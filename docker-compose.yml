@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  allman:
+    build: .
+    container_name: allman_server
+    ports:
+      - "8000:8000"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./allman_db:/app/allman_db
+      - ./allman_index:/app/allman_index
+      - ./allman_repo:/app/allman_repo
+    restart: unless-stopped
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_server
+    ports:
+      - "8001:8000" # Expose vLLM on 8001
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=1
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+    # Mistral 7B AWQ (4-bit) fits in ~6GB VRAM.
+    command: --model TheBloke/Mistral-7B-Instruct-v0.2-AWQ --quantization awq --dtype half --max-model-len 4096 --api-key sk-test-123 --gpu-memory-utilization 0.6
+    restart: unless-stopped

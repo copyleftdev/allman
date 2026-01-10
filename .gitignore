@@ -1,0 +1,20 @@
+
+# Rust
+target/
+**/*.rs.bk
+
+# Data Stores (SQLite, Tantivy)
+allman_db
+allman_index
+allman_repo
+simulation_logs_repo
+
+# Environment
+.env
+
+# Docker
+vllm_cache/
+
+# OS
+.DS_Store
+*.db
