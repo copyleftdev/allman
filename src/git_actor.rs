@@ -172,8 +172,12 @@ mod tests {
     fn h9_valid_nested_path_still_works() {
         let (actor, repo, repo_dir) = test_actor();
 
-        let result =
-            actor.handle_commit(&repo, "agents/alice/profile.json", "ok", "valid nested path");
+        let result = actor.handle_commit(
+            &repo,
+            "agents/alice/profile.json",
+            "ok",
+            "valid nested path",
+        );
         assert!(result.is_ok(), "Valid nested paths must still work");
         assert!(repo_dir.path().join("agents/alice/profile.json").exists());
     }

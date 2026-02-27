@@ -146,7 +146,11 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         content: serde_json::to_string_pretty(&profile).unwrap(),
         message: format!("Register agent {}", name),
     }) {
-        tracing::warn!("Persist channel full, dropping git commit for agent {}: {}", name, e);
+        tracing::warn!(
+            "Persist channel full, dropping git commit for agent {}: {}",
+            name,
+            e
+        );
     }
 
     Ok(json!(profile))
@@ -215,7 +219,11 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         body: body.to_string(),
         created_ts: now,
     }) {
-        tracing::warn!("Persist channel full, dropping index op for message {}: {}", message_id, e);
+        tracing::warn!(
+            "Persist channel full, dropping index op for message {}: {}",
+            message_id,
+            e
+        );
     }
 
     Ok(json!({ "id": message_id, "status": "sent" }))
