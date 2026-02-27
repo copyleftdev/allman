@@ -107,6 +107,18 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     let name = name_hint.unwrap_or("AnonymousAgent").to_string();
     validate_agent_name(&name)?;
+
+    // Reject cross-project name collisions. Same-project re-registration
+    // is allowed (idempotent upsert — expected by benchmarks and simulations).
+    if let Some(existing) = state.agents.get(&name) {
+        if existing.project_id != project_id {
+            return Err(format!(
+                "Agent '{}' already registered in a different project",
+                name
+            ));
+        }
+    }
+
     let agent_id = Uuid::new_v4().to_string();
 
     let record = AgentRecord {
@@ -236,7 +248,11 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("Missing query")?;
-    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 1000) as usize;
 
     let index = &state.index;
     let searcher = state.index_reader.searcher();
@@ -279,34 +295,73 @@ mod tests {
     }
 
     // ── H1: Agent Name Collision ────────────────────────────────────────────
-    // Hypothesis: Two create_agent calls with the same name_hint but different
-    // project_keys will silently overwrite the first agent's record.
+    // Cross-project collision must be rejected.
     #[tokio::test]
-    async fn h1_agent_name_collision_overwrites_silently() {
+    async fn h1_cross_project_name_collision_is_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Register "Alice" under project_a
         let r1 = create_agent(
             &state,
             json!({ "project_key": "project_a", "name_hint": "Alice", "program": "prog_a" }),
-        )
-        .unwrap();
-        let id_a = r1["id"].as_str().unwrap().to_string();
+        );
+        assert!(r1.is_ok(), "First registration should succeed");
 
-        // Register "Alice" under project_b — same name, different project
         let r2 = create_agent(
             &state,
             json!({ "project_key": "project_b", "name_hint": "Alice", "program": "prog_b" }),
+        );
+        assert!(r2.is_err(), "Same name in different project must be rejected");
+        assert!(
+            r2.unwrap_err().contains("already registered"),
+            "Error should mention the name conflict"
+        );
+
+        // Original agent must be preserved
+        let record = state.agents.get("Alice").unwrap();
+        assert_eq!(record.program, "prog_a", "Original agent must not be overwritten");
+    }
+
+    // Same-project re-registration must be idempotent (upsert).
+    #[tokio::test]
+    async fn h1_same_project_reregistration_is_upsert() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "proj_x", "name_hint": "Bob", "program": "v1" }),
         )
         .unwrap();
-        let id_b = r2["id"].as_str().unwrap().to_string();
 
-        // CONFIRMED: The second registration overwrites the first.
-        // Agent IDs differ, but only the second survives in the map.
-        assert_ne!(id_a, id_b, "Two registrations should produce different UUIDs");
-        let record = state.agents.get("Alice").unwrap();
-        assert_eq!(record.program, "prog_b", "First agent's record was silently overwritten");
-        assert_eq!(record.id, id_b, "Only the second agent_id survives");
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "proj_x", "name_hint": "Bob", "program": "v2" }),
+        )
+        .unwrap();
+
+        // Both succeed — second is an upsert
+        assert_ne!(r1["id"], r2["id"], "Re-registration generates a new agent_id");
+        let record = state.agents.get("Bob").unwrap();
+        assert_eq!(record.program, "v2", "Upsert should update the record");
+    }
+
+    // Different names within the same project must coexist.
+    #[tokio::test]
+    async fn h1_different_names_same_project_coexist() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "proj_x", "name_hint": "Agent1" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "proj_x", "name_hint": "Agent2" }),
+        )
+        .unwrap();
+
+        assert!(state.agents.contains_key("Agent1"));
+        assert!(state.agents.contains_key("Agent2"));
     }
 
     // ── H3: Unbounded Inbox Growth ──────────────────────────────────────────
@@ -388,23 +443,34 @@ mod tests {
         );
     }
 
-    // ── H18: Negative Limit Wraps to usize::MAX ────────────────────────────
-    // Hypothesis: A negative `limit` value in search_messages wraps around
-    // to usize::MAX when cast via `as usize`, potentially causing OOM.
-    #[test]
-    fn h18_negative_limit_wraps_to_usize_max() {
-        // This test verifies the cast behavior without triggering OOM.
-        // We assert the wrapping occurs, proving the vulnerability exists.
-        let limit_i64: i64 = -1;
-        let limit_usize = limit_i64 as usize;
-        assert_eq!(
-            limit_usize,
-            usize::MAX,
-            "Negative i64 wraps to usize::MAX — would cause TopDocs::with_limit(usize::MAX)"
-        );
+    // ── H18: search_messages limit must be clamped ─────────────────────────
+    #[tokio::test]
+    async fn h18_negative_limit_returns_results_not_oom() {
+        let (state, _idx, _repo) = test_post_office();
 
-        // The actual search would attempt to collect usize::MAX docs.
-        // We don't call search_messages here to avoid OOM, but the cast is proven.
+        // Negative limit must not wrap to usize::MAX — should be clamped.
+        let r = search_messages(&state, json!({ "query": "hello", "limit": -1 }));
+        assert!(r.is_ok(), "Negative limit must not cause panic or OOM");
+    }
+
+    #[tokio::test]
+    async fn h18_zero_limit_returns_ok() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r = search_messages(&state, json!({ "query": "hello", "limit": 0 }));
+        assert!(r.is_ok(), "Zero limit must not cause error");
+    }
+
+    #[tokio::test]
+    async fn h18_huge_limit_is_capped() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // A limit of 999999999 must not allocate that much — should be capped.
+        let r = search_messages(
+            &state,
+            json!({ "query": "hello", "limit": 999_999_999 }),
+        );
+        assert!(r.is_ok(), "Huge limit must be capped, not cause OOM");
     }
 
     // ── H9: Input validation rejects malicious agent names ──────────────────
