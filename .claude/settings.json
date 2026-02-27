@@ -1,21 +1,44 @@
 {
   "permissions": {
     "allow": [
-      "cargo build",
-      "cargo check",
-      "cargo fmt",
-      "cargo clippy",
-      "cargo test",
-      "cargo run --release --bin allman",
-      "cargo run --release --bin benchmark",
-      "cargo run --release --bin swarm_stress",
-      "curl http://localhost:8000/*",
-      "bash examples/*.sh"
+      "cargo *",
+      "git *",
+      "gh *",
+      "curl *",
+      "bash *",
+      "cat *",
+      "ls *",
+      "find *",
+      "grep *",
+      "rg *",
+      "head *",
+      "tail *",
+      "wc *",
+      "sort *",
+      "mkdir *",
+      "touch *",
+      "cp *",
+      "mv *",
+      "chmod *",
+      "echo *",
+      "sleep *",
+      "kill *",
+      "pkill *",
+      "lsof *",
+      "ps *",
+      "env *",
+      "export *",
+      "which *",
+      "rustup *",
+      "rustc *"
     ],
     "deny": [
       "rm -rf /",
+      "rm -rf /*",
+      "sudo rm -rf *",
       "cargo publish",
-      "docker push"
+      "docker push",
+      "sudo *"
     ]
   }
 }
