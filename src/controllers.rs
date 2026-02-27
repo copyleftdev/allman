@@ -131,12 +131,6 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         Uuid::new_v5(&Uuid::NAMESPACE_DNS, project_key.as_bytes()).simple()
     );
 
-    // Lock-free upsert into DashMap (after all validation passes)
-    state
-        .projects
-        .entry(project_id.clone())
-        .or_insert_with(|| project_key.to_string());
-
     // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
     // across the collision check and the insert/update, eliminating the
     // TOCTOU race that existed with separate get() + insert().
@@ -165,6 +159,13 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
             vac.insert(record);
         }
     }
+
+    // Record project mapping AFTER successful agent registration.
+    // No state mutation occurs on any error path.
+    state
+        .projects
+        .entry(project_id.clone())
+        .or_insert_with(|| project_key.to_string());
 
     // Fire-and-forget: persist agent profile to Git
     let profile = json!({
@@ -2689,12 +2690,12 @@ mod tests {
     // Deep Review #10 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED - Low): cross-project collision creates orphan project ─
-    // state.projects.entry() executes before state.agents.entry(). A cross-
-    // project collision at step 2 leaves the project entry from step 1 orphaned.
-    // Fix: move projects.entry() after successful agents.entry().
+    // ── H1 (FIXED): cross-project collision creates no orphan project ───
+    // Previously, state.projects.entry() ran before state.agents.entry().
+    // Now projects.entry() runs after successful agent registration only.
+    // No state mutation on any error path.
     #[tokio::test]
-    async fn dr10_h1_cross_project_collision_creates_orphan_project() {
+    async fn dr10_h1_cross_project_collision_no_orphan_project() {
         let (state, _idx, _repo) = test_post_office();
 
         // Register Alice in project_a
@@ -2711,17 +2712,18 @@ mod tests {
         );
         assert!(result.is_err(), "Cross-project collision must be rejected");
 
-        // BUG: project_b entry was created before the collision check
+        // FIXED: project_b entry must NOT exist
         let project_id_b = format!(
             "proj_{}",
             Uuid::new_v5(&Uuid::NAMESPACE_DNS, "proj_b".as_bytes()).simple()
         );
-        let has_orphan = state.projects.contains_key(&project_id_b);
-        // After fix: orphan should NOT exist.
         assert!(
-            has_orphan,
-            "BUG: projects entry created before collision check — orphan exists"
+            !state.projects.contains_key(&project_id_b),
+            "No orphan project entry on cross-project collision"
         );
+
+        // Only project_a should exist
+        assert_eq!(state.projects.len(), 1, "Only one project registered");
     }
 
     // ── H2 (DISPROVED): Inbox messages are returned in FIFO order ───────
