@@ -6,6 +6,8 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use uuid::Uuid;
 
+const MAX_INBOX_SIZE: usize = 10_000;
+
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id");
@@ -139,11 +141,17 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         "program": program,
         "model": model
     });
-    let _ = state.persist_tx.try_send(PersistOp::GitCommit {
+    if let Err(e) = state.persist_tx.try_send(PersistOp::GitCommit {
         path: format!("agents/{}/profile.json", name),
         content: serde_json::to_string_pretty(&profile).unwrap(),
         message: format!("Register agent {}", name),
-    });
+    }) {
+        tracing::warn!(
+            "Persist channel full, dropping git commit for agent {}: {}",
+            name,
+            e
+        );
+    }
 
     Ok(json!(profile))
 }
@@ -155,13 +163,15 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("from_agent")
         .and_then(|v| v.as_str())
         .ok_or("Missing from_agent")?;
-    let to_agents = args
+    let to_agents: Vec<String> = args
         .get("to")
         .and_then(|v| v.as_array())
         .ok_or("Missing to recipients")?
         .iter()
-        .map(|v| v.as_str().unwrap_or("").to_string())
-        .collect::<Vec<_>>();
+        .filter_map(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
     let subject = args
         .get("subject")
         .and_then(|v| v.as_str())
@@ -189,15 +199,18 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     };
 
     for recipient in &to_agents {
-        state
-            .inboxes
-            .entry(recipient.clone())
-            .or_default()
-            .push(entry.clone());
+        let mut inbox = state.inboxes.entry(recipient.clone()).or_default();
+        if inbox.len() >= MAX_INBOX_SIZE {
+            return Err(format!(
+                "Recipient '{}' inbox full ({} messages) — drain with get_inbox first",
+                recipient, MAX_INBOX_SIZE
+            ));
+        }
+        inbox.push(entry.clone());
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
-    let _ = state.persist_tx.try_send(PersistOp::IndexMessage {
+    if let Err(e) = state.persist_tx.try_send(PersistOp::IndexMessage {
         id: message_id.clone(),
         project_id: project_id.to_string(),
         from_agent: from_agent.to_string(),
@@ -205,7 +218,13 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         subject: subject.to_string(),
         body: body.to_string(),
         created_ts: now,
-    });
+    }) {
+        tracing::warn!(
+            "Persist channel full, dropping index op for message {}: {}",
+            message_id,
+            e
+        );
+    }
 
     Ok(json!({ "id": message_id, "status": "sent" }))
 }
@@ -274,7 +293,9 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     for (_score, doc_address) in top_docs {
         let retrieved_doc = searcher.doc(doc_address).map_err(|e| e.to_string())?;
         let doc_json = schema.to_json(&retrieved_doc);
-        results.push(serde_json::from_str::<Value>(&doc_json).unwrap());
+        let parsed = serde_json::from_str::<Value>(&doc_json)
+            .map_err(|e| format!("Failed to parse doc JSON: {}", e))?;
+        results.push(parsed);
     }
 
     Ok(json!(results))
@@ -373,49 +394,83 @@ mod tests {
         assert!(state.agents.contains_key("Agent2"));
     }
 
-    // ── H3: Unbounded Inbox Growth ──────────────────────────────────────────
-    // Hypothesis: There is no limit on the number of messages in an inbox.
-    // A sender can push an arbitrary number of messages without error.
+    // ── H3: Inbox size is capped ────────────────────────────────────────────
     #[tokio::test]
-    async fn h3_unbounded_inbox_growth_no_limit() {
+    async fn h3_inbox_rejects_when_full() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send 10,000 messages to the same recipient
-        for i in 0..10_000 {
+        // Fill inbox to the cap
+        for i in 0..super::MAX_INBOX_SIZE {
             let result = send_message(
                 &state,
                 json!({
-                    "from_agent": "spammer",
-                    "to": ["victim"],
-                    "subject": format!("spam #{}", i),
-                    "body": "x".repeat(100),
+                    "from_agent": "sender",
+                    "to": ["recipient"],
+                    "subject": format!("msg #{}", i),
+                    "body": "x",
                 }),
             );
-            assert!(
-                result.is_ok(),
-                "send_message should never reject on inbox size"
-            );
+            assert!(result.is_ok(), "Message {} should be accepted", i);
         }
 
-        // CONFIRMED: All 10,000 messages accepted. No backpressure.
-        let inbox = state.inboxes.get("victim").unwrap();
-        assert_eq!(
-            inbox.len(),
-            10_000,
-            "All 10k messages stored — no inbox limit exists"
+        // Next message should be rejected
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": ["recipient"],
+                "subject": "overflow",
+                "body": "this should fail",
+            }),
+        );
+        assert!(result.is_err(), "Message beyond inbox cap must be rejected");
+        assert!(
+            result.unwrap_err().contains("inbox full"),
+            "Error should mention inbox full"
         );
     }
 
-    // ── H4: Silent Channel Drop ─────────────────────────────────────────────
-    // Hypothesis: When the persist channel (100k capacity) is full,
-    // try_send silently drops the operation and send_message still returns Ok.
     #[tokio::test]
-    async fn h4_persist_channel_drop_returns_ok() {
+    async fn h3_inbox_accepts_after_drain() {
         let (state, _idx, _repo) = test_post_office();
 
-        // The persist channel has capacity 100,000. We can't easily fill it
-        // in a unit test without blocking the worker. Instead, verify that
-        // send_message returns Ok regardless of channel state.
+        // Fill inbox to the cap
+        for i in 0..super::MAX_INBOX_SIZE {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender",
+                    "to": ["recipient"],
+                    "subject": format!("msg #{}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Drain the inbox
+        get_inbox(&state, json!({ "agent_name": "recipient" })).unwrap();
+
+        // Should accept messages again
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": ["recipient"],
+                "subject": "after drain",
+                "body": "this should succeed",
+            }),
+        );
+        assert!(result.is_ok(), "Inbox should accept messages after drain");
+    }
+
+    // ── H4: Persist channel drops are logged, not silent ───────────────────
+    // send_message still returns Ok (hot path must not block on persistence),
+    // but channel failures are now logged via tracing::warn.
+    #[tokio::test]
+    async fn h4_persist_channel_drop_returns_ok_but_logs() {
+        let (state, _idx, _repo) = test_post_office();
+
         let result = send_message(
             &state,
             json!({
@@ -427,21 +482,16 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "send_message always succeeds even if indexing might fail"
+            "send_message returns Ok — hot path is independent of persist pipeline"
         );
-
-        // CONFIRMED by code inspection: line 169 uses `let _ = state.persist_tx.try_send(...)`.
-        // There is no feedback path from the persist pipeline to the caller.
+        // Channel drops are now logged via tracing::warn (verified by code inspection).
     }
 
-    // ── H10: Empty String Recipients ────────────────────────────────────────
-    // Hypothesis: Non-string elements in `to` array silently become empty
-    // string inbox keys.
+    // ── H10: Non-string recipients are filtered out ────────────────────────
     #[tokio::test]
-    async fn h10_non_string_to_elements_become_empty_string() {
+    async fn h10_non_string_recipients_are_filtered() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send to a mix of valid and non-string recipients
         let result = send_message(
             &state,
             json!({
@@ -453,13 +503,53 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        // CONFIRMED: "bob" gets the message
+        // "bob" gets the message (valid string recipient)
         assert!(state.inboxes.contains_key("bob"));
-        // CONFIRMED: Empty string key exists in the inbox map from null/int coercion
+        // Non-string elements must NOT create empty-string inbox entries
         assert!(
-            state.inboxes.contains_key(""),
-            "Non-string to elements silently become empty-string inbox entries"
+            !state.inboxes.contains_key(""),
+            "Non-string to elements must be filtered out, not coerced to empty string"
         );
+    }
+
+    // Empty-string recipients in the array must also be filtered.
+    #[tokio::test]
+    async fn h10_empty_string_recipients_are_filtered() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob", ""],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_ok());
+
+        assert!(state.inboxes.contains_key("bob"));
+        assert!(
+            !state.inboxes.contains_key(""),
+            "Empty string recipients must be filtered out"
+        );
+    }
+
+    // All-invalid recipients should return an error.
+    #[tokio::test]
+    async fn h10_all_invalid_recipients_returns_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [123, null, ""],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_err(), "All-invalid recipients must return error");
     }
 
     // ── H18: search_messages limit must be clamped ─────────────────────────

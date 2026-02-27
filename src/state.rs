@@ -206,11 +206,13 @@ fn persistence_worker(
                     content,
                     message,
                 } => {
-                    let _ = git_tx.try_send(GitRequest::CommitFile {
-                        path,
+                    if let Err(e) = git_tx.try_send(GitRequest::CommitFile {
+                        path: path.clone(),
                         content,
                         message,
-                    });
+                    }) {
+                        tracing::warn!("Git channel full, dropping commit for {}: {}", path, e);
+                    }
                 }
             }
         }
