@@ -9,6 +9,7 @@ use uuid::Uuid;
 const MAX_INBOX_SIZE: usize = 10_000;
 const MAX_AGENT_NAME_LEN: usize = 128;
 const MAX_FROM_AGENT_LEN: usize = 256;
+const MAX_PROJECT_KEY_LEN: usize = 256;
 const MAX_RECIPIENTS: usize = 100;
 const MAX_SUBJECT_LEN: usize = 1_024;
 const MAX_BODY_LEN: usize = 65_536; // 64 KB
@@ -105,6 +106,12 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("project_key")
         .and_then(|v| v.as_str())
         .ok_or("Missing project_key")?;
+    if project_key.len() > MAX_PROJECT_KEY_LEN {
+        return Err(format!(
+            "project_key exceeds {} character limit",
+            MAX_PROJECT_KEY_LEN
+        ));
+    }
     let program = args
         .get("program")
         .and_then(|v| v.as_str())
@@ -2330,37 +2337,50 @@ mod tests {
     // Deep Review #8 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED - Low): project_key has no length validation ──────
-    // Every other user-facing text input is bounded. project_key is stored
-    // in the projects DashMap without length or character validation.
-    // The HTTP 1MB body limit provides an outer bound, and the value is
-    // stored once per unique project_key (not amplified).
+    // ── H1 (FIXED): project_key length is capped at MAX_PROJECT_KEY_LEN ──
+    // Previously unbounded. Now capped at 256 chars to complete
+    // defense-in-depth for all user-facing text inputs.
     #[tokio::test]
-    async fn dr8_h1_large_project_key_stored_unbounded() {
+    async fn dr8_h1_large_project_key_is_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 100KB project_key — within 1MB HTTP limit but no app-level bound
-        let big_key = "K".repeat(100_000);
+        // 257 chars — exceeds MAX_PROJECT_KEY_LEN (256)
+        let big_key = "K".repeat(257);
 
         let result = create_agent(
             &state,
             json!({ "project_key": big_key, "name_hint": "Agent1" }),
         );
+        assert!(result.is_err(), "257-char project_key must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("project_key exceeds"),
+            "Error should mention project_key limit: {}",
+            err
+        );
+    }
+
+    // MAX_PROJECT_KEY_LEN boundary: exactly 256 should succeed
+    #[tokio::test]
+    async fn dr8_h1_project_key_boundary_accepted() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let key = "K".repeat(256);
+
+        let result = create_agent(&state, json!({ "project_key": key, "name_hint": "Agent1" }));
         assert!(
             result.is_ok(),
-            "Large project_key is accepted (no app-level limit — only HTTP body limit)"
+            "Exactly 256-char project_key must be accepted"
         );
 
-        // Verify the full project_key is stored in the projects DashMap
+        // Verify stored correctly
         let project_id = format!(
             "proj_{}",
-            Uuid::new_v5(&Uuid::NAMESPACE_DNS, big_key.as_bytes()).simple()
+            Uuid::new_v5(&Uuid::NAMESPACE_DNS, key.as_bytes()).simple()
         );
-        let stored = state.projects.get(&project_id).unwrap();
-        assert_eq!(
-            stored.value().len(),
-            100_000,
-            "Full 100KB project_key stored in DashMap"
+        assert!(
+            state.projects.contains_key(&project_id),
+            "256-char project_key stored in projects DashMap"
         );
     }
 
