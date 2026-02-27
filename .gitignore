@@ -20,6 +20,9 @@ allman_db/
 # Docker
 vllm_cache/
 
+# Personal / non-repo files
+VERCEL_PROMPT.md
+
 # OS
 .DS_Store
 Thumbs.db
