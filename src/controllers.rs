@@ -894,7 +894,10 @@ mod tests {
         );
 
         // Caller gets an error (B is full)
-        assert!(result.is_err(), "Should fail because recipient_b inbox is full");
+        assert!(
+            result.is_err(),
+            "Should fail because recipient_b inbox is full"
+        );
 
         // Fixed: pre-check prevents partial delivery. recipient_a should NOT
         // have received the message since the entire send was rejected.
@@ -918,7 +921,10 @@ mod tests {
             json!({ "project_key": "test", "name_hint": long_name }),
         );
 
-        assert!(result.is_err(), "Agent name exceeding limit must be rejected");
+        assert!(
+            result.is_err(),
+            "Agent name exceeding limit must be rejected"
+        );
         assert!(
             result.unwrap_err().contains("character limit"),
             "Error should mention character limit"
@@ -930,11 +936,11 @@ mod tests {
         let (state, _idx, _repo) = test_post_office();
         let name = "A".repeat(super::MAX_AGENT_NAME_LEN);
 
-        let result = create_agent(
-            &state,
-            json!({ "project_key": "test", "name_hint": name }),
+        let result = create_agent(&state, json!({ "project_key": "test", "name_hint": name }));
+        assert!(
+            result.is_ok(),
+            "Agent name at exactly the limit should be accepted"
         );
-        assert!(result.is_ok(), "Agent name at exactly the limit should be accepted");
     }
 
     #[tokio::test]
@@ -1092,10 +1098,7 @@ mod tests {
     async fn h10_whitespace_only_agent_name_is_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
-        let result = create_agent(
-            &state,
-            json!({ "project_key": "test", "name_hint": "   " }),
-        );
+        let result = create_agent(&state, json!({ "project_key": "test", "name_hint": "   " }));
 
         assert!(result.is_err(), "Whitespace-only names must be rejected");
         assert!(result.unwrap_err().contains("whitespace"));
@@ -1110,7 +1113,10 @@ mod tests {
             json!({ "project_key": "test", "name_hint": "agent\x07bell" }),
         );
 
-        assert!(result.is_err(), "Control characters in names must be rejected");
+        assert!(
+            result.is_err(),
+            "Control characters in names must be rejected"
+        );
         assert!(result.unwrap_err().contains("control"));
     }
 
@@ -1248,7 +1254,10 @@ mod tests {
             }),
         )
         .await;
-        assert!(resp2["id"].is_null(), "Explicit null id should be echoed as null");
+        assert!(
+            resp2["id"].is_null(),
+            "Explicit null id should be echoed as null"
+        );
     }
 
     // ── H-REGRESSION: create_agent with all optional fields missing ─────
