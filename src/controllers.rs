@@ -6,6 +6,8 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use uuid::Uuid;
 
+const MAX_INBOX_SIZE: usize = 10_000;
+
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id");
@@ -193,11 +195,14 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     };
 
     for recipient in &to_agents {
-        state
-            .inboxes
-            .entry(recipient.clone())
-            .or_default()
-            .push(entry.clone());
+        let mut inbox = state.inboxes.entry(recipient.clone()).or_default();
+        if inbox.len() >= MAX_INBOX_SIZE {
+            return Err(format!(
+                "Recipient '{}' inbox full ({} messages) — drain with get_inbox first",
+                recipient, MAX_INBOX_SIZE
+            ));
+        }
+        inbox.push(entry.clone());
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
@@ -381,37 +386,74 @@ mod tests {
         assert!(state.agents.contains_key("Agent2"));
     }
 
-    // ── H3: Unbounded Inbox Growth ──────────────────────────────────────────
-    // Hypothesis: There is no limit on the number of messages in an inbox.
-    // A sender can push an arbitrary number of messages without error.
+    // ── H3: Inbox size is capped ────────────────────────────────────────────
     #[tokio::test]
-    async fn h3_unbounded_inbox_growth_no_limit() {
+    async fn h3_inbox_rejects_when_full() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send 10,000 messages to the same recipient
-        for i in 0..10_000 {
+        // Fill inbox to the cap
+        for i in 0..super::MAX_INBOX_SIZE {
             let result = send_message(
                 &state,
                 json!({
-                    "from_agent": "spammer",
-                    "to": ["victim"],
-                    "subject": format!("spam #{}", i),
-                    "body": "x".repeat(100),
+                    "from_agent": "sender",
+                    "to": ["recipient"],
+                    "subject": format!("msg #{}", i),
+                    "body": "x",
                 }),
             );
-            assert!(
-                result.is_ok(),
-                "send_message should never reject on inbox size"
-            );
+            assert!(result.is_ok(), "Message {} should be accepted", i);
         }
 
-        // CONFIRMED: All 10,000 messages accepted. No backpressure.
-        let inbox = state.inboxes.get("victim").unwrap();
-        assert_eq!(
-            inbox.len(),
-            10_000,
-            "All 10k messages stored — no inbox limit exists"
+        // Next message should be rejected
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": ["recipient"],
+                "subject": "overflow",
+                "body": "this should fail",
+            }),
         );
+        assert!(result.is_err(), "Message beyond inbox cap must be rejected");
+        assert!(
+            result.unwrap_err().contains("inbox full"),
+            "Error should mention inbox full"
+        );
+    }
+
+    #[tokio::test]
+    async fn h3_inbox_accepts_after_drain() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Fill inbox to the cap
+        for i in 0..super::MAX_INBOX_SIZE {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender",
+                    "to": ["recipient"],
+                    "subject": format!("msg #{}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Drain the inbox
+        get_inbox(&state, json!({ "agent_name": "recipient" })).unwrap();
+
+        // Should accept messages again
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": ["recipient"],
+                "subject": "after drain",
+                "body": "this should succeed",
+            }),
+        );
+        assert!(result.is_ok(), "Inbox should accept messages after drain");
     }
 
     // ── H4: Persist channel drops are logged, not silent ───────────────────
