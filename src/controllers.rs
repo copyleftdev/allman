@@ -110,17 +110,9 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     let name = name_hint.unwrap_or("AnonymousAgent").to_string();
     validate_agent_name(&name)?;
 
-    // Reject cross-project name collisions. Same-project re-registration
-    // is allowed (idempotent upsert — expected by benchmarks and simulations).
-    if let Some(existing) = state.agents.get(&name) {
-        if existing.project_id != project_id {
-            return Err(format!(
-                "Agent '{}' already registered in a different project",
-                name
-            ));
-        }
-    }
-
+    // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
+    // across the collision check and the insert/update, eliminating the
+    // TOCTOU race that existed with separate get() + insert().
     let agent_id = Uuid::new_v4().to_string();
 
     let record = AgentRecord {
@@ -131,7 +123,21 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         model: model.to_string(),
     };
 
-    state.agents.insert(name.clone(), record);
+    match state.agents.entry(name.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+            if occ.get().project_id != project_id {
+                return Err(format!(
+                    "Agent '{}' already registered in a different project",
+                    name
+                ));
+            }
+            // Same project — idempotent upsert
+            occ.insert(record);
+        }
+        dashmap::mapref::entry::Entry::Vacant(vac) => {
+            vac.insert(record);
+        }
+    }
 
     // Fire-and-forget: persist agent profile to Git
     let profile = json!({
@@ -813,24 +819,9 @@ mod tests {
         let successes = results.iter().filter(|r| r.is_ok()).count();
         let failures = results.iter().filter(|r| r.is_err()).count();
 
-        // CONFIRMED BUG: Both may succeed because the get() → insert() gap
-        // allows both threads to see "no agent exists" simultaneously.
-        // At minimum, only one should succeed; the other should be rejected.
-        // With the current code, both CAN succeed (race window).
-        if successes == 2 {
-            // This proves the TOCTOU race: both passed the collision check.
-            // The agent record belongs to whichever thread inserted last.
-            let record = state.agents.get("RaceName").unwrap();
-            eprintln!(
-                "TOCTOU CONFIRMED: Both succeeded, winner project_id = {}",
-                record.project_id
-            );
-            // We document this as a confirmed issue but don't fail the test —
-            // it's non-deterministic.
-        } else {
-            assert_eq!(successes, 1, "Exactly one should succeed");
-            assert_eq!(failures, 1, "Exactly one should be rejected");
-        }
+        // Fixed: atomic entry() API ensures exactly one succeeds.
+        assert_eq!(successes, 1, "Exactly one should succeed");
+        assert_eq!(failures, 1, "Exactly one should be rejected");
     }
 
     // ── H2: Partial delivery when multi-recipient inbox is full ──────────
