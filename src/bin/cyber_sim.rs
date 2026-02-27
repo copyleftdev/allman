@@ -197,7 +197,8 @@ impl Agent {
             .push(json!({"role": "assistant", "content": response_text}));
 
         let subject = if response_text.len() > 20 {
-            format!("Re: Inc-## {}", &response_text[..10])
+            let preview: String = response_text.chars().take(10).collect();
+            format!("Re: Inc-## {}", preview)
         } else {
             "Re: Incident Update".to_string()
         };
