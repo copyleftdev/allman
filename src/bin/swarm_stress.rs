@@ -367,10 +367,12 @@ async fn phase_inbox_drain(client: &Client, metrics: &Arc<Metrics>) -> f64 {
                         Ok(resp) => {
                             metrics.inbox_ok.fetch_add(1, Ordering::Relaxed);
                             if let Some(text) = parse_content_text(&resp) {
-                                if let Ok(msgs) = serde_json::from_str::<Vec<Value>>(&text) {
-                                    metrics
-                                        .inbox_msgs_received
-                                        .fetch_add(msgs.len() as u64, Ordering::Relaxed);
+                                if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                                    if let Some(msgs) = parsed["messages"].as_array() {
+                                        metrics
+                                            .inbox_msgs_received
+                                            .fetch_add(msgs.len() as u64, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
