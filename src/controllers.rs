@@ -342,12 +342,45 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
                 MAX_RECIPIENT_NAME_LEN
             ));
         }
+        if recipient.contains('\0') {
+            return Err(format!(
+                "Recipient '{}' must not contain null bytes",
+                recipient
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect::<String>()
+            ));
+        }
+        if recipient.chars().any(|c| c.is_control()) {
+            return Err(format!(
+                "Recipient '{}' must not contain control characters",
+                recipient
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect::<String>()
+            ));
+        }
+        if recipient.contains('/') || recipient.contains('\\') {
+            return Err(format!(
+                "Recipient '{}' must not contain path separators",
+                recipient
+            ));
+        }
+        if recipient.contains("..") {
+            return Err(format!("Recipient '{}' must not contain '..'", recipient));
+        }
     }
     if subject.len() > MAX_SUBJECT_LEN {
         return Err(format!(
             "Subject exceeds {} character limit",
             MAX_SUBJECT_LEN
         ));
+    }
+    if subject.contains('\0') {
+        return Err("Subject must not contain null bytes".to_string());
+    }
+    if subject.chars().any(|c| c.is_control()) {
+        return Err("Subject must not contain control characters".to_string());
     }
     if body.len() > MAX_BODY_LEN {
         return Err(format!("Body exceeds {} byte limit", MAX_BODY_LEN));
@@ -369,6 +402,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         subject: subject.to_string(),
         body: body.to_string(),
         timestamp: now,
+        project_id: project_id.to_string(),
     };
 
     // Pre-check all recipient inboxes BEFORE any delivery.
@@ -473,7 +507,8 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
                 "from_agent": e.from_agent,
                 "subject": e.subject,
                 "body": e.body,
-                "created_ts": e.timestamp
+                "created_ts": e.timestamp,
+                "project_id": e.project_id
             })
         })
         .collect();
@@ -552,7 +587,10 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         results.push(unwrapped);
     }
 
-    Ok(json!(results))
+    Ok(json!({
+        "results": results,
+        "total": results.len()
+    }))
 }
 
 #[cfg(test)]
@@ -2551,8 +2589,8 @@ mod tests {
     async fn dr8_h2_get_inbox_special_chars_is_safe() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send to a recipient with path-like characters
-        send_message(
+        // Recipients with path-like characters are now rejected (DR18 fix)
+        let result = send_message(
             &state,
             json!({
                 "from_agent": "alice",
@@ -2560,15 +2598,29 @@ mod tests {
                 "subject": "test",
                 "body": "hello",
             }),
+        );
+        assert!(
+            result.is_err(),
+            "Recipients with path separators are rejected"
+        );
+
+        // But harmless special chars (like hyphens, dots) still work as DashMap keys
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["agent-with.dots"],
+                "subject": "test",
+                "body": "hello",
+            }),
         )
         .unwrap();
 
-        // get_inbox with the same special-char name retrieves correctly
-        let inbox = get_inbox(&state, json!({ "agent_name": "../evil" })).unwrap();
+        let inbox = get_inbox(&state, json!({ "agent_name": "agent-with.dots" })).unwrap();
         assert_eq!(
             inbox_messages(&inbox).len(),
             1,
-            "Special-char agent_name works as DashMap key (no filesystem access)"
+            "Agent name with dots/hyphens works as DashMap key"
         );
         assert_eq!(inbox_messages(&inbox)[0]["from_agent"], "alice");
     }
@@ -3445,7 +3497,10 @@ mod tests {
         // Empty query succeeds gracefully — Tantivy returns empty results
         assert!(result.is_ok(), "Empty query must not panic");
         let results = result.unwrap();
-        assert!(results.as_array().is_some(), "Returns a valid array");
+        assert!(
+            results.get("results").is_some(),
+            "Returns a valid envelope with 'results'"
+        );
     }
 
     // ── H5 (CONFIRMED): search_messages limit uses magic numbers ────────────
@@ -3458,11 +3513,17 @@ mod tests {
 
         // Default limit uses DEFAULT_SEARCH_LIMIT
         let result = search_messages(&state, json!({ "query": "hello" })).unwrap();
-        assert!(result.as_array().is_some(), "Default limit returns array");
+        assert!(
+            result["results"].as_array().is_some(),
+            "Default limit returns array"
+        );
 
         // Negative limit clamped to 1
         let result = search_messages(&state, json!({ "query": "hello", "limit": -5 })).unwrap();
-        assert!(result.as_array().is_some(), "Negative limit clamped to 1");
+        assert!(
+            result["results"].as_array().is_some(),
+            "Negative limit clamped to 1"
+        );
 
         // Huge limit clamped to MAX_SEARCH_LIMIT
         let result = search_messages(
@@ -3471,7 +3532,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            result.as_array().is_some(),
+            result["results"].as_array().is_some(),
             "Huge limit clamped to MAX_SEARCH_LIMIT"
         );
     }
@@ -3553,7 +3614,7 @@ mod tests {
 
         let result = search_messages(&state, json!({ "query": "hello", "limit": 0 }));
         assert!(result.is_ok(), "limit=0 must not panic");
-        assert!(result.unwrap().as_array().is_some());
+        assert!(result.unwrap()["results"].as_array().is_some());
     }
 
     // ── H4 (DISPROVED): empty JSON request returns error, no panic ──────────
@@ -3639,7 +3700,7 @@ mod tests {
         assert!(result.is_ok(), "Search must succeed");
 
         let results = result.unwrap();
-        let docs = results.as_array().unwrap();
+        let docs = results["results"].as_array().unwrap();
         assert!(!docs.is_empty(), "Must find at least one result");
 
         // FIXED: fields are now scalar, not array-wrapped
@@ -4063,7 +4124,7 @@ mod tests {
         // Check search field names
         let search =
             search_messages(&state, json!({ "query": "dr16_field_test", "limit": 10 })).unwrap();
-        let search_docs = search.as_array().unwrap();
+        let search_docs = search["results"].as_array().unwrap();
         assert!(!search_docs.is_empty(), "Search found the message");
 
         let search_doc = &search_docs[0];
@@ -4192,7 +4253,7 @@ mod tests {
         // Search for this message
         let search =
             search_messages(&state, json!({ "query": "dr17_join_test", "limit": 10 })).unwrap();
-        let docs = search.as_array().unwrap();
+        let docs = search["results"].as_array().unwrap();
         assert!(!docs.is_empty(), "Message indexed");
 
         // FIXED: to_recipients uses \x1F unit separator — unambiguous split
@@ -4381,15 +4442,14 @@ mod tests {
     // Deep Review #18 — Hypothesis Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED): to recipients bypass validate_agent_name ────────────
-    // send_message only length-checks recipients. Null bytes, control chars,
-    // path separators, and ".." are all accepted. Creates DashMap entries
-    // that can never be drained since create_agent rejects those names.
+    // ── H1 (FIXED): to recipients now validated for dangerous content ──────
+    // Recipients are checked for null bytes, control chars, path separators,
+    // and ".." — matching validate_agent_name pattern.
     #[tokio::test]
-    async fn dr18_h1_to_recipients_bypass_validate_agent_name() {
+    async fn dr18_h1_to_recipients_validated() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Null byte in recipient — accepted
+        // Null byte in recipient — now rejected
         let r1 = send_message(
             &state,
             json!({
@@ -4399,12 +4459,10 @@ mod tests {
                 "body": "hi"
             }),
         );
-        assert!(
-            r1.is_ok(),
-            "CONFIRMED: Null byte in recipient name is accepted"
-        );
+        assert!(r1.is_err(), "FIXED: Null byte in recipient rejected");
+        assert!(r1.unwrap_err().contains("null bytes"));
 
-        // Path traversal in recipient — accepted
+        // Path traversal in recipient — now rejected
         let r2 = send_message(
             &state,
             json!({
@@ -4414,12 +4472,10 @@ mod tests {
                 "body": "hi"
             }),
         );
-        assert!(
-            r2.is_ok(),
-            "CONFIRMED: Path traversal in recipient name is accepted"
-        );
+        assert!(r2.is_err(), "FIXED: Path traversal in recipient rejected");
+        assert!(r2.unwrap_err().contains("path separators"));
 
-        // Control char in recipient — accepted
+        // Control char in recipient — now rejected
         let r3 = send_message(
             &state,
             json!({
@@ -4429,35 +4485,36 @@ mod tests {
                 "body": "hi"
             }),
         );
-        assert!(
-            r3.is_ok(),
-            "CONFIRMED: Control chars in recipient name are accepted"
-        );
+        assert!(r3.is_err(), "FIXED: Control chars in recipient rejected");
+        assert!(r3.unwrap_err().contains("control characters"));
 
-        // These entries exist in DashMap but can never be drained by a
-        // legitimate agent (create_agent would reject all these names).
-        assert!(
-            state.inboxes.contains_key("\0ghost"),
-            "Dead entry: null byte key"
+        // Path separator in recipient — now rejected
+        let r4 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["path/sep"],
+                "subject": "test",
+                "body": "hi"
+            }),
         );
-        assert!(
-            state.inboxes.contains_key("../evil"),
-            "Dead entry: traversal key"
-        );
-        assert!(
-            state.inboxes.contains_key("agent\x07bell"),
-            "Dead entry: control char key"
-        );
+        assert!(r4.is_err(), "FIXED: Path separator in recipient rejected");
+        assert!(r4.unwrap_err().contains("path separators"));
 
-        // Attempting to create agents with these names fails
-        assert!(
-            create_agent(
-                &state,
-                json!({ "project_key": "p", "name_hint": "../evil" })
-            )
-            .is_err(),
-            "create_agent rejects path traversal"
+        // No orphan DashMap entries created
+        assert!(state.inboxes.is_empty(), "No orphan inbox entries");
+
+        // Clean recipient still works
+        let r5 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hi"
+            }),
         );
+        assert!(r5.is_ok(), "Clean recipient accepted");
     }
 
     // ── H2 (CONFIRMED): InboxEntry missing project_id ──────────────────────
@@ -4492,10 +4549,15 @@ mod tests {
         assert!(msgs[0].get("body").is_some(), "Has body");
         assert!(msgs[0].get("created_ts").is_some(), "Has created_ts");
 
-        // CONFIRMED: project_id is NOT in the inbox response
+        // FIXED: project_id is now present in the inbox response
         assert!(
-            msgs[0].get("project_id").is_none(),
-            "CONFIRMED: Inbox response missing project_id — clients can't identify project"
+            msgs[0].get("project_id").is_some(),
+            "FIXED: Inbox response includes project_id"
+        );
+        assert_eq!(
+            msgs[0]["project_id"].as_str().unwrap(),
+            "proj_important_123",
+            "FIXED: project_id matches what was sent"
         );
     }
 
@@ -4537,7 +4599,7 @@ mod tests {
                 search_messages(&state, json!({ "query": "split brain test", "limit": 10 }))
                     .unwrap();
             assert!(
-                !search.as_array().unwrap().is_empty(),
+                !search["results"].as_array().unwrap().is_empty(),
                 "Search finds message in first instance"
             );
 
@@ -4569,7 +4631,7 @@ mod tests {
                 search_messages(&state2, json!({ "query": "split brain test", "limit": 10 }))
                     .unwrap();
             assert!(
-                !search.as_array().unwrap().is_empty(),
+                !search["results"].as_array().unwrap().is_empty(),
                 "CONFIRMED: Tantivy search returns historical data after restart"
             );
 
@@ -4617,21 +4679,22 @@ mod tests {
         // Wait for indexing
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // search_messages: bare JSON array
+        // FIXED: search_messages now returns { results: [...], total: N }
         let search =
             search_messages(&state, json!({ "query": "envelope test", "limit": 10 })).unwrap();
         assert!(
-            search.is_array(),
-            "CONFIRMED: search_messages returns bare array"
+            search.get("results").is_some(),
+            "FIXED: search_messages has 'results' wrapper"
         );
         assert!(
-            search.get("messages").is_none(),
-            "CONFIRMED: search_messages has no 'messages' wrapper"
+            search.get("total").is_some(),
+            "FIXED: search_messages has 'total' field"
         );
         assert!(
-            search.get("remaining").is_none(),
-            "CONFIRMED: search_messages has no 'remaining' field"
+            search["results"].is_array(),
+            "FIXED: search results is an array"
         );
+        assert!(search["total"].is_number(), "FIXED: total is a number");
     }
 
     // ── H5 (CONFIRMED): subject accepts null bytes and control characters ──
@@ -4641,7 +4704,7 @@ mod tests {
     async fn dr18_h5_subject_accepts_control_chars() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Null byte in subject — accepted
+        // FIXED: Null byte in subject — now rejected
         let r1 = send_message(
             &state,
             json!({
@@ -4651,9 +4714,9 @@ mod tests {
                 "body": "hi"
             }),
         );
-        assert!(r1.is_ok(), "CONFIRMED: Subject with null byte is accepted");
+        assert!(r1.is_err(), "FIXED: Subject with null byte is rejected");
 
-        // Control chars in subject — accepted
+        // FIXED: Control chars in subject — now rejected
         let r2 = send_message(
             &state,
             json!({
@@ -4664,22 +4727,20 @@ mod tests {
             }),
         );
         assert!(
-            r2.is_ok(),
-            "CONFIRMED: Subject with control chars (ANSI escape) is accepted"
+            r2.is_err(),
+            "FIXED: Subject with control chars (ANSI escape) is rejected"
         );
 
-        // Verify both in inbox
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msgs = inbox_messages(&inbox);
-        assert_eq!(msgs.len(), 2, "Both messages delivered");
-
-        assert!(
-            msgs[0]["subject"].as_str().unwrap().contains('\0'),
-            "Null byte preserved in subject"
+        // Clean subject still works
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "Normal subject line",
+                "body": "hi"
+            }),
         );
-        assert!(
-            msgs[1]["subject"].as_str().unwrap().contains('\x1b'),
-            "ANSI escape preserved in subject"
-        );
+        assert!(r3.is_ok(), "Clean subject accepted");
     }
 }

@@ -57,6 +57,12 @@ pub struct AgentRecord {
 // ── Core State ───────────────────────────────────────────────────────────────
 // All hot-path reads and writes go through lock-free DashMap operations.
 // Persistence (Tantivy indexing, Git commits) is async via crossbeam channel.
+//
+// ARCHITECTURAL NOTE: DashMap state (agents, inboxes, projects) is ephemeral
+// and lost on restart. Tantivy index persists on disk. After restart,
+// search_messages returns historical data but agents/inboxes are empty.
+// This is by design: the hot path prioritizes speed over durability.
+// Clients must re-register agents after a server restart.
 #[derive(Clone)]
 pub struct PostOffice {
     // Lock-free concurrent state (microsecond access)
