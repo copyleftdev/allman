@@ -201,12 +201,14 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         .or_insert_with(|| project_key.to_string());
 
     // Fire-and-forget: persist agent profile to Git
+    let registered_at = Utc::now().timestamp();
     let profile = json!({
         "id": agent_id,
         "project_id": project_id,
         "name": name,
         "program": program,
-        "model": model
+        "model": model,
+        "registered_at": registered_at
     });
     if let Err(e) = state.persist_tx.try_send(PersistOp::GitCommit {
         path: format!("agents/{}/profile.json", name),
@@ -400,10 +402,10 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         .map(|e| {
             json!({
                 "id": e.message_id,
-                "from": e.from_agent,
+                "from_agent": e.from_agent,
                 "subject": e.subject,
                 "body": e.body,
-                "timestamp": e.timestamp
+                "created_ts": e.timestamp
             })
         })
         .collect();
@@ -1164,7 +1166,7 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
-            inbox_messages(&inbox)[0]["from"].as_str().unwrap(),
+            inbox_messages(&inbox)[0]["from_agent"].as_str().unwrap(),
             "ghost_agent"
         );
     }
@@ -1559,8 +1561,8 @@ mod tests {
 
         // Verify messages are well-formed
         assert!(msgs1[0]["id"].is_string());
-        assert_eq!(msgs1[0]["from"], "sender");
-        assert!(msgs1[0]["timestamp"].is_i64());
+        assert_eq!(msgs1[0]["from_agent"], "sender");
+        assert!(msgs1[0]["created_ts"].is_i64());
 
         // Second page with explicit limit
         let page2 = get_inbox(&state, json!({ "agent_name": "receiver", "limit": 200 })).unwrap();
@@ -1629,7 +1631,7 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
-            inbox_messages(&inbox)[0]["from"].as_str().unwrap(),
+            inbox_messages(&inbox)[0]["from_agent"].as_str().unwrap(),
             long_from,
             "from_agent preserved in inbox entry"
         );
@@ -1787,7 +1789,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         let arr = parsed["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 1, "Receiver has exactly 1 message");
-        assert_eq!(arr[0]["from"], "Sender");
+        assert_eq!(arr[0]["from_agent"], "Sender");
         assert_eq!(arr[0]["subject"], "Hello");
         assert_eq!(arr[0]["body"], "End-to-end test");
         assert_eq!(parsed["remaining"], 0);
@@ -2181,7 +2183,10 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
-            inbox_messages(&inbox)[0]["from"].as_str().unwrap().len(),
+            inbox_messages(&inbox)[0]["from_agent"]
+                .as_str()
+                .unwrap()
+                .len(),
             256,
             "Full 256-char from_agent preserved in inbox entry"
         );
@@ -2330,7 +2335,7 @@ mod tests {
         // Verify each got exactly one message with normal-sized content
         let inbox = get_inbox(&state, json!({ "agent_name": &recipients[0] })).unwrap();
         let msg = &inbox_messages(&inbox)[0];
-        assert_eq!(msg["from"], "alice");
+        assert_eq!(msg["from_agent"], "alice");
         assert_eq!(msg["body"], "hello");
     }
 
@@ -2499,7 +2504,7 @@ mod tests {
             1,
             "Special-char agent_name works as DashMap key (no filesystem access)"
         );
-        assert_eq!(inbox_messages(&inbox)[0]["from"], "alice");
+        assert_eq!(inbox_messages(&inbox)[0]["from_agent"], "alice");
     }
 
     // ── H3 (DISPROVED): Whitespace-only recipient is functional ─────────
@@ -2685,7 +2690,7 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "エージェント" })).unwrap();
         assert_eq!(inbox_messages(&inbox).len(), 1);
-        assert_eq!(inbox_messages(&inbox)[0]["from"], "Агент_1");
+        assert_eq!(inbox_messages(&inbox)[0]["from_agent"], "Агент_1");
         assert_eq!(inbox_messages(&inbox)[0]["body"], "こんにちは");
     }
 
@@ -2838,7 +2843,7 @@ mod tests {
 
         for (i, msg) in msgs.iter().enumerate() {
             assert_eq!(
-                msg["from"].as_str().unwrap(),
+                msg["from_agent"].as_str().unwrap(),
                 format!("sender_{}", i),
                 "Message {} must be in FIFO order",
                 i
@@ -2912,7 +2917,7 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "alice" })).unwrap();
         assert_eq!(inbox_messages(&inbox).len(), 1);
-        assert_eq!(inbox_messages(&inbox)[0]["from"], "alice");
+        assert_eq!(inbox_messages(&inbox)[0]["from_agent"], "alice");
         assert_eq!(inbox_messages(&inbox)[0]["subject"], "note to self");
     }
 
@@ -3233,11 +3238,11 @@ mod tests {
         assert_eq!(r["remaining"], 4, "4 remaining");
 
         // The one returned should be the first (FIFO)
-        assert_eq!(inbox_messages(&r)[0]["from"], "sender_0");
+        assert_eq!(inbox_messages(&r)[0]["from_agent"], "sender_0");
 
         // Subsequent calls continue from where we left off
         let r2 = get_inbox(&state, json!({ "agent_name": "target", "limit": 1 })).unwrap();
-        assert_eq!(inbox_messages(&r2)[0]["from"], "sender_1");
+        assert_eq!(inbox_messages(&r2)[0]["from_agent"], "sender_1");
         assert_eq!(r2["remaining"], 3);
     }
 
@@ -3275,7 +3280,7 @@ mod tests {
             let msgs = inbox_messages(&inbox);
             assert_eq!(msgs.len(), 1);
             assert_eq!(
-                msgs[0]["from"].as_str().unwrap().len(),
+                msgs[0]["from_agent"].as_str().unwrap().len(),
                 super::MAX_FROM_AGENT_LEN
             );
             assert_eq!(
@@ -3362,7 +3367,7 @@ mod tests {
         let msgs = inbox_messages(&inbox);
         assert_eq!(msgs.len(), 1);
         assert_eq!(
-            msgs[0]["from"], evil_from,
+            msgs[0]["from_agent"], evil_from,
             "Null byte preserved in from field"
         );
     }
@@ -3697,7 +3702,7 @@ mod tests {
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(inbox_messages(&inbox).len(), 1);
         assert_eq!(
-            inbox_messages(&inbox)[0]["from"],
+            inbox_messages(&inbox)[0]["from_agent"],
             "Agent Smith",
             "Spaced name preserved in inbox"
         );
@@ -3716,7 +3721,7 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "Agent Smith" })).unwrap();
         assert_eq!(inbox_messages(&inbox).len(), 1);
-        assert_eq!(inbox_messages(&inbox)[0]["from"], "bob");
+        assert_eq!(inbox_messages(&inbox)[0]["from_agent"], "bob");
     }
 
     // ── H4 (FIXED): NRT refresh task shuts down cleanly on PostOffice drop ────
@@ -3881,12 +3886,11 @@ mod tests {
         );
     }
 
-    // ── H2 (CONFIRMED): create_agent response has no timestamp field ──────────
-    // The response includes id, project_id, name, program, model — but no
-    // registered_at or timestamp. Clients cannot distinguish fresh registration
-    // from upsert by examining the response alone.
+    // ── H2 (FIXED): create_agent response now includes registered_at ──────────
+    // The response includes id, project_id, name, program, model, and
+    // registered_at (Unix timestamp). Clients can now see when registration occurred.
     #[tokio::test]
-    async fn dr16_h2_create_agent_response_has_no_timestamp() {
+    async fn dr16_h2_create_agent_response_has_timestamp() {
         let (state, _idx, _repo) = test_post_office();
 
         let r1 = create_agent(
@@ -3902,19 +3906,23 @@ mod tests {
         assert!(r1.get("program").is_some(), "Has program");
         assert!(r1.get("model").is_some(), "Has model");
         assert!(
-            r1.get("registered_at").is_none(),
-            "CONFIRMED: No timestamp field in create_agent response"
+            r1.get("registered_at").is_some(),
+            "FIXED: create_agent response now includes registered_at"
+        );
+        assert!(
+            r1["registered_at"].is_i64(),
+            "registered_at is a Unix timestamp"
         );
 
-        // Upsert returns same structure — indistinguishable from fresh registration
+        // Upsert returns same structure with fresh timestamp
         let r2 = create_agent(
             &state,
             json!({ "project_key": "proj", "name_hint": "Alice", "program": "v2" }),
         )
         .unwrap();
         assert!(
-            r2.get("registered_at").is_none(),
-            "Upsert also has no timestamp"
+            r2.get("registered_at").is_some(),
+            "Upsert also includes registered_at"
         );
 
         // Only id differs between registration and upsert
@@ -3950,13 +3958,10 @@ mod tests {
         assert_eq!(unwrapped["id"], "abc123");
     }
 
-    // ── H4 (CONFIRMED): get_inbox and search_messages use different field names ─
-    // get_inbox returns: { "id", "from", "subject", "body", "timestamp" }
-    // search returns:    { "id", "from_agent", "subject", "body", "created_ts", ... }
-    // The sender field is "from" in inbox but "from_agent" in search.
-    // The timestamp field is "timestamp" in inbox but "created_ts" in search.
+    // ── H4 (FIXED): get_inbox and search_messages now use consistent field names
+    // Both return: { "id", "from_agent", "subject", "body", "created_ts" }
     #[tokio::test]
-    async fn dr16_h4_inbox_vs_search_field_name_mismatch() {
+    async fn dr16_h4_inbox_and_search_field_names_match() {
         let (state, _idx, _repo) = test_post_office();
 
         send_message(
@@ -3974,18 +3979,21 @@ mod tests {
         // Check inbox field names
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         let inbox_msg = &inbox_messages(&inbox)[0];
-        assert!(inbox_msg.get("from").is_some(), "Inbox has 'from' field");
         assert!(
-            inbox_msg.get("from_agent").is_none(),
-            "Inbox does NOT have 'from_agent'"
+            inbox_msg.get("from_agent").is_some(),
+            "FIXED: Inbox now uses 'from_agent'"
         );
         assert!(
-            inbox_msg.get("timestamp").is_some(),
-            "Inbox has 'timestamp'"
+            inbox_msg.get("from").is_none(),
+            "Old 'from' field no longer present"
         );
         assert!(
-            inbox_msg.get("created_ts").is_none(),
-            "Inbox does NOT have 'created_ts'"
+            inbox_msg.get("created_ts").is_some(),
+            "FIXED: Inbox now uses 'created_ts'"
+        );
+        assert!(
+            inbox_msg.get("timestamp").is_none(),
+            "Old 'timestamp' field no longer present"
         );
 
         // Wait for indexing
