@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "allman=debug,tower_http=debug".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "allman=info,tower_http=info".into()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -75,7 +75,15 @@ async fn mcp_handler(
     Extension(state): Extension<PostOffice>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    tracing::debug!("Received MCP payload: {:?}", payload);
+    let method = payload
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let tool = payload
+        .pointer("/params/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    tracing::debug!(method, tool, "MCP request");
     let response = controllers::handle_mcp_request(state, payload).await;
     Json(response)
 }
