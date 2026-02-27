@@ -13,6 +13,8 @@ const MAX_PROJECT_KEY_LEN: usize = 256;
 const MAX_RECIPIENTS: usize = 100;
 const MAX_SUBJECT_LEN: usize = 1_024;
 const MAX_BODY_LEN: usize = 65_536; // 64 KB
+const MAX_PROGRAM_LEN: usize = 4_096; // 4 KB
+const MAX_MODEL_LEN: usize = 256;
 const DEFAULT_INBOX_LIMIT: usize = 100;
 const MAX_INBOX_LIMIT: usize = 1_000;
 
@@ -87,6 +89,9 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
     if name.contains("..") {
         return Err("Invalid agent name: must not contain '..'".to_string());
     }
+    if name == "." {
+        return Err("Invalid agent name: must not be '.'".to_string());
+    }
     if name.contains('\0') {
         return Err("Invalid agent name: must not contain null bytes".to_string());
     }
@@ -123,6 +128,12 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     let name_hint = args.get("name_hint").and_then(|v| v.as_str());
 
     // Validate all inputs BEFORE mutating any state.
+    if program.len() > MAX_PROGRAM_LEN {
+        return Err(format!("program exceeds {} byte limit", MAX_PROGRAM_LEN));
+    }
+    if model.len() > MAX_MODEL_LEN {
+        return Err(format!("model exceeds {} byte limit", MAX_MODEL_LEN));
+    }
     let name = name_hint.unwrap_or("AnonymousAgent").to_string();
     validate_agent_name(&name)?;
 
@@ -2244,33 +2255,30 @@ mod tests {
         assert_eq!(msg["body"], "hello");
     }
 
-    // ── H4 (DISPROVED): Unvalidated program/model fields are bounded ─────
-    // program and model are stored once per agent (not per recipient).
-    // No amplification possible. This test documents the behavior.
+    // ── H4 (UPDATED DR11): program/model now have explicit bounds ────────
+    // program capped at MAX_PROGRAM_LEN (4096), model at MAX_MODEL_LEN (256).
+    // Values at the boundary are accepted; values over are rejected.
     #[tokio::test]
-    async fn dr7_h4_large_program_model_accepted() {
+    async fn dr7_h4_program_model_within_bounds_accepted() {
         let (state, _idx, _repo) = test_post_office();
 
-        let big_program = "P".repeat(10_000);
-        let big_model = "M".repeat(10_000);
+        let ok_program = "P".repeat(super::MAX_PROGRAM_LEN);
+        let ok_model = "M".repeat(super::MAX_MODEL_LEN);
 
         let result = create_agent(
             &state,
             json!({
                 "project_key": "test",
                 "name_hint": "BigAgent",
-                "program": big_program,
-                "model": big_model,
+                "program": ok_program,
+                "model": ok_model,
             }),
         );
-        assert!(
-            result.is_ok(),
-            "Large program/model are accepted (stored once per agent, not amplified)"
-        );
+        assert!(result.is_ok(), "program/model at boundary are accepted");
 
         let record = state.agents.get("BigAgent").unwrap();
-        assert_eq!(record.program.len(), 10_000);
-        assert_eq!(record.model.len(), 10_000);
+        assert_eq!(record.program.len(), super::MAX_PROGRAM_LEN);
+        assert_eq!(record.model.len(), super::MAX_MODEL_LEN);
     }
 
     // ── H5 (DISPROVED): QueryParser construction is lightweight ──────────
@@ -2827,5 +2835,181 @@ mod tests {
         assert_eq!(inbox_messages(&inbox).len(), 1);
         assert_eq!(inbox_messages(&inbox)[0]["from"], "alice");
         assert_eq!(inbox_messages(&inbox)[0]["subject"], "note to self");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #11 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (FIXED): program and model have explicit length bounds ──────
+    // Every user-facing text input now has a MAX_* constant:
+    //   agent_name (128), from_agent (256), project_key (256),
+    //   subject (1024), body (65536), program (4096), model (256),
+    //   recipients count (100).
+    #[tokio::test]
+    async fn dr11_h1_program_model_length_validated() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // program exceeding MAX_PROGRAM_LEN (4096) must be rejected
+        let big_program = "P".repeat(super::MAX_PROGRAM_LEN + 1);
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "BigProg",
+                "program": big_program,
+            }),
+        );
+        assert!(result.is_err(), "Oversized program must be rejected");
+        assert!(result.unwrap_err().contains("program exceeds"));
+
+        // model exceeding MAX_MODEL_LEN (256) must be rejected
+        let big_model = "M".repeat(super::MAX_MODEL_LEN + 1);
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "BigModel",
+                "model": big_model,
+            }),
+        );
+        assert!(result.is_err(), "Oversized model must be rejected");
+        assert!(result.unwrap_err().contains("model exceeds"));
+
+        // At the boundary: exactly MAX lengths accepted
+        let ok_program = "P".repeat(super::MAX_PROGRAM_LEN);
+        let ok_model = "M".repeat(super::MAX_MODEL_LEN);
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "BoundaryAgent",
+                "program": ok_program,
+                "model": ok_model,
+            }),
+        );
+        assert!(result.is_ok(), "Exact boundary must be accepted");
+
+        // No state mutated on rejected calls
+        assert!(!state.agents.contains_key("BigProg"));
+        assert!(!state.agents.contains_key("BigModel"));
+    }
+
+    // ── H2 (FIXED): Agent "." is rejected by validate_agent_name ────────
+    // "." would create an anomalous Git path "agents/./profile.json" that
+    // normalizes to "agents/profile.json". Now explicitly rejected.
+    #[tokio::test]
+    async fn dr11_h2_dot_agent_name_is_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(&state, json!({ "project_key": "test", "name_hint": "." }));
+        assert!(result.is_err(), "Agent name '.' must be rejected");
+        assert!(result.unwrap_err().contains("must not be '.'"));
+
+        // No state mutated
+        assert!(!state.agents.contains_key("."));
+        assert_eq!(state.projects.len(), 0);
+    }
+
+    // ── H3 (DISPROVED): Non-string method returns error, no panic ────────
+    // handle_mcp_request uses .as_str() which returns None for non-strings,
+    // falling through to "" → _ arm → -32601 Method not found.
+    #[tokio::test]
+    async fn dr11_h3_nonstring_method_returns_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // method is an integer, not a string
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": 42 }),
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"], -32601,
+            "Non-string method should return Method not found"
+        );
+
+        // method is a boolean
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": true }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32601);
+
+        // method is an array
+        let resp = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 3, "method": ["tools/call"] }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    // ── H4 (DISPROVED): Body with null bytes is correctly handled ────────
+    // Rust strings support \0. serde_json serializes as \u0000 in JSON.
+    #[tokio::test]
+    async fn dr11_h4_body_with_null_bytes_handled() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let body_with_nulls = "hello\0world\0end";
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "null test",
+                "body": body_with_nulls,
+            }),
+        );
+        assert!(result.is_ok(), "Body with null bytes must be accepted");
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        assert_eq!(inbox_messages(&inbox).len(), 1);
+        assert_eq!(
+            inbox_messages(&inbox)[0]["body"].as_str().unwrap(),
+            body_with_nulls,
+            "Null bytes preserved in body round-trip"
+        );
+    }
+
+    // ── H5 (DISPROVED): Exact limit boundary triggers full drain + cleanup ─
+    // When inbox.len() == limit, the <= branch fires: mem::take + occ.remove.
+    // The DashMap entry is cleaned up, not left as an empty Vec.
+    #[tokio::test]
+    async fn dr11_h5_exact_limit_triggers_full_drain() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send exactly 50 messages
+        for i in 0..50 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender",
+                    "to": ["target"],
+                    "subject": format!("msg {}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        assert!(state.inboxes.contains_key("target"));
+
+        // Drain with limit == inbox.len() (exact boundary)
+        let result = get_inbox(&state, json!({ "agent_name": "target", "limit": 50 })).unwrap();
+        assert_eq!(
+            inbox_messages(&result).len(),
+            50,
+            "All 50 messages returned"
+        );
+        assert_eq!(result["remaining"], 0, "Zero remaining");
+
+        // DashMap entry must be cleaned up (occ.remove() in <= branch)
+        assert!(
+            !state.inboxes.contains_key("target"),
+            "Exact boundary must trigger full drain + DashMap entry removal"
+        );
     }
 }
