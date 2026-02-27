@@ -70,11 +70,7 @@ impl GitActor {
     fn handle_commit(&self, rel_path: &str, content: &str, msg: &str) -> anyhow::Result<()> {
         // Defense-in-depth: reject paths that escape the repo root.
         let rel = Path::new(rel_path);
-        anyhow::ensure!(
-            !rel.is_absolute(),
-            "Refusing absolute path: {}",
-            rel_path
-        );
+        anyhow::ensure!(!rel.is_absolute(), "Refusing absolute path: {}", rel_path);
         for component in rel.components() {
             anyhow::ensure!(
                 !matches!(component, std::path::Component::ParentDir),
@@ -153,8 +149,7 @@ mod tests {
         let actor = GitActor::new(repo_dir.path().to_path_buf(), rx);
         actor.ensure_repo().unwrap();
 
-        let result =
-            actor.handle_commit("agents/../../etc/passwd", "pwned", "deep traversal");
+        let result = actor.handle_commit("agents/../../etc/passwd", "pwned", "deep traversal");
         assert!(result.is_err(), "Deep path traversal must be rejected");
     }
 
@@ -178,8 +173,7 @@ mod tests {
         let actor = GitActor::new(repo_dir.path().to_path_buf(), rx);
         actor.ensure_repo().unwrap();
 
-        let result =
-            actor.handle_commit("agents/alice/profile.json", "ok", "valid nested path");
+        let result = actor.handle_commit("agents/alice/profile.json", "ok", "valid nested path");
         assert!(result.is_ok(), "Valid nested paths must still work");
         assert!(repo_dir.path().join("agents/alice/profile.json").exists());
     }
@@ -229,7 +223,10 @@ mod tests {
         actor.ensure_repo().unwrap();
 
         let result = actor.handle_commit("init.txt", "hello", "initial commit");
-        assert!(result.is_ok(), "Initial commit on empty repo should succeed");
+        assert!(
+            result.is_ok(),
+            "Initial commit on empty repo should succeed"
+        );
 
         let repo = Repository::open(repo_dir.path()).unwrap();
         let head = repo.head().unwrap();

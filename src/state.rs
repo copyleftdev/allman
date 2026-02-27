@@ -47,8 +47,8 @@ pub struct AgentRecord {
 #[derive(Clone)]
 pub struct PostOffice {
     // Lock-free concurrent state (microsecond access)
-    pub projects: Arc<DashMap<String, String>>,        // project_id → human_key
-    pub agents: Arc<DashMap<String, AgentRecord>>,     // agent_name → record
+    pub projects: Arc<DashMap<String, String>>, // project_id → human_key
+    pub agents: Arc<DashMap<String, AgentRecord>>, // agent_name → record
     pub inboxes: Arc<DashMap<String, Vec<InboxEntry>>>, // agent_name → unread messages
 
     // Tantivy search (read path only — writes go through persist pipeline)

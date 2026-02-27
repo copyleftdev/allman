@@ -310,7 +310,10 @@ mod tests {
             &state,
             json!({ "project_key": "project_b", "name_hint": "Alice", "program": "prog_b" }),
         );
-        assert!(r2.is_err(), "Same name in different project must be rejected");
+        assert!(
+            r2.is_err(),
+            "Same name in different project must be rejected"
+        );
         assert!(
             r2.unwrap_err().contains("already registered"),
             "Error should mention the name conflict"
@@ -318,7 +321,10 @@ mod tests {
 
         // Original agent must be preserved
         let record = state.agents.get("Alice").unwrap();
-        assert_eq!(record.program, "prog_a", "Original agent must not be overwritten");
+        assert_eq!(
+            record.program, "prog_a",
+            "Original agent must not be overwritten"
+        );
     }
 
     // Same-project re-registration must be idempotent (upsert).
@@ -339,7 +345,10 @@ mod tests {
         .unwrap();
 
         // Both succeed — second is an upsert
-        assert_ne!(r1["id"], r2["id"], "Re-registration generates a new agent_id");
+        assert_ne!(
+            r1["id"], r2["id"],
+            "Re-registration generates a new agent_id"
+        );
         let record = state.agents.get("Bob").unwrap();
         assert_eq!(record.program, "v2", "Upsert should update the record");
     }
@@ -382,12 +391,19 @@ mod tests {
                     "body": "x".repeat(100),
                 }),
             );
-            assert!(result.is_ok(), "send_message should never reject on inbox size");
+            assert!(
+                result.is_ok(),
+                "send_message should never reject on inbox size"
+            );
         }
 
         // CONFIRMED: All 10,000 messages accepted. No backpressure.
         let inbox = state.inboxes.get("victim").unwrap();
-        assert_eq!(inbox.len(), 10_000, "All 10k messages stored — no inbox limit exists");
+        assert_eq!(
+            inbox.len(),
+            10_000,
+            "All 10k messages stored — no inbox limit exists"
+        );
     }
 
     // ── H4: Silent Channel Drop ─────────────────────────────────────────────
@@ -409,7 +425,10 @@ mod tests {
                 "body": "hello",
             }),
         );
-        assert!(result.is_ok(), "send_message always succeeds even if indexing might fail");
+        assert!(
+            result.is_ok(),
+            "send_message always succeeds even if indexing might fail"
+        );
 
         // CONFIRMED by code inspection: line 169 uses `let _ = state.persist_tx.try_send(...)`.
         // There is no feedback path from the persist pipeline to the caller.
@@ -466,10 +485,7 @@ mod tests {
         let (state, _idx, _repo) = test_post_office();
 
         // A limit of 999999999 must not allocate that much — should be capped.
-        let r = search_messages(
-            &state,
-            json!({ "query": "hello", "limit": 999_999_999 }),
-        );
+        let r = search_messages(&state, json!({ "query": "hello", "limit": 999_999_999 }));
         assert!(r.is_ok(), "Huge limit must be capped, not cause OOM");
     }
 
@@ -512,10 +528,7 @@ mod tests {
     async fn h9_create_agent_allows_safe_names() {
         let (state, _idx, _repo) = test_post_office();
         for name in &["Alice", "agent_007", "Bob-Smith", "CamelCase42"] {
-            let r = create_agent(
-                &state,
-                json!({ "project_key": "test", "name_hint": name }),
-            );
+            let r = create_agent(&state, json!({ "project_key": "test", "name_hint": name }));
             assert!(r.is_ok(), "Safe name '{}' should be accepted", name);
         }
     }
@@ -566,7 +579,11 @@ mod tests {
 
         let second = get_inbox(&state, json!({ "agent_name": "b" })).unwrap();
         let second_arr = second.as_array().unwrap();
-        assert_eq!(second_arr.len(), 0, "Second drain should be empty — messages consumed");
+        assert_eq!(
+            second_arr.len(),
+            0,
+            "Second drain should be empty — messages consumed"
+        );
     }
 
     // ── H-PROJ: project_id is deterministic from project_key ────────────────
