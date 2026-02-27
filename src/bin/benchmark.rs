@@ -1,7 +1,6 @@
 use reqwest::Client;
-use serde_json::{json, Value};
-use std::time::{Instant, Duration};
-use tokio::task;
+use serde_json::json;
+use std::time::Instant;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 

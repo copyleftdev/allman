@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::sleep;
-use rand::Rng;
+
 
 const SERVER_URL: &str = "http://localhost:8000/mcp";
 const LLM_API_URL: &str = "http://127.0.0.1:8001/v1/chat/completions";

@@ -23,7 +23,6 @@ RUN cargo build --release
 RUN rm src/*.rs
 
 # Copy source code
-COPY ./migrations ./migrations
 COPY ./src ./src
 
 # Build the actual application

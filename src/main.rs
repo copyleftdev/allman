@@ -27,22 +27,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     dotenv::dotenv().ok();
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:allman.db".to_string());
     let index_path_str = std::env::var("INDEX_PATH").unwrap_or_else(|_| "allman_index".to_string());
     let index_path = std::path::Path::new(&index_path_str);
     let repo_root_str = std::env::var("REPO_ROOT").unwrap_or_else(|_| "allman_repo".to_string());
     let repo_root = std::path::Path::new(&repo_root_str);
 
-    // Ensure database file exists for SQLite if not using memory
-    if let Some(path) = database_url.strip_prefix("sqlite:") {
-        if path != ":memory:"
-            && !std::path::Path::new(path).exists() {
-                std::fs::File::create(path).expect("Failed to create database file");
-            }
-    }
-
-    let state = PostOffice::new(&database_url, index_path, repo_root).await?;
+    let state = PostOffice::new(index_path, repo_root)?;
 
     // Build the application router
     let app = Router::new()

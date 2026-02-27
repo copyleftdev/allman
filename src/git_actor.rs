@@ -1,7 +1,7 @@
 use anyhow::Context;
+use crossbeam_channel::Receiver;
 use git2::{Repository, Signature};
 use std::path::{Path, PathBuf};
-use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum GitRequest {
@@ -14,32 +14,32 @@ pub enum GitRequest {
         content: String,
         message: String,
     },
-    // Maybe other ops later, like EnsureRepo
 }
 
 pub struct GitActor {
     repo_root: PathBuf,
-    receiver: mpsc::Receiver<GitRequest>,
+    receiver: Receiver<GitRequest>,
 }
 
 impl GitActor {
-    pub fn new(repo_root: PathBuf, receiver: mpsc::Receiver<GitRequest>) -> Self {
+    pub fn new(repo_root: PathBuf, receiver: Receiver<GitRequest>) -> Self {
         Self {
             repo_root,
             receiver,
         }
     }
 
-    pub async fn run(mut self) {
+    /// Run the actor on a dedicated OS thread. git2 is synchronous —
+    /// this must never execute on the tokio runtime.
+    pub fn run(self) {
         tracing::info!("GitActor started for {:?}", self.repo_root);
 
-        // Ensure repo exists
         if let Err(e) = self.ensure_repo() {
             tracing::error!("Failed to initialize git repo: {:?}", e);
             return;
         }
 
-        while let Some(req) = self.receiver.recv().await {
+        while let Ok(req) = self.receiver.recv() {
             match req {
                 GitRequest::CommitFile {
                     path,
@@ -52,6 +52,7 @@ impl GitActor {
                 }
             }
         }
+        tracing::info!("GitActor shutting down (channel closed)");
     }
 
     fn ensure_repo(&self) -> anyhow::Result<Repository> {

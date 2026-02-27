@@ -1,132 +1,134 @@
-# 👁️ Allman
-**A Hyper-Performance AI Agent "Nervous System"**
+# Allman
 
-> *Inspired by the `mcp-agent-mail` pattern found in typical agent frameworks, but re-engineered from first principles for near-zero latency, extreme throughput, and data locality.*
+A high-performance MCP agent mail server built in Rust. Named in honor of [Eric Allman](https://en.wikipedia.org/wiki/Eric_Allman), creator of Sendmail.
 
-## 🚀 Overview
+Allman acts as the communication backbone for large swarms of autonomous AI agents — lock-free message routing, near-real-time search, and a Git-backed audit trail, all exposed through the [Model Context Protocol](https://modelcontextprotocol.io/).
 
-Allman is a standalone **Model Context Protocol (MCP)** server designed to act as the high-speed communication backbone for large swarms of autonomous agents. 
+## Architecture
 
-While traditional agent mailboxes rely on slow file I/O or JSON parsing in Python/Node, **Allman** is built in **Rust** and acts as a neurological switchboard, routing thousands of thoughts and messages per second.
-
-### Why Allman?
-*   **Zero-Latency Communication**: Benchmarked at **12,000+ messages/sec**.
-*   **Neural Search**: Built-in Tantivy indexing provides NRT (Near Real-Time) semantic search at **9,000+ queries/sec**.
-*   **Integrated Intelligence**: Orchestrates local GPU resources (vLLM) to provide a "Brain-in-a-Box" via standard OpenAI protocols.
-*   **Standard Compliance**: Fully compliant with MCP `tools/list` and `tools/call`.
-
-## 🏗️ System Architecture
-
-```ascii
-                                    [ GPU 1: RTX 3080 Ti ]
-                                             |
-[ Agent Swarm ] <----(HTTP/JSON)----> [ vLLM Inference Engine ]
-       |                               (Port 8001 / OpenAI API)
-       |
-(MCP / JSON-RPC)
-       v
-+-----------------------------------------------------------+
-|                      ALLMAN SERVER (Rust)                 |
-|                                                           |
-|  [ MCP Controller ] -> Exposes tools/call, tools/list     |
-|         |                                                 |
-|  [ PostOffice (State) ]                                   |
-|         |-- [ SQLite (WAL Mode) ] -> Persistence          |
-|         |-- [ Tantivy Index ]     -> Search Engine        |
-|         |-- [ Git Backup ]        -> Audit Trail          |
-+-----------------------------------------------------------+
-       ^
-       | (Port 8000)
-    [ Client / Dashboard ]
+```
+[ Agent Swarm ]                      [ vLLM / GPU Inference ]
+       |                                   (Port 8001)
+  MCP JSON-RPC                              |
+       v                                    |
++----------------------------------------------+
+|              ALLMAN SERVER (Rust)              |
+|                                               |
+|  MCP Controller   (tools/call, tools/list)    |
+|       |                                       |
+|  PostOffice                                   |
+|    ├─ DashMap        lock-free hot state       |
+|    ├─ Tantivy        NRT full-text search      |
+|    └─ Git Actor      audit trail (OS thread)   |
+|                                               |
+|  Persist Worker      batched indexing pipeline  |
+|    crossbeam-channel → Tantivy IndexWriter     |
++----------------------------------------------+
+              Port 8000
 ```
 
-## 📊 Performance Benchmarks
-*Tested on Dual NVIDIA RTX 3080 Ti Workstation.*
+**Hot path** (create_agent, send_message, get_inbox): DashMap read/write only — no disk I/O, no locks, microsecond latency.
 
-| Component | Operation | Throughput | Latency |
-| :--- | :--- | :--- | :--- |
-| **Server** | Message Ingestion | **11,937 msgs/s** | ~80µs |
-| **Server** | Inbox Retrieval | **18,304 req/s** | ~50µs |
-| **Server** | Full Text Search | **9,043 q/s** | ~110µs |
-| **Brain** | Mistral 7B (AWQ) | **~60 tokens/s** | <500ms TTFT |
+**Persistence**: fire-and-forget via crossbeam channel. A dedicated OS thread batches Tantivy index writes and Git commits. The client never waits for disk.
 
-## 🛠️ Prerequisites
+## MCP Tools
 
-*   **Linux OS** (Ubuntu 22.04+ recommended)
-*   **Docker** & `nvidia-container-toolkit` for GPU acceleration.
-*   **NVIDIA GPU** (min 8GB VRAM for 7B Models).
-*   **Rust Toolchain** (1.75+).
+Connect any MCP-compatible client to `http://localhost:8000/mcp`.
 
-## 📥 Installation
+| Tool | Description |
+|:---|:---|
+| `create_agent` | Register an agent (project_key, name_hint, program, model) |
+| `send_message` | Send a message (from_agent, to, subject, body, project_id) |
+| `get_inbox` | Retrieve and drain unread messages for an agent |
+| `search_messages` | Full-text search across all indexed messages |
 
-1.  **Clone the Repository**
-    ```bash
-    git clone https://github.com/copyleftdev/allman.git
-    cd allman
-    ```
+## Getting Started
 
-2.  **Configure GPU**
-    Run the setup script to install NVIDIA Container Toolkit if not present:
-    ```bash
-    sudo ./setup_gpu.sh
-    ```
+### Prerequisites
 
-3.  **Start Services (Allman + vLLM)**
-    ```bash
-    docker compose up -d
-    ```
-    *   This launches:
-        *   **allman_server**: The Rust MCP server (Port 8000).
-        *   **vllm_server**: The GPU Inference Engine (Port 8001).
+- **Rust** 1.75+
+- **Docker** (optional — for containerized deployment and vLLM)
+- **NVIDIA GPU** + `nvidia-container-toolkit` (optional — only for LLM inference)
 
-    > **Note**: The default config uses `TheBloke/Mistral-7B-Instruct-v0.2-AWQ` heavily optimized for consumer GPUs. It requires ~6GB VRAM.
+### Build from Source
 
-4.  **Verify Status**
-    ```bash
-    docker logs -f vllm_server
-    # Wait for: "Application startup complete"
-    ```
+```bash
+git clone https://github.com/copyleftdev/allman.git
+cd allman
+cargo build --release
+```
 
-## 🧪 Usage
+### Run
 
-### Running Simulations
-Allman comes with a **Cybersecurity Threat Simulation** to demonstrate swarm behavior.
+```bash
+# Start the server (binds to 0.0.0.0:8000)
+cargo run --release
+```
+
+Configuration via environment variables (or `.env`):
+
+| Variable | Default | Description |
+|:---|:---|:---|
+| `INDEX_PATH` | `allman_index` | Tantivy index directory |
+| `REPO_ROOT` | `allman_repo` | Git audit trail directory |
+| `RUST_LOG` | `allman=debug` | Log level filter |
+
+### Docker
+
+```bash
+# Allman server only
+docker compose up allman -d
+
+# Allman + vLLM GPU inference
+sudo ./setup_gpu.sh   # one-time NVIDIA toolkit install
+docker compose up -d
+```
+
+## Simulations
+
+Included binaries demonstrate swarm behavior with LLM-driven agents:
+
+| Binary | Description |
+|:---|:---|
+| `cyber_sim` | 30-agent cybersecurity incident response (Blue Team, Forensics, CISO) |
+| `black_friday` | Retail chaos simulation with personality-driven personas |
+| `escrow_sim` | Real estate closing day with buyer, seller, and escrow officer |
+| `swarm_stress` | High-concurrency stress test for throughput benchmarking |
+| `benchmark` | Targeted latency and throughput measurements |
 
 ```bash
 cargo run --release --bin cyber_sim
+cargo run --release --bin swarm_stress
 ```
 
-This will:
-1.  Register 30 Autonomous Agents with unique roles (Team Blue, Forensics, CISO, etc.).
-2.  Connect them to the **vLLM** backend.
-3.  Simulate a chaotic data exfiltration event.
-4.  Agents will autonomously "think" (using vLLM) and "email" each other (using Allman) to resolve the incident.
+> **Note**: Simulations that use LLM inference require a running vLLM instance on port 8001. The stress test and benchmark run against Allman alone.
 
-### 2. "Black Friday" Retail Event 🎬
-A cinematic chaos simulation with personality-driven agents.
+## Project Structure
+
+```
+src/
+├── main.rs           Axum server, routing, MCP endpoint
+├── controllers.rs    MCP tool dispatch (create_agent, send_message, etc.)
+├── state.rs          PostOffice: DashMap state, Tantivy index, persist pipeline
+├── models.rs         Data types (InboxEntry, Agent, Message)
+├── git_actor.rs      Dedicated OS thread for Git audit commits
+└── bin/
+    ├── benchmark.rs
+    ├── black_friday.rs
+    ├── cyber_sim.rs
+    ├── escrow_sim.rs
+    ├── simulation.rs
+    └── swarm_stress.rs
+```
+
+## Contributing
 
 ```bash
-cargo run --release --bin black_friday
+cargo fmt
+cargo check   # must pass clean
+cargo test
 ```
 
-This will:
-1.  Register 5 distinct personas (Manager Dave, Shopper Karen, etc.).
-2.  Simulate a retail meltdown event (stuck doors, POS crash).
-3.  Demonstrate complex LLM role-playing and efficient vLLM usage (127.0.0.1).
+## License
 
-### MCP Tools
-To use Allman with your own agent framework (e.g., Claude Desktop, LangChain), connect to `http://localhost:8000/mcp`.
-
-Available Tools:
-*   `create_agent`: Register yourself.
-*   `send_message(to, subject, body)`: Dispatch comms.
-*   `get_inbox`: Check mail.
-*   `search_messages(query)`: Find intel.
-
-## 🤝 Contribution
-Clean code is strictly enforced.
-*   Ensure `cargo check` passes.
-*   Run `cargo fmt` before committing.
-
-## 📜 License
 MIT

@@ -17,14 +17,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Search Engine
-# Downgrading to 0.19 to avoid zstd-safe 6.x issues
 tantivy = "0.19"
 
-# Database
-sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-native-tls", "migrate"] }
-
 # Version Control
-git2 = { version = "0.18" } # Downgrading git2 slightly as well to match that era
+git2 = "0.18"
+
+# Concurrent Data Structures
+dashmap = "5"
+crossbeam-channel = "0.5"
 
 # Utilities
 uuid = { version = "1.7", features = ["v4", "v5", "serde"] }

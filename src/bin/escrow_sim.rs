@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
     sleep(Duration::from_millis(1500)).await;
     bob.initiate("Eddie", "Did the wire hit?").await?;
 
-    let agents = vec!["Alice", "Bob", "Eddie"];
+    let _agents = vec!["Alice", "Bob", "Eddie"];
     
     // Simulation Loop
     for turn in 1..8 {
