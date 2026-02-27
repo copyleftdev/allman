@@ -4086,4 +4086,214 @@ mod tests {
         // Brief sleep to let worker threads finish
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Deep Review #17 — Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): to_recipients join(" ") is ambiguous for spaced names ─
+    // Agent names can contain spaces (DR15 H3). Joining with " " makes the
+    // to_recipients field in Tantivy unsplittable. "Agent A Agent B" could be
+    // one recipient "Agent A Agent B" or two: "Agent A" and "Agent B".
+    #[tokio::test]
+    async fn dr17_h1_to_recipients_join_ambiguous_with_spaced_names() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register agents with spaces in names
+        create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Agent A" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Agent B" }),
+        )
+        .unwrap();
+
+        // Send to two space-containing recipients
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": ["Agent A", "Agent B"],
+                "subject": "dr17_join_test",
+                "body": "ambiguity check",
+                "project_id": "proj_dr17"
+            }),
+        )
+        .unwrap();
+        assert_eq!(r["status"], "sent");
+
+        // Wait for Tantivy indexing
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Search for this message
+        let search =
+            search_messages(&state, json!({ "query": "dr17_join_test", "limit": 10 })).unwrap();
+        let docs = search.as_array().unwrap();
+        assert!(!docs.is_empty(), "Message indexed");
+
+        // CONFIRMED: to_recipients is a flat space-joined string — ambiguous
+        let to_field = docs[0]["to_recipients"].as_str().unwrap();
+        assert_eq!(
+            to_field, "Agent A Agent B",
+            "CONFIRMED: Space-joined recipients produce ambiguous string"
+        );
+
+        // Demonstrate ambiguity: this is indistinguishable from 4 single-word recipients
+        // "Agent", "A", "Agent", "B" — or from a single recipient "Agent A Agent B"
+        let parts: Vec<&str> = to_field.split(' ').collect();
+        assert_eq!(parts.len(), 4, "Split produces 4 tokens, not 2 recipients");
+    }
+
+    // ── H2 (CONFIRMED): tools/list missing inputSchema per MCP spec ───────────
+    // MCP protocol requires each tool to declare its inputSchema (JSON Schema)
+    // so clients can validate arguments. Our tools/list only returns name and
+    // description — no schema.
+    #[tokio::test]
+    async fn dr17_h2_tools_list_missing_input_schema() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4, "Four tools returned");
+
+        for tool in tools {
+            assert!(tool.get("name").is_some(), "Has name");
+            assert!(tool.get("description").is_some(), "Has description");
+            assert!(
+                tool.get("inputSchema").is_none(),
+                "CONFIRMED: No inputSchema — MCP clients can't introspect arguments"
+            );
+        }
+    }
+
+    // ── H3 (CONFIRMED): projects DashMap unbounded and never read ──────────────
+    // state.projects accumulates entries on every create_agent but has no cap
+    // and no tool ever queries it. It's a memory leak for distinct project_keys.
+    #[tokio::test]
+    async fn dr17_h3_projects_dashmap_unbounded_and_unread() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register agents across many distinct projects
+        for i in 0..50 {
+            create_agent(
+                &state,
+                json!({
+                    "project_key": format!("project_{}", i),
+                    "name_hint": format!("agent_{}", i)
+                }),
+            )
+            .unwrap();
+        }
+
+        // Projects map grows with each unique project_key
+        assert_eq!(
+            state.projects.len(),
+            50,
+            "CONFIRMED: projects DashMap grows without bound — 50 entries, no cap"
+        );
+
+        // No tool reads from projects — it's write-only state.
+        // Verify none of the 4 tools access it:
+        // - create_agent: writes to it (line 198-201)
+        // - send_message: doesn't touch it
+        // - get_inbox: doesn't touch it
+        // - search_messages: doesn't touch it
+        // This test documents the leak — projects has no MAX_PROJECTS cap.
+    }
+
+    // ── H4 (CONFIRMED): AgentRecord missing registered_at that API returns ────
+    // create_agent returns { ..., registered_at } but AgentRecord stored in
+    // DashMap only has { id, project_id, name, program, model }.
+    #[tokio::test]
+    async fn dr17_h4_agent_record_missing_registered_at() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice" }),
+        )
+        .unwrap();
+
+        // API response has registered_at
+        assert!(
+            resp.get("registered_at").is_some(),
+            "API response includes registered_at"
+        );
+        let api_registered_at = resp["registered_at"].as_i64().unwrap();
+        assert!(api_registered_at > 0, "Valid timestamp");
+
+        // DashMap record does NOT have registered_at
+        let record = state.agents.get("Alice").unwrap();
+        // AgentRecord fields: id, project_id, name, program, model
+        assert_eq!(record.name, "Alice");
+        assert_eq!(record.id, resp["id"].as_str().unwrap());
+
+        // CONFIRMED: The struct has no registered_at field.
+        // This is a structural mismatch — the DashMap record can't reproduce
+        // the full API response. If a future "get_agent" tool reads from DashMap,
+        // it won't have the timestamp.
+    }
+
+    // ── H5 (CONFIRMED): from_agent in send_message accepts control chars ───────
+    // from_agent only has a length check. No validation for null bytes, control
+    // characters, or other problematic content. This produces garbled entries.
+    #[tokio::test]
+    async fn dr17_h5_send_message_from_agent_accepts_control_chars() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Null byte in from_agent — accepted
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "evil\0sender",
+                "to": ["bob"],
+                "subject": "null byte test",
+                "body": "test"
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "CONFIRMED: from_agent with null byte is accepted"
+        );
+
+        // Control characters (bell, backspace, escape) in from_agent — accepted
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "evil\x07\x08\x1bsender",
+                "to": ["bob"],
+                "subject": "control char test",
+                "body": "test"
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "CONFIRMED: from_agent with control chars is accepted"
+        );
+
+        // Verify both messages are in Bob's inbox with garbled sender
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 2, "Both messages delivered");
+
+        // First message has null byte in from_agent
+        assert!(
+            msgs[0]["from_agent"].as_str().unwrap().contains('\0'),
+            "Null byte preserved in inbox from_agent"
+        );
+
+        // Second message has control chars in from_agent
+        assert!(
+            msgs[1]["from_agent"].as_str().unwrap().contains('\x07'),
+            "Control char preserved in inbox from_agent"
+        );
+    }
 }
