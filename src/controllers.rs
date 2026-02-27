@@ -290,27 +290,28 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         .unwrap_or(DEFAULT_INBOX_LIMIT as i64)
         .clamp(1, MAX_INBOX_LIMIT as i64) as usize;
 
-    // Atomic drain: remove the entry, take up to `limit` messages,
-    // put the rest back if any remain.
-    let all_messages = state
-        .inboxes
-        .remove(agent_name)
-        .map(|(_, entries)| entries)
-        .unwrap_or_default();
+    // Atomic drain via entry() API. Holds the DashMap shard lock for the
+    // entire operation, preventing concurrent send_message from inserting
+    // messages that would be overwritten by a separate insert() call.
+    // Previous remove→insert pattern had a TOCTOU race window (H1).
+    let mut taken = Vec::new();
+    let remaining_count;
 
-    let total = all_messages.len();
-    let (taken, remaining) = if total <= limit {
-        (all_messages, Vec::new())
-    } else {
-        let mut all = all_messages;
-        let rest = all.split_off(limit);
-        (all, rest)
-    };
-
-    // Put remaining messages back into the inbox
-    let remaining_count = remaining.len();
-    if !remaining.is_empty() {
-        state.inboxes.insert(agent_name.to_string(), remaining);
+    match state.inboxes.entry(agent_name.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+            let inbox = occ.get_mut();
+            if inbox.len() <= limit {
+                taken = std::mem::take(inbox);
+                remaining_count = 0;
+                occ.remove(); // Clean up empty entry
+            } else {
+                taken = inbox.drain(..limit).collect();
+                remaining_count = inbox.len();
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(_) => {
+            remaining_count = 0;
+        }
     }
 
     let result: Vec<Value> = taken
