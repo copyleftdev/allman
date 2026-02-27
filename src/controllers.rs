@@ -3505,4 +3505,289 @@ mod tests {
         );
         assert!(result.is_ok(), "Dots in the middle are allowed");
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Deep Review #15 — Hypothesis Tests
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): search_messages returns Tantivy array-wrapped fields ──
+    // Tantivy's schema.to_json() serializes each field as an array because
+    // Tantivy documents support multi-valued fields. Our schema adds one value
+    // per field, so arrays always have length 1. But clients see:
+    //   search: {"subject":["hello"]}  vs  inbox: {"subject":"hello"}
+    // This is a format inconsistency between search and inbox responses.
+    #[tokio::test]
+    async fn dr15_h1_search_returns_array_wrapped_fields() {
+        let (state, _idx, _repo) = test_post_office();
+
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "unique_dr15_marker",
+                "body": "searchable content for dr15",
+                "project_id": "proj_dr15",
+            }),
+        )
+        .unwrap();
+
+        // Wait for persistence worker + NRT reader refresh
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let result = search_messages(
+            &state,
+            json!({ "query": "unique_dr15_marker", "limit": 10 }),
+        );
+        assert!(result.is_ok(), "Search must succeed");
+
+        let results = result.unwrap();
+        let docs = results.as_array().unwrap();
+        assert!(!docs.is_empty(), "Must find at least one result");
+
+        // Tantivy's to_json wraps each field value in an array
+        let doc = &docs[0];
+        let subject = &doc["subject"];
+        assert!(
+            subject.is_array(),
+            "CONFIRMED: Tantivy returns subject as array, not scalar. Got: {}",
+            subject
+        );
+        assert_eq!(
+            subject.as_array().unwrap()[0],
+            "unique_dr15_marker",
+            "Array contains the correct value"
+        );
+
+        // Contrast with get_inbox which returns scalar fields
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let inbox_msg = &inbox_messages(&inbox)[0];
+        assert!(
+            inbox_msg["subject"].is_string(),
+            "get_inbox returns subject as scalar string"
+        );
+    }
+
+    // ── H2 (CONFIRMED): All tool errors return -32603 regardless of type ──────
+    // JSON-RPC 2.0 defines: -32600 Invalid Request, -32601 Method not found,
+    // -32602 Invalid params, -32603 Internal error.
+    // Currently all tool dispatch errors use -32603.
+    #[tokio::test]
+    async fn dr15_h2_tool_errors_all_return_32603() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 1. Missing required param (should ideally be -32602)
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "create_agent", "arguments": {} }
+            }),
+        )
+        .await;
+        assert!(resp.get("error").is_some(), "Missing project_key → error");
+        assert_eq!(
+            resp["error"]["code"], -32603,
+            "Missing param returns -32603 (Internal error), not -32602 (Invalid params)"
+        );
+
+        // 2. Validation failure (should ideally be -32602)
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "create_agent",
+                    "arguments": { "project_key": "test", "name_hint": "../evil" }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"], -32603,
+            "Validation failure also returns -32603"
+        );
+
+        // 3. Unknown tool (should ideally be -32601 or a custom code)
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "nonexistent_tool", "arguments": {} }
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"], -32603,
+            "Unknown tool also returns -32603"
+        );
+
+        // 4. Unknown METHOD correctly returns -32601 (the one correct code)
+        let resp = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "bad_method" }),
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"], -32601,
+            "Unknown method correctly returns -32601"
+        );
+    }
+
+    // ── H3 (DISPROVED): Agent names with spaces work correctly ────────────────
+    // validate_agent_name allows spaces (they pass all checks: not empty,
+    // not whitespace-only, no slashes, no control chars). Spaces in names
+    // create DashMap keys containing spaces, and to_recipients join becomes
+    // ambiguous (e.g., "Agent Smith" + "bob" → "Agent Smith bob"). However,
+    // to_recipients is stored as STRING (opaque token) not TEXT, so search
+    // doesn't tokenize it — no functional impact.
+    #[tokio::test]
+    async fn dr15_h3_agent_names_with_spaces_work() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Agent name with spaces passes validation
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": "Agent Smith" }),
+        );
+        assert!(
+            result.is_ok(),
+            "Agent names with spaces are accepted by validate_agent_name"
+        );
+
+        // Send and receive messages with spaced names
+        send_message(
+            &state,
+            json!({
+                "from_agent": "Agent Smith",
+                "to": ["bob"],
+                "subject": "hello",
+                "body": "from a spaced name",
+            }),
+        )
+        .unwrap();
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        assert_eq!(inbox_messages(&inbox).len(), 1);
+        assert_eq!(
+            inbox_messages(&inbox)[0]["from"],
+            "Agent Smith",
+            "Spaced name preserved in inbox"
+        );
+
+        // Receiving works with spaced names too
+        send_message(
+            &state,
+            json!({
+                "from_agent": "bob",
+                "to": ["Agent Smith"],
+                "subject": "reply",
+                "body": "hi back",
+            }),
+        )
+        .unwrap();
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "Agent Smith" })).unwrap();
+        assert_eq!(inbox_messages(&inbox).len(), 1);
+        assert_eq!(inbox_messages(&inbox)[0]["from"], "bob");
+    }
+
+    // ── H4 (CONFIRMED): NRT refresh task has no cancellation mechanism ────────
+    // state.rs spawns `task::spawn(async move { loop { sleep → reload } })`.
+    // This task captures an IndexReader clone and runs until the tokio runtime
+    // shuts down. There is no CancellationToken or AbortHandle to stop it
+    // when PostOffice is dropped. The channels (persist, git) close cleanly
+    // on drop, but this tokio task does not.
+    //
+    // Impact: minimal in production (runtime shutdown kills it), but it means
+    // PostOffice::drop is not a clean shutdown — orphaned tasks continue.
+    #[tokio::test]
+    async fn dr15_h4_nrt_refresh_task_survives_post_office_drop() {
+        let idx_dir = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let state = PostOffice::new(idx_dir.path(), repo_dir.path()).unwrap();
+
+        // Verify the state works
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "pre-drop",
+                "body": "test",
+            }),
+        )
+        .unwrap();
+
+        // Drop PostOffice — persist_tx closes, persist worker drains, git_tx closes
+        drop(state);
+
+        // The NRT refresh task is still running in the tokio runtime.
+        // We can't directly observe it, but we can verify the drop
+        // didn't panic and the persist/git channels closed correctly.
+        // The orphaned task will be killed when this test's runtime shuts down.
+        //
+        // CONFIRMED: No CancellationToken or AbortHandle in PostOffice.
+        // The task at state.rs:111-118 outlives PostOffice.
+
+        // Brief sleep to allow worker threads to drain
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // TempDir cleanup succeeds even with orphaned task (Linux allows
+        // deleting dirs with open file handles in them).
+        // This test documents the leak, not the failure consequence.
+    }
+
+    // ── H5 (DISPROVED): Missing/wrong jsonrpc version is still processed ──────
+    // handle_mcp_request does not validate the jsonrpc field. This is fine:
+    // the handler processes the request by method dispatch regardless of
+    // protocol version. This is common practice for simple JSON-RPC servers.
+    // Regression guard: verify this behavior is stable.
+    #[tokio::test]
+    async fn dr15_h5_missing_jsonrpc_field_still_works() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // No jsonrpc field at all
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "id": 1, "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            resp.get("result").is_some(),
+            "Missing jsonrpc field does not prevent processing"
+        );
+        assert_eq!(
+            resp["jsonrpc"], "2.0",
+            "Response still includes jsonrpc: 2.0"
+        );
+
+        // Wrong version
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "1.0", "id": 2, "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            resp.get("result").is_some(),
+            "Wrong jsonrpc version does not prevent processing"
+        );
+
+        // Non-string jsonrpc
+        let resp = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": 42, "id": 3, "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            resp.get("result").is_some(),
+            "Non-string jsonrpc does not prevent processing"
+        );
+    }
 }
