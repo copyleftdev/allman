@@ -101,15 +101,78 @@ curl -s http://localhost:8000/mcp -H 'Content-Type: application/json' \
 - Hot-path code (controllers.rs, state.rs) must avoid disk I/O and heap allocation where possible.
 - Commit messages use imperative mood: `fix:`, `feat:`, `docs:`, `refactor:`.
 
+## Git Flow (Non-Negotiable)
+
+All new work goes through branches and PRs. Never push directly to master.
+
+```
+master (protected)
+  └── feature/<name>    — new capabilities
+  └── fix/<name>        — bug fixes
+  └── refactor/<name>   — structural improvements
+  └── optimize/<name>   — performance work
+  └── test/<name>       — test-only additions
+```
+
+1. `git checkout master && git pull origin master`
+2. `git checkout -b <type>/<name>`
+3. Work in small, atomic commits. Each commit must pass `cargo check --all-targets`.
+4. Run `/preflight` before opening a PR.
+5. Run `/pr` to create the pull request. Never merge your own PR without review.
+6. If master moves ahead: `git fetch origin && git rebase origin/master`
+
+## Testing Philosophy
+
+**Nothing is assumed. Everything is asserted by hypothesis.**
+
+- Write tests BEFORE implementation (TDD). The test defines the contract.
+- Every hypothesis about behavior must be captured as a test. Use `/test-hypothesis` for this.
+- Tests must assert specific outcomes, not just "doesn't panic."
+- Characterization tests must exist before any refactoring begins. Use `/refactor` for this.
+- Performance claims must be backed by benchmark measurements. Use `/optimize` for this.
+- Never delete or weaken a passing test without explicit direction.
+
+Test locations:
+- Unit tests: `#[cfg(test)] mod tests { ... }` inside each `src/*.rs` file.
+- Integration tests: `tests/` directory (for HTTP-level MCP endpoint tests).
+- Benchmarks: `src/bin/benchmark.rs` and `src/bin/swarm_stress.rs` (run against live server).
+
+```bash
+cargo test                          # run all unit + integration tests
+cargo test -- --nocapture           # with stdout
+cargo test test_name                # run a specific test
+```
+
 ## Workflow: Before Modifying Core Files
 
 Before changing `controllers.rs`, `state.rs`, `models.rs`, or `git_actor.rs`:
-1. Read the file and understand the current contract.
-2. Plan the change — identify which hot path, search path, or audit path is affected.
-3. Implement minimally.
-4. Run `cargo check --all-targets` — zero warnings.
-5. Run `cargo run --release --bin benchmark` to verify no performance regression.
-6. Commit with a descriptive message.
+
+1. Create a feature branch: `/feature-branch <name>`
+2. Read the file and understand the current contract.
+3. Write characterization tests for the current behavior (if they don't exist).
+4. Plan the change — identify which hot path, search path, or audit path is affected.
+5. Implement minimally.
+6. Run `cargo check --all-targets` — zero warnings.
+7. Run `cargo test` — all tests pass.
+8. Run `cargo run --release --bin benchmark` to verify no performance regression.
+9. Commit with a descriptive message.
+10. Open a PR: `/pr`
+
+## Slash Commands
+
+| Command | Purpose |
+| ------- | ------- |
+| `/bench` | Run benchmark suite, report throughput, flag regressions |
+| `/preflight` | Pre-commit checks: fmt, clippy, check, test, diff summary |
+| `/deep-review <scope>` | Adversarial code review with hypothesis-driven findings |
+| `/optimize <target>` | Performance optimization with before/after proof |
+| `/refactor <target>` | Test-first refactoring with characterization tests |
+| `/test-hypothesis <claim>` | TDD assertion of a specific behavior |
+| `/feature-branch <name>` | Start new work with proper Git flow |
+| `/pr` | Open a pull request with structured description |
+| `/add-tool <name>` | Guided MCP tool scaffolding |
+| `/add-simulation <name>` | Scaffold a new simulation binary |
+| `/review-hot-path` | Audit hot path for performance regressions |
 
 ## Runtime Artifacts (gitignored)
 
