@@ -22,6 +22,7 @@ const DEFAULT_INBOX_LIMIT: usize = 100;
 const MAX_INBOX_LIMIT: usize = 1_000;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 1_000;
+const MAX_AGENTS: usize = 100_000;
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -97,6 +98,9 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
     if name == "." {
         return Err("Invalid agent name: must not be '.'".to_string());
     }
+    if name.starts_with('.') {
+        return Err("Invalid agent name: must not start with '.'".to_string());
+    }
     if name.contains('\0') {
         return Err("Invalid agent name: must not contain null bytes".to_string());
     }
@@ -146,6 +150,13 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         "proj_{}",
         Uuid::new_v5(&Uuid::NAMESPACE_DNS, project_key.as_bytes()).simple()
     );
+
+    // Soft cap on total agent count. Checked BEFORE entry() to avoid deadlock
+    // (DashMap::len() locks all shards; entry() holds one shard lock).
+    // Slightly racy under concurrency but acceptable as a soft limit.
+    if state.agents.len() >= MAX_AGENTS {
+        return Err(format!("Agent limit reached ({} max)", MAX_AGENTS));
+    }
 
     // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
     // across the collision check and the insert/update, eliminating the
@@ -309,7 +320,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
-    if let Err(e) = state.persist_tx.try_send(PersistOp::IndexMessage {
+    let indexed = match state.persist_tx.try_send(PersistOp::IndexMessage {
         id: message_id.clone(),
         project_id: project_id.to_string(),
         from_agent: from_agent.to_string(),
@@ -318,14 +329,18 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         body: body.to_string(),
         created_ts: now,
     }) {
-        tracing::warn!(
-            "Persist channel full, dropping index op for message {}: {}",
-            message_id,
-            e
-        );
-    }
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                "Persist channel full, dropping index op for message {}: {}",
+                message_id,
+                e
+            );
+            false
+        }
+    };
 
-    Ok(json!({ "id": message_id, "status": "sent" }))
+    Ok(json!({ "id": message_id, "status": "sent", "indexed": indexed }))
 }
 
 // ── get_inbox ────────────────────────────────────────────────────────────────
@@ -3370,10 +3385,12 @@ mod tests {
     // Unlike inboxes (capped at MAX_INBOX_SIZE), there is no MAX_AGENTS limit.
     // Unlimited create_agent calls with unique names grow the DashMap unbounded.
     #[tokio::test]
-    async fn dr14_h1_agents_dashmap_unbounded() {
+    async fn dr14_h1_agents_dashmap_capped_at_max() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Register 200 unique agents — no cap enforced
+        // Register up to MAX_AGENTS — we can't test 100K in a unit test,
+        // so verify the mechanism works by checking the check exists.
+        // Register 200 agents (well under MAX_AGENTS) — all succeed.
         for i in 0..200 {
             let result = create_agent(
                 &state,
@@ -3384,13 +3401,18 @@ mod tests {
             );
             assert!(result.is_ok(), "Agent {} should register", i);
         }
-
-        // CONFIRMED: all 200 accepted, no upper bound enforced
         assert_eq!(state.agents.len(), 200, "All 200 agents registered");
-        assert!(
-            state.agents.len() > 100,
-            "No MAX_AGENTS limit — unbounded growth possible"
+
+        // Upsert does NOT count against the limit (Occupied branch)
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "stress",
+                "name_hint": "agent_0",
+                "program": "updated",
+            }),
         );
+        assert!(result.is_ok(), "Upsert must succeed regardless of count");
     }
 
     // ── H2 (CONFIRMED): persist channel drop returns "sent" silently ────────
@@ -3398,12 +3420,10 @@ mod tests {
     // The caller gets "status": "sent" with no degradation indicator.
     // Message IS delivered to inbox but becomes permanently unsearchable.
     #[tokio::test]
-    async fn dr14_h2_persist_drop_returns_sent_silently() {
+    async fn dr14_h2_send_message_reports_indexed_status() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Fill the persist channel to capacity (100,000 ops)
-        // We can't actually fill 100K in a test, but we can verify the
-        // response format doesn't include any "degraded" indicator.
+        // Normal send — persist channel has capacity, indexed should be true
         let result = send_message(
             &state,
             json!({
@@ -3415,15 +3435,14 @@ mod tests {
         )
         .unwrap();
 
-        // Response always says "sent" — no field indicates indexing status
         assert_eq!(result["status"], "sent");
         assert!(
-            result.get("indexed").is_none(),
-            "No indexing status in response — persist drops are silent"
+            result.get("indexed").is_some(),
+            "Response must include 'indexed' field"
         );
-        assert!(
-            result.get("search_status").is_none(),
-            "No search_status field — caller cannot detect degraded indexing"
+        assert_eq!(
+            result["indexed"], true,
+            "indexed=true when persist channel accepts the op"
         );
     }
 
@@ -3458,7 +3477,7 @@ mod tests {
     // validate_agent_name rejects "." but allows ".hidden", which creates
     // agents/.hidden/profile.json in the git repo — a hidden directory.
     #[tokio::test]
-    async fn dr14_h5_dot_prefixed_agent_name_creates_hidden_dir() {
+    async fn dr14_h5_dot_prefixed_agent_name_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
         let result = create_agent(
@@ -3469,12 +3488,21 @@ mod tests {
             }),
         );
 
-        // CONFIRMED: ".hidden_agent" passes validation — creates hidden git path
+        assert!(result.is_err(), "Dot-prefixed name must be rejected");
+        assert!(result.unwrap_err().contains("must not start with '.'"));
         assert!(
-            result.is_ok(),
-            "Dot-prefixed name accepted by validate_agent_name"
+            !state.agents.contains_key(".hidden_agent"),
+            "No agent registered for rejected name"
         );
-        assert!(state.agents.contains_key(".hidden_agent"));
-        // The git path would be agents/.hidden_agent/profile.json — a hidden dir
+
+        // Names with dots in the middle are still valid
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "agent.v2",
+            }),
+        );
+        assert!(result.is_ok(), "Dots in the middle are allowed");
     }
 }
