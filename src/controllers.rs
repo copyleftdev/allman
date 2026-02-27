@@ -1834,4 +1834,162 @@ mod tests {
             "Field-qualified query should not error (may return 0 results)"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #5 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): No recipient count limit — memory amplification ──
+    // send_message has no MAX_RECIPIENTS constant. A crafted request with
+    // many recipients and a large body causes O(N * body_size) heap alloc.
+    // Within 1MB HTTP limit: ~235K single-char recipients × 64KB body
+    // = ~14.5 GB heap. This test documents the vulnerability.
+    #[tokio::test]
+    async fn dr5_h1_no_recipient_count_limit() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 500 recipients — well within reason but demonstrates the pattern.
+        // Each recipient gets a full clone of the InboxEntry.
+        let recipients: Vec<String> = (0..500).map(|i| format!("agent_{}", i)).collect();
+        let body = "A".repeat(1_000); // 1KB body × 500 = 500KB heap
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "attacker",
+                "to": recipients,
+                "subject": "amplify",
+                "body": body,
+            }),
+        );
+
+        // Currently succeeds — no limit on recipient count.
+        // This is the bug: the only protection is the 1MB HTTP body limit,
+        // but a small JSON array of short names + large body amplifies to
+        // much more heap allocation than the request size.
+        assert!(
+            result.is_ok(),
+            "500 recipients accepted (no MAX_RECIPIENTS limit)"
+        );
+
+        // Verify all 500 got a copy
+        let mut delivered = 0;
+        for i in 0..500 {
+            let inbox = get_inbox(
+                &state,
+                json!({ "agent_name": format!("agent_{}", i) }),
+            )
+            .unwrap();
+            delivered += inbox_messages(&inbox).len();
+        }
+        assert_eq!(delivered, 500, "All 500 recipients received the message");
+    }
+
+    // ── H2 (DISPROVED): get_inbox entry() for nonexistent agent ──────────
+    // Using entry() API on a nonexistent key with the Vacant branch should
+    // NOT create a spurious DashMap entry. Regression guard.
+    #[tokio::test]
+    async fn dr5_h2_get_inbox_vacant_no_spurious_entry() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Inbox for "ghost" doesn't exist
+        assert!(!state.inboxes.contains_key("ghost"));
+
+        // get_inbox for nonexistent agent
+        let result = get_inbox(&state, json!({ "agent_name": "ghost" })).unwrap();
+        assert_eq!(inbox_messages(&result).len(), 0);
+        assert_eq!(result["remaining"], 0);
+
+        // DashMap should NOT have created an entry
+        assert!(
+            !state.inboxes.contains_key("ghost"),
+            "Vacant branch must not create a spurious DashMap entry"
+        );
+    }
+
+    // ── H3 (DISPROVED): Full drain removes empty DashMap entry ───────────
+    // When all messages are drained, occ.remove() should clean up the key.
+    #[tokio::test]
+    async fn dr5_h3_full_drain_removes_dashmap_entry() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send 5 messages to alice
+        for i in 0..5 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "bob",
+                    "to": ["alice"],
+                    "subject": format!("msg {}", i),
+                    "body": "hello",
+                }),
+            )
+            .unwrap();
+        }
+
+        assert!(state.inboxes.contains_key("alice"));
+
+        // Drain all (default limit 100 > 5 messages)
+        let result = get_inbox(&state, json!({ "agent_name": "alice" })).unwrap();
+        assert_eq!(inbox_messages(&result).len(), 5);
+        assert_eq!(result["remaining"], 0);
+
+        // Key should be removed from DashMap
+        assert!(
+            !state.inboxes.contains_key("alice"),
+            "Full drain must remove the empty DashMap entry via occ.remove()"
+        );
+    }
+
+    // ── H5-DR5 (DISPROVED): serde_json::to_string_pretty on Value is safe ─
+    // create_agent serializes the agent profile as JSON for Git commit.
+    // serde_json::to_string_pretty can only fail on non-string map keys,
+    // but Value built from json!() macros always has string keys.
+    #[tokio::test]
+    async fn dr5_h5_serde_json_to_string_pretty_is_safe() {
+        // Build a Value identical to the agent profile in create_agent
+        let profile = json!({
+            "id": "test-id",
+            "project_id": "proj-123",
+            "name": "Agent_Test",
+            "program": "test program",
+            "model": "test-model",
+            "registered_at": "2026-01-01T00:00:00Z"
+        });
+
+        // This must not panic
+        let serialized = serde_json::to_string_pretty(&profile);
+        assert!(
+            serialized.is_ok(),
+            "to_string_pretty on json!() Value must always succeed"
+        );
+    }
+
+    // ── H6-DR5 (DISPROVED): schema.get_field() unwraps are safe ──────────
+    // The persistence worker calls schema.get_field("id").unwrap() etc.
+    // These are safe because the schema was just built with those fields
+    // in PostOffice::new(). This test asserts the schema contract.
+    #[tokio::test]
+    async fn dr5_h6_schema_fields_always_exist() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let schema = state.index.schema();
+        let required_fields = [
+            "id",
+            "project_id",
+            "from_agent",
+            "to_recipients",
+            "subject",
+            "body",
+            "created_ts",
+        ];
+
+        for field_name in &required_fields {
+            assert!(
+                schema.get_field(field_name).is_some(),
+                "Schema must contain field '{}' (persistence worker unwrap safety)",
+                field_name
+            );
+        }
+    }
 }
