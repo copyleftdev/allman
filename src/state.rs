@@ -4,10 +4,22 @@ use anyhow::Context;
 use crossbeam_channel::{bounded, Sender as CbSender};
 use dashmap::DashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tantivy::{schema::*, Index, IndexReader};
 use tokio::task;
+
+// ── NRT Shutdown Guard ──────────────────────────────────────────────────────
+// Sets a shared AtomicBool flag when the last Arc reference is dropped.
+// This signals the NRT reader refresh task to exit its loop.
+struct NrtShutdownGuard(Arc<AtomicBool>);
+
+impl Drop for NrtShutdownGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 // ── Persistence Pipeline ─────────────────────────────────────────────────────
 // Operations dispatched from the hot path to the background persistence worker.
@@ -57,6 +69,10 @@ pub struct PostOffice {
 
     // Async persistence pipeline (fire-and-forget from hot path)
     pub persist_tx: CbSender<PersistOp>,
+
+    // NRT shutdown guard — when the last PostOffice clone is dropped,
+    // the guard sets a flag that stops the NRT reader refresh task.
+    _nrt_guard: Arc<NrtShutdownGuard>,
 }
 
 impl PostOffice {
@@ -107,10 +123,19 @@ impl PostOffice {
         }
 
         // ── 4. NRT Reader Refresh (lightweight tokio task) ───────────────────
+        // Uses a shared AtomicBool flag for clean shutdown. When the last
+        // PostOffice clone is dropped, NrtShutdownGuard sets the flag → task exits.
+        let nrt_shutdown = Arc::new(AtomicBool::new(false));
+        let nrt_guard = Arc::new(NrtShutdownGuard(nrt_shutdown.clone()));
         let reader_clone = index_reader.clone();
+        let shutdown_flag = nrt_shutdown;
         task::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    tracing::info!("NRT reader refresh task shutting down");
+                    break;
+                }
                 if let Err(e) = reader_clone.reload() {
                     tracing::error!("NRT reader reload failed: {}", e);
                 }
@@ -128,6 +153,7 @@ impl PostOffice {
             index: Arc::new(index),
             index_reader,
             persist_tx,
+            _nrt_guard: nrt_guard,
         })
     }
 }

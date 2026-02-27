@@ -39,7 +39,13 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                 "search_messages" => search_messages(&state, args),
                 "send_message" => send_message(&state, args),
                 "get_inbox" => get_inbox(&state, args),
-                _ => Err(format!("Unknown tool: {}", tool_name)),
+                _ => {
+                    return json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32601, "message": format!("Unknown tool: {}", tool_name) }
+                    });
+                }
             };
 
             match result {
@@ -51,7 +57,7 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                 Err(e) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": { "code": -32603, "message": e }
+                    "error": { "code": -32602, "message": e }
                 }),
             }
         }
@@ -408,6 +414,30 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
     }))
 }
 
+// ── Tantivy field unwrapper ──────────────────────────────────────────────────
+// Tantivy's schema.to_json() wraps each field value in an array because
+// documents can have multiple values per field. Our schema only adds one
+// value per field, so unwrap single-element arrays to produce scalar fields
+// consistent with get_inbox's response format.
+fn unwrap_tantivy_arrays(doc: Value) -> Value {
+    match doc {
+        Value::Object(map) => {
+            let unwrapped = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        Value::Array(ref arr) if arr.len() == 1 => arr[0].clone(),
+                        other => other,
+                    };
+                    (k, val)
+                })
+                .collect();
+            Value::Object(unwrapped)
+        }
+        other => other,
+    }
+}
+
 // ── search_messages ──────────────────────────────────────────────────────────
 // Tantivy NRT search — unchanged, already fast.
 fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
@@ -446,7 +476,10 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         let doc_json = schema.to_json(&retrieved_doc);
         let parsed = serde_json::from_str::<Value>(&doc_json)
             .map_err(|e| format!("Failed to parse doc JSON: {}", e))?;
-        results.push(parsed);
+        // Tantivy's to_json wraps each field value in an array (multi-value support).
+        // Unwrap single-element arrays to match get_inbox's scalar field format.
+        let unwrapped = unwrap_tantivy_arrays(parsed);
+        results.push(unwrapped);
     }
 
     Ok(json!(results))
@@ -3510,14 +3543,12 @@ mod tests {
     // Deep Review #15 — Hypothesis Tests
     // ════════════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED): search_messages returns Tantivy array-wrapped fields ──
-    // Tantivy's schema.to_json() serializes each field as an array because
-    // Tantivy documents support multi-valued fields. Our schema adds one value
-    // per field, so arrays always have length 1. But clients see:
-    //   search: {"subject":["hello"]}  vs  inbox: {"subject":"hello"}
-    // This is a format inconsistency between search and inbox responses.
+    // ── H1 (FIXED): search_messages now returns scalar fields ────────────────
+    // Previously, Tantivy's schema.to_json() wrapped each field in an array
+    // (e.g., "subject":["hello"]). Now unwrap_tantivy_arrays() converts
+    // single-element arrays to scalars, matching get_inbox's format.
     #[tokio::test]
-    async fn dr15_h1_search_returns_array_wrapped_fields() {
+    async fn dr15_h1_search_returns_scalar_fields() {
         let (state, _idx, _repo) = test_post_office();
 
         send_message(
@@ -3545,38 +3576,34 @@ mod tests {
         let docs = results.as_array().unwrap();
         assert!(!docs.is_empty(), "Must find at least one result");
 
-        // Tantivy's to_json wraps each field value in an array
+        // FIXED: fields are now scalar, not array-wrapped
         let doc = &docs[0];
         let subject = &doc["subject"];
         assert!(
-            subject.is_array(),
-            "CONFIRMED: Tantivy returns subject as array, not scalar. Got: {}",
+            subject.is_string(),
+            "FIXED: search returns scalar subject, not array. Got: {}",
             subject
         );
-        assert_eq!(
-            subject.as_array().unwrap()[0],
-            "unique_dr15_marker",
-            "Array contains the correct value"
-        );
+        assert_eq!(subject, "unique_dr15_marker");
 
-        // Contrast with get_inbox which returns scalar fields
+        // Both search and inbox now use consistent scalar format
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         let inbox_msg = &inbox_messages(&inbox)[0];
         assert!(
             inbox_msg["subject"].is_string(),
-            "get_inbox returns subject as scalar string"
+            "get_inbox also returns scalar string"
         );
+        assert_eq!(inbox_msg["subject"], "unique_dr15_marker");
     }
 
-    // ── H2 (CONFIRMED): All tool errors return -32603 regardless of type ──────
-    // JSON-RPC 2.0 defines: -32600 Invalid Request, -32601 Method not found,
-    // -32602 Invalid params, -32603 Internal error.
-    // Currently all tool dispatch errors use -32603.
+    // ── H2 (FIXED): Tool errors now use correct JSON-RPC error codes ──────────
+    // -32601 for unknown tool (Method not found), -32602 for param/validation
+    // errors (Invalid params), -32601 for unknown method.
     #[tokio::test]
-    async fn dr15_h2_tool_errors_all_return_32603() {
+    async fn dr15_h2_tool_errors_use_correct_codes() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 1. Missing required param (should ideally be -32602)
+        // 1. Missing required param → -32602 (Invalid params)
         let resp = handle_mcp_request(
             state.clone(),
             json!({
@@ -3587,11 +3614,11 @@ mod tests {
         .await;
         assert!(resp.get("error").is_some(), "Missing project_key → error");
         assert_eq!(
-            resp["error"]["code"], -32603,
-            "Missing param returns -32603 (Internal error), not -32602 (Invalid params)"
+            resp["error"]["code"], -32602,
+            "FIXED: Missing param returns -32602 (Invalid params)"
         );
 
-        // 2. Validation failure (should ideally be -32602)
+        // 2. Validation failure → -32602 (Invalid params)
         let resp = handle_mcp_request(
             state.clone(),
             json!({
@@ -3604,11 +3631,11 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp["error"]["code"], -32603,
-            "Validation failure also returns -32603"
+            resp["error"]["code"], -32602,
+            "FIXED: Validation failure returns -32602"
         );
 
-        // 3. Unknown tool (should ideally be -32601 or a custom code)
+        // 3. Unknown tool → -32601 (Method not found)
         let resp = handle_mcp_request(
             state.clone(),
             json!({
@@ -3618,11 +3645,11 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp["error"]["code"], -32603,
-            "Unknown tool also returns -32603"
+            resp["error"]["code"], -32601,
+            "FIXED: Unknown tool returns -32601 (Method not found)"
         );
 
-        // 4. Unknown METHOD correctly returns -32601 (the one correct code)
+        // 4. Unknown method → -32601 (Method not found)
         let resp = handle_mcp_request(
             state,
             json!({ "jsonrpc": "2.0", "id": 4, "method": "bad_method" }),
@@ -3692,17 +3719,13 @@ mod tests {
         assert_eq!(inbox_messages(&inbox)[0]["from"], "bob");
     }
 
-    // ── H4 (CONFIRMED): NRT refresh task has no cancellation mechanism ────────
-    // state.rs spawns `task::spawn(async move { loop { sleep → reload } })`.
-    // This task captures an IndexReader clone and runs until the tokio runtime
-    // shuts down. There is no CancellationToken or AbortHandle to stop it
-    // when PostOffice is dropped. The channels (persist, git) close cleanly
-    // on drop, but this tokio task does not.
-    //
-    // Impact: minimal in production (runtime shutdown kills it), but it means
-    // PostOffice::drop is not a clean shutdown — orphaned tasks continue.
+    // ── H4 (FIXED): NRT refresh task shuts down cleanly on PostOffice drop ────
+    // Previously, the NRT task ran forever until the tokio runtime shut down.
+    // Now, PostOffice holds an Arc<NrtShutdownGuard> that sets an AtomicBool
+    // flag when the last clone is dropped. The NRT task checks this flag
+    // each iteration and exits cleanly.
     #[tokio::test]
-    async fn dr15_h4_nrt_refresh_task_survives_post_office_drop() {
+    async fn dr15_h4_nrt_refresh_task_exits_on_post_office_drop() {
         let idx_dir = TempDir::new().unwrap();
         let repo_dir = TempDir::new().unwrap();
         let state = PostOffice::new(idx_dir.path(), repo_dir.path()).unwrap();
@@ -3719,23 +3742,31 @@ mod tests {
         )
         .unwrap();
 
-        // Drop PostOffice — persist_tx closes, persist worker drains, git_tx closes
+        // Clone simulates Extension layer in axum
+        let clone = state.clone();
+        drop(clone);
+
+        // Original still works
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["charlie"],
+                "subject": "after clone drop",
+                "body": "still works",
+            }),
+        );
+        assert!(result.is_ok(), "State works after dropping one clone");
+
+        // Drop last PostOffice — NrtShutdownGuard fires, sets AtomicBool flag
         drop(state);
 
-        // The NRT refresh task is still running in the tokio runtime.
-        // We can't directly observe it, but we can verify the drop
-        // didn't panic and the persist/git channels closed correctly.
-        // The orphaned task will be killed when this test's runtime shuts down.
-        //
-        // CONFIRMED: No CancellationToken or AbortHandle in PostOffice.
-        // The task at state.rs:111-118 outlives PostOffice.
+        // Brief sleep to allow NRT task to see the flag and exit
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Brief sleep to allow worker threads to drain
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // TempDir cleanup succeeds even with orphaned task (Linux allows
-        // deleting dirs with open file handles in them).
-        // This test documents the leak, not the failure consequence.
+        // FIXED: NRT task exits cleanly via NrtShutdownGuard.
+        // The AtomicBool flag is set when the last Arc<NrtShutdownGuard> drops.
+        // The task checks the flag every 100ms and breaks out of the loop.
     }
 
     // ── H5 (DISPROVED): Missing/wrong jsonrpc version is still processed ──────
