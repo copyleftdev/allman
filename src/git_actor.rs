@@ -68,6 +68,17 @@ impl GitActor {
     }
 
     fn handle_commit(&self, rel_path: &str, content: &str, msg: &str) -> anyhow::Result<()> {
+        // Defense-in-depth: reject paths that escape the repo root.
+        let rel = Path::new(rel_path);
+        anyhow::ensure!(!rel.is_absolute(), "Refusing absolute path: {}", rel_path);
+        for component in rel.components() {
+            anyhow::ensure!(
+                !matches!(component, std::path::Component::ParentDir),
+                "Refusing path with '..': {}",
+                rel_path
+            );
+        }
+
         let repo = Repository::open(&self.repo_root)?;
         let full_path = self.repo_root.join(rel_path);
 
@@ -102,5 +113,124 @@ impl GitActor {
 
         tracing::info!(" committed: {}", rel_path);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── H9: Path traversal must be BLOCKED ─────────────────────────────
+    // Defense-in-depth: handle_commit must reject paths that resolve
+    // outside the repo root.
+    #[test]
+    fn h9_path_traversal_is_blocked() {
+        let repo_dir = TempDir::new().unwrap();
+        let escape_target = repo_dir.path().parent().unwrap().join("escaped_file.txt");
+
+        let (_tx, rx) = crossbeam_channel::bounded(10);
+        let actor = GitActor::new(repo_dir.path().to_path_buf(), rx);
+        actor.ensure_repo().unwrap();
+
+        let result = actor.handle_commit("../escaped_file.txt", "pwned", "escape attempt");
+        assert!(result.is_err(), "Path traversal with .. must be rejected");
+        assert!(
+            !escape_target.exists(),
+            "No file must be written outside repo root"
+        );
+    }
+
+    #[test]
+    fn h9_deep_traversal_is_blocked() {
+        let repo_dir = TempDir::new().unwrap();
+
+        let (_tx, rx) = crossbeam_channel::bounded(10);
+        let actor = GitActor::new(repo_dir.path().to_path_buf(), rx);
+        actor.ensure_repo().unwrap();
+
+        let result = actor.handle_commit("agents/../../etc/passwd", "pwned", "deep traversal");
+        assert!(result.is_err(), "Deep path traversal must be rejected");
+    }
+
+    #[test]
+    fn h9_absolute_path_is_blocked() {
+        let repo_dir = TempDir::new().unwrap();
+
+        let (_tx, rx) = crossbeam_channel::bounded(10);
+        let actor = GitActor::new(repo_dir.path().to_path_buf(), rx);
+        actor.ensure_repo().unwrap();
+
+        let result = actor.handle_commit("/etc/passwd", "pwned", "absolute path");
+        assert!(result.is_err(), "Absolute paths must be rejected");
+    }
+
+    #[test]
+    fn h9_valid_nested_path_still_works() {
+        let repo_dir = TempDir::new().unwrap();
+
+        let (_tx, rx) = crossbeam_channel::bounded(10);
+        let actor = GitActor::new(repo_dir.path().to_path_buf(), rx);
+        actor.ensure_repo().unwrap();
+
+        let result = actor.handle_commit("agents/alice/profile.json", "ok", "valid nested path");
+        assert!(result.is_ok(), "Valid nested paths must still work");
+        assert!(repo_dir.path().join("agents/alice/profile.json").exists());
+    }
+
+    // ── H7: Repo reopened on every commit ───────────────────────────────
+    // Regression guard: multiple sequential commits should all succeed.
+    #[test]
+    fn h7_sequential_commits_succeed() {
+        let repo_dir = TempDir::new().unwrap();
+        let (_, rx) = crossbeam_channel::bounded::<GitRequest>(10);
+        let actor = GitActor::new(repo_dir.path().to_path_buf(), rx);
+        actor.ensure_repo().unwrap();
+
+        // First commit (initial — no parent)
+        actor
+            .handle_commit("file1.txt", "content1", "first commit")
+            .expect("First commit should succeed");
+
+        // Second commit (has parent)
+        actor
+            .handle_commit("file2.txt", "content2", "second commit")
+            .expect("Second commit should succeed");
+
+        // Third commit (updates existing file)
+        actor
+            .handle_commit("file1.txt", "updated", "update file1")
+            .expect("Third commit should succeed");
+
+        // Verify files on disk
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.path().join("file1.txt")).unwrap(),
+            "updated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.path().join("file2.txt")).unwrap(),
+            "content2"
+        );
+    }
+
+    // ── H8: Initial commit on empty repo ────────────────────────────────
+    // Regression guard: first commit with no HEAD should succeed.
+    #[test]
+    fn h8_initial_commit_on_empty_repo() {
+        let repo_dir = TempDir::new().unwrap();
+        let (_, rx) = crossbeam_channel::bounded::<GitRequest>(10);
+        let actor = GitActor::new(repo_dir.path().to_path_buf(), rx);
+        actor.ensure_repo().unwrap();
+
+        let result = actor.handle_commit("init.txt", "hello", "initial commit");
+        assert!(
+            result.is_ok(),
+            "Initial commit on empty repo should succeed"
+        );
+
+        let repo = Repository::open(repo_dir.path()).unwrap();
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        assert_eq!(commit.message().unwrap(), "initial commit");
     }
 }

@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde_json::json;
-use std::time::Instant;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Barrier;
 
 const SERVER_URL: &str = "http://localhost:8000/mcp";
@@ -36,9 +36,15 @@ async fn main() -> anyhow::Result<()> {
             let _ = client.post(SERVER_URL).json(&payload).send().await;
         }));
     }
-    for h in handles { h.await?; }
+    for h in handles {
+        h.await?;
+    }
     let duration = start.elapsed();
-    println!("✅ Registration: {:.2?} ({:.0} req/s)", duration, AGENT_COUNT as f64 / duration.as_secs_f64());
+    println!(
+        "✅ Registration: {:.2?} ({:.0} req/s)",
+        duration,
+        AGENT_COUNT as f64 / duration.as_secs_f64()
+    );
 
     // 2. Message Ingestion Benchmark
     // We will have agents send messages to each other randomly.
@@ -54,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         handles.push(tokio::spawn(async move {
             let from = format!("BenchAgent_{}", i);
             let to = format!("BenchAgent_{}", (i + 1) % AGENT_COUNT);
-            
+
             barrier.wait().await; // Synchronize start
 
             for j in 0..MESSAGES_PER_AGENT {
@@ -74,9 +80,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }));
     }
-    for h in handles { h.await?; }
+    for h in handles {
+        h.await?;
+    }
     let duration = start.elapsed();
-    println!("✅ Ingestion:    {:.2?} ({:.0} msgs/s)", duration, TOTAL_REQUESTS as f64 / duration.as_secs_f64());
+    println!(
+        "✅ Ingestion:    {:.2?} ({:.0} msgs/s)",
+        duration,
+        TOTAL_REQUESTS as f64 / duration.as_secs_f64()
+    );
 
     // 3. Search Benchmark
     // Perform 1000 searches
@@ -97,9 +109,15 @@ async fn main() -> anyhow::Result<()> {
             let _ = client.post(SERVER_URL).json(&payload).send().await;
         }));
     }
-    for h in handles { h.await?; }
+    for h in handles {
+        h.await?;
+    }
     let duration = start.elapsed();
-    println!("✅ Search:       {:.2?} ({:.0} q/s)", duration, search_count as f64 / duration.as_secs_f64());
+    println!(
+        "✅ Search:       {:.2?} ({:.0} q/s)",
+        duration,
+        search_count as f64 / duration.as_secs_f64()
+    );
 
     // 4. Inbox Benchmark
     println!("📥 Starting Inbox Test...");
@@ -119,9 +137,15 @@ async fn main() -> anyhow::Result<()> {
             let _ = client.post(SERVER_URL).json(&payload).send().await;
         }));
     }
-    for h in handles { h.await?; }
+    for h in handles {
+        h.await?;
+    }
     let duration = start.elapsed();
-    println!("✅ Inbox:        {:.2?} ({:.0} req/s)", duration, AGENT_COUNT as f64 / duration.as_secs_f64());
+    println!(
+        "✅ Inbox:        {:.2?} ({:.0} req/s)",
+        duration,
+        AGENT_COUNT as f64 / duration.as_secs_f64()
+    );
 
     Ok(())
 }

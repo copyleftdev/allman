@@ -16,14 +16,17 @@ const TOTAL_AGENTS: usize = DIVISIONS * TEAMS_PER_DIV * AGENTS_PER_TEAM;
 
 // ── Concurrency Tuning ───────────────────────────────────────────────────────
 const REGISTRATION_CONCURRENCY: usize = 500; // parallel registration batch size
-const MSG_WAVES: usize = 3;                  // number of messaging waves
-const SEARCH_QUERIES: usize = 2000;          // total search requests
-const SEARCH_CONCURRENCY: usize = 200;       // parallel search batch size
-const MSG_CONCURRENCY: usize = 500;          // parallel message sends (DashMap is lock-free)
+const MSG_WAVES: usize = 3; // number of messaging waves
+const SEARCH_QUERIES: usize = 2000; // total search requests
+const SEARCH_CONCURRENCY: usize = 200; // parallel search batch size
+const MSG_CONCURRENCY: usize = 500; // parallel message sends (DashMap is lock-free)
 
 // Derived the same way the server does: Uuid::new_v5(NAMESPACE_DNS, key)
 fn project_id_for_key(key: &str) -> String {
-    format!("proj_{}", Uuid::new_v5(&Uuid::NAMESPACE_DNS, key.as_bytes()).simple())
+    format!(
+        "proj_{}",
+        Uuid::new_v5(&Uuid::NAMESPACE_DNS, key.as_bytes()).simple()
+    )
 }
 
 const PROJECT_KEY: &str = "swarm_stress";
@@ -108,7 +111,10 @@ fn parse_content_text(resp: &Value) -> Option<String> {
 async fn phase_register(client: &Client, metrics: &Arc<Metrics>) -> f64 {
     println!("\n{}", "=".repeat(60));
     println!("  PHASE 1: MASS REGISTRATION ({} agents)", TOTAL_AGENTS);
-    println!("  Concurrency: {} parallel requests", REGISTRATION_CONCURRENCY);
+    println!(
+        "  Concurrency: {} parallel requests",
+        REGISTRATION_CONCURRENCY
+    );
     println!("{}", "=".repeat(60));
 
     let sem = Arc::new(tokio::sync::Semaphore::new(REGISTRATION_CONCURRENCY));
@@ -278,7 +284,7 @@ async fn phase_messaging(client: &Client, metrics: &Arc<Metrics>, project_id: &s
                 let from = division_head(div);
                 let targets: Vec<String> = (0..DIVISIONS)
                     .filter(|d| *d != div)
-                    .map(|d| division_head(d))
+                    .map(division_head)
                     .collect();
                 let subject = format!("W{} cross-div from D{}", wave, div);
                 let pid = project_id.to_string();
@@ -335,7 +341,10 @@ async fn phase_messaging(client: &Client, metrics: &Arc<Metrics>, project_id: &s
 /// Phase 3: Every agent checks inbox concurrently.
 async fn phase_inbox_drain(client: &Client, metrics: &Arc<Metrics>) -> f64 {
     println!("\n{}", "=".repeat(60));
-    println!("  PHASE 3: INBOX DRAIN ({} agents check mail)", TOTAL_AGENTS);
+    println!(
+        "  PHASE 3: INBOX DRAIN ({} agents check mail)",
+        TOTAL_AGENTS
+    );
     println!("{}", "=".repeat(60));
 
     let sem = Arc::new(tokio::sync::Semaphore::new(REGISTRATION_CONCURRENCY));
@@ -352,12 +361,8 @@ async fn phase_inbox_drain(client: &Client, metrics: &Arc<Metrics>) -> f64 {
 
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let result = mcp_call(
-                        &client,
-                        "get_inbox",
-                        json!({ "agent_name": name }),
-                    )
-                    .await;
+                    let result =
+                        mcp_call(&client, "get_inbox", json!({ "agent_name": name })).await;
                     match result {
                         Ok(resp) => {
                             metrics.inbox_ok.fetch_add(1, Ordering::Relaxed);
@@ -474,8 +479,14 @@ async fn phase_search_stress(client: &Client, metrics: &Arc<Metrics>) -> f64 {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║       ALLMAN SWARM STRESS TEST — {} AGENTS              ║", TOTAL_AGENTS);
-    println!("║  Topology: {} div x {} teams x {} agents/team            ║", DIVISIONS, TEAMS_PER_DIV, AGENTS_PER_TEAM);
+    println!(
+        "║       ALLMAN SWARM STRESS TEST — {} AGENTS              ║",
+        TOTAL_AGENTS
+    );
+    println!(
+        "║  Topology: {} div x {} teams x {} agents/team            ║",
+        DIVISIONS, TEAMS_PER_DIV, AGENTS_PER_TEAM
+    );
     println!("║  Target:   {}                            ║", SERVER_URL);
     println!("╚══════════════════════════════════════════════════════════════╝");
 
@@ -522,24 +533,55 @@ async fn main() -> anyhow::Result<()> {
     let srch_err = metrics.search_err.load(Ordering::Relaxed);
     let srch_hits = metrics.search_hits.load(Ordering::Relaxed);
 
-    let total_requests = reg_ok + reg_err + msg_ok + msg_err + inb_ok + inb_err + srch_ok + srch_err;
+    let total_requests =
+        reg_ok + reg_err + msg_ok + msg_err + inb_ok + inb_err + srch_ok + srch_err;
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");
     println!("║                    FINAL RESULTS                           ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Total Time:       {:>10.2?}                              ║", total_elapsed);
-    println!("║  Total Requests:   {:>10}                              ║", total_requests);
-    println!("║  Aggregate Rate:   {:>10.0} req/s                      ║", total_requests as f64 / total_elapsed.as_secs_f64());
+    println!(
+        "║  Total Time:       {:>10.2?}                              ║",
+        total_elapsed
+    );
+    println!(
+        "║  Total Requests:   {:>10}                              ║",
+        total_requests
+    );
+    println!(
+        "║  Aggregate Rate:   {:>10.0} req/s                      ║",
+        total_requests as f64 / total_elapsed.as_secs_f64()
+    );
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║  Phase          │  OK     │ Err   │  Rate                  ║");
-    println!("║  Registration   │ {:>6}  │ {:>5} │ {:>8.0} reg/s           ║", reg_ok, reg_err, reg_rate);
-    println!("║  Messaging      │ {:>6}  │ {:>5} │ {:>8.0} msg/s           ║", msg_ok, msg_err, msg_rate);
-    println!("║  Inbox Drain    │ {:>6}  │ {:>5} │ {:>8.0} inbox/s         ║", inb_ok, inb_err, inbox_rate);
-    println!("║  Search         │ {:>6}  │ {:>5} │ {:>8.0} q/s             ║", srch_ok, srch_err, search_rate);
+    println!(
+        "║  Registration   │ {:>6}  │ {:>5} │ {:>8.0} reg/s           ║",
+        reg_ok, reg_err, reg_rate
+    );
+    println!(
+        "║  Messaging      │ {:>6}  │ {:>5} │ {:>8.0} msg/s           ║",
+        msg_ok, msg_err, msg_rate
+    );
+    println!(
+        "║  Inbox Drain    │ {:>6}  │ {:>5} │ {:>8.0} inbox/s         ║",
+        inb_ok, inb_err, inbox_rate
+    );
+    println!(
+        "║  Search         │ {:>6}  │ {:>5} │ {:>8.0} q/s             ║",
+        srch_ok, srch_err, search_rate
+    );
     println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Messages Sent (calls):    {:>10}                      ║", msg_count);
-    println!("║  Inbox Msgs Received:      {:>10}                      ║", inb_msgs);
-    println!("║  Search Hits Returned:     {:>10}                      ║", srch_hits);
+    println!(
+        "║  Messages Sent (calls):    {:>10}                      ║",
+        msg_count
+    );
+    println!(
+        "║  Inbox Msgs Received:      {:>10}                      ║",
+        inb_msgs
+    );
+    println!(
+        "║  Search Hits Returned:     {:>10}                      ║",
+        srch_hits
+    );
     println!("╚══════════════════════════════════════════════════════════════╝");
 
     // Error rate warning

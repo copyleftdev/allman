@@ -3,10 +3,9 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::sleep;
 
-
 const SERVER_URL: &str = "http://localhost:8000/mcp";
 const LLM_API_URL: &str = "http://127.0.0.1:8001/v1/chat/completions";
-const MODEL: &str = "TheBloke/Mistral-7B-Instruct-v0.2-AWQ"; 
+const MODEL: &str = "TheBloke/Mistral-7B-Instruct-v0.2-AWQ";
 const API_KEY: &str = "sk-test-123";
 
 struct Agent {
@@ -15,7 +14,7 @@ struct Agent {
     persona: String,
     project_id: String,
     client: Client,
-    history: Vec<Value>, 
+    history: Vec<Value>,
 }
 
 impl Agent {
@@ -37,21 +36,23 @@ impl Agent {
             }
         });
 
-        let mut project_id = "black_friday_2026".to_string(); 
-        
+        let mut project_id = "black_friday_2026".to_string();
+
         // Registration call...
         if let Ok(resp) = client.post(SERVER_URL).json(&payload).send().await {
             if let Ok(json) = resp.json::<Value>().await {
-                 if let Some(pid) = json.get("result")
+                if let Some(pid) = json
+                    .get("result")
                     .and_then(|r| r.get("content"))
                     .and_then(|c| c.get(0))
                     .and_then(|t| t.get("text"))
                     .and_then(|s| s.as_str())
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                     .and_then(|v| v.get("project_id").cloned())
-                    .and_then(|v| v.as_str().map(|s| s.to_string())) {
-                        project_id = pid;
-                 }
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                {
+                    project_id = pid;
+                }
             }
         }
         println!("[{}] enters the store.", name);
@@ -72,24 +73,42 @@ impl Agent {
             "params": { "name": "get_inbox", "arguments": { "agent_name": self.name } }
         });
 
-        let resp = self.client.post(SERVER_URL).json(&payload).send().await?.json::<Value>().await?;
-        
+        let resp = self
+            .client
+            .post(SERVER_URL)
+            .json(&payload)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
         let mut count = 0;
-        if let Some(content_str) = resp.get("result").and_then(|r| r.get("content"))
-            .and_then(|c| c.get(0)).and_then(|t| t.get("text")).and_then(|s| s.as_str()) {
-            
+        if let Some(content_str) = resp
+            .get("result")
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.get(0))
+            .and_then(|t| t.get("text"))
+            .and_then(|s| s.as_str())
+        {
             let messages: Vec<Value> = serde_json::from_str(content_str)?;
             count = messages.len();
 
             for msg in messages {
-                let from = msg.get("from").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let from = msg
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 let body = msg.get("body").and_then(|v| v.as_str()).unwrap_or("");
                 let subject = msg.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-                
-                println!("\n📨 {} received mail from {}: {}", self.name, from, subject);
+
+                println!(
+                    "\n📨 {} received mail from {}: {}",
+                    self.name, from, subject
+                );
 
                 // Add to history
-                self.history.push(json!({"role": "user", "content": format!("From {}: {}", from, body)}));
+                self.history
+                    .push(json!({"role": "user", "content": format!("From {}: {}", from, body)}));
 
                 // Reply Logic
                 self.generate_and_send(from, "").await?;
@@ -107,21 +126,26 @@ impl Agent {
                 SCENARIO: It is Black Friday. The store is packed. Chaos. \
                 PERSONA: {}. \
                 Start with a 'thought' in *italics* then write your message. \
-                Keep it dramatic but short.", 
+                Keep it dramatic but short.",
                 self.name, self.role, self.persona
             )
         });
-        
+
         // Context Injection
         if !extra_context.is_empty() {
             // We inject context as a "User" observation to comply with vLLM
-            self.history.push(json!({"role": "user", "content": format!("EVENT: {}", extra_context)}));
+            self.history
+                .push(json!({"role": "user", "content": format!("EVENT: {}", extra_context)}));
         }
 
         // Window Helper
-        let start = if self.history.len() > 6 { self.history.len() - 6 } else { 0 };
+        let start = if self.history.len() > 6 {
+            self.history.len() - 6
+        } else {
+            0
+        };
         let history_slice = &self.history[start..];
-        
+
         let mut messages = vec![system_message];
         messages.extend(history_slice.iter().cloned());
 
@@ -136,11 +160,13 @@ impl Agent {
         use std::io::Write;
         std::io::stdout().flush().unwrap();
 
-        let response_text = match self.client.post(LLM_API_URL)
+        let response_text = match self
+            .client
+            .post(LLM_API_URL)
             .header("Authorization", format!("Bearer {}", API_KEY))
             .json(&llm_payload)
             .send()
-            .await 
+            .await
         {
             Ok(resp) => {
                 let body: Value = resp.json().await.unwrap_or(json!({}));
@@ -151,7 +177,7 @@ impl Agent {
                     .and_then(|s| s.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "Error parsing vLLM".to_string())
-            },
+            }
             Err(e) => {
                 println!("[{}] DEBUG: Error call LLM: {}", self.name, e);
                 format!("(Debug) Error calling vLLM: {}", e)
@@ -159,8 +185,9 @@ impl Agent {
         };
 
         println!(" Done.");
-        
-        self.history.push(json!({"role": "assistant", "content": response_text}));
+
+        self.history
+            .push(json!({"role": "assistant", "content": response_text}));
 
         let subject = "Black Friday Update".to_string();
 
@@ -178,7 +205,12 @@ impl Agent {
             }
         });
 
-        let _ = self.client.post(SERVER_URL).json(&mcp_payload).send().await?;
+        let _ = self
+            .client
+            .post(SERVER_URL)
+            .json(&mcp_payload)
+            .send()
+            .await?;
         Ok(())
     }
 }
@@ -187,43 +219,98 @@ impl Agent {
 async fn main() -> anyhow::Result<()> {
     println!("--- 🎬 SCENE: BLACK FRIDAY APOCALYPSE ---");
     println!("--- 🏬 LOCATION: SuperMart 3000 ---");
-    
+
     // Casting
-    let mut manager = Agent::new("Manager_Dave", "Store Manager", "Stressed, sweating, trying to prevent a riot. Hates his life.").await;
-    let mut karen = Agent::new("Shopper_Karen", "Entitled Customer", "Demanding, oblivious to tech issues, wants to speak to the manager IMMEDIATELY.").await;
-    let mut kevin = Agent::new("Shopper_Kevin", "Confused Customer", "Lost, looking for the bathroom, holding a frozen turkey.").await;
-    let mut hacker = Agent::new("Hacker_Zero", "Cybercriminal", "Cool, calculated, typing fast. Wearing a hoodie in the food court.").await;
-    let mut cashier = Agent::new("Cashier_Pat", "Teenage Employee", "Bored, secretly helping the hacker, hates the manager.").await;
+    let mut manager = Agent::new(
+        "Manager_Dave",
+        "Store Manager",
+        "Stressed, sweating, trying to prevent a riot. Hates his life.",
+    )
+    .await;
+    let mut karen = Agent::new(
+        "Shopper_Karen",
+        "Entitled Customer",
+        "Demanding, oblivious to tech issues, wants to speak to the manager IMMEDIATELY.",
+    )
+    .await;
+    let mut kevin = Agent::new(
+        "Shopper_Kevin",
+        "Confused Customer",
+        "Lost, looking for the bathroom, holding a frozen turkey.",
+    )
+    .await;
+    let mut hacker = Agent::new(
+        "Hacker_Zero",
+        "Cybercriminal",
+        "Cool, calculated, typing fast. Wearing a hoodie in the food court.",
+    )
+    .await;
+    let mut cashier = Agent::new(
+        "Cashier_Pat",
+        "Teenage Employee",
+        "Bored, secretly helping the hacker, hates the manager.",
+    )
+    .await;
 
     // --- ACT I: The Rush ---
     println!("\n--- 🕐 ACT I: THE DOORS OPEN ---");
-    karen.generate_and_send("Manager_Dave", "The automatic doors are stuck! I've been waiting 3 hours!").await?;
+    karen
+        .generate_and_send(
+            "Manager_Dave",
+            "The automatic doors are stuck! I've been waiting 3 hours!",
+        )
+        .await?;
     manager.check_inbox().await?; // Dave reacts
-    
+
     sleep(Duration::from_millis(1000)).await;
 
     // --- ACT II: The Glitch ---
     println!("\n--- 🕐 ACT II: THE POS CRASH ---");
-    hacker.generate_and_send("Cashier_Pat", "Injecting payload into Register 4. Distract Dave.").await?;
+    hacker
+        .generate_and_send(
+            "Cashier_Pat",
+            "Injecting payload into Register 4. Distract Dave.",
+        )
+        .await?;
     cashier.check_inbox().await?; // Pat reacts
-    cashier.generate_and_send("Manager_Dave", "Uh, boss? The registers are all showing skulls.").await?;
-    
+    cashier
+        .generate_and_send(
+            "Manager_Dave",
+            "Uh, boss? The registers are all showing skulls.",
+        )
+        .await?;
+
     sleep(Duration::from_millis(1000)).await;
 
     manager.check_inbox().await?; // Dave gets hit with bad news
-    kevin.generate_and_send("Manager_Dave", "Excuse me, where are the batteries? Also the registers are smoking.").await?;
+    kevin
+        .generate_and_send(
+            "Manager_Dave",
+            "Excuse me, where are the batteries? Also the registers are smoking.",
+        )
+        .await?;
 
     sleep(Duration::from_millis(1000)).await;
 
     // --- ACT III: The Meltdown ---
     println!("\n--- 🕐 ACT III: TOTAL CHAOS ---");
     karen.check_inbox().await?; // Maybe Dave replied?
-    karen.generate_and_send("Manager_Dave", "THIS IS UNACCEPTABLE. I AM CALLING CORPORATE.").await?;
-    
-    hacker.generate_and_send("Manager_Dave", "We have your transaction logs. Wire 50 BTC or we leak the credit cards.").await?;
-    
+    karen
+        .generate_and_send(
+            "Manager_Dave",
+            "THIS IS UNACCEPTABLE. I AM CALLING CORPORATE.",
+        )
+        .await?;
+
+    hacker
+        .generate_and_send(
+            "Manager_Dave",
+            "We have your transaction logs. Wire 50 BTC or we leak the credit cards.",
+        )
+        .await?;
+
     manager.check_inbox().await?; // Dave gets the ransom
-    
+
     // Final thoughts
     println!("\n--- 🎬 SCENE END ---");
     Ok(())
