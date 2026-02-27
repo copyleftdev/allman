@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const MAX_INBOX_SIZE: usize = 10_000;
 const MAX_AGENT_NAME_LEN: usize = 128;
+const MAX_RECIPIENTS: usize = 100;
 const MAX_SUBJECT_LEN: usize = 1_024;
 const MAX_BODY_LEN: usize = 65_536; // 64 KB
 const DEFAULT_INBOX_LIMIT: usize = 100;
@@ -207,6 +208,13 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
+    }
+    if to_agents.len() > MAX_RECIPIENTS {
+        return Err(format!(
+            "Too many recipients ({}, max {})",
+            to_agents.len(),
+            MAX_RECIPIENTS
+        ));
     }
     if subject.len() > MAX_SUBJECT_LEN {
         return Err(format!(
@@ -1833,5 +1841,183 @@ mod tests {
             result.is_ok(),
             "Field-qualified query should not error (may return 0 results)"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #5 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (FIXED): Recipient count is capped at MAX_RECIPIENTS ────────
+    // Previously, send_message had no limit on recipient count. A crafted
+    // 1MB request could cause ~14.5GB heap allocation via amplification.
+    // Now capped at MAX_RECIPIENTS (100).
+    #[tokio::test]
+    async fn dr5_h1_recipient_count_limit_enforced() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 101 recipients — exceeds MAX_RECIPIENTS (100)
+        let recipients: Vec<String> = (0..101).map(|i| format!("agent_{}", i)).collect();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "attacker",
+                "to": recipients,
+                "subject": "amplify",
+                "body": "payload",
+            }),
+        );
+
+        assert!(result.is_err(), "101 recipients must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Too many recipients"),
+            "Error message should mention recipient limit: {}",
+            err
+        );
+
+        // Verify zero delivery (no partial send)
+        for i in 0..101 {
+            assert!(
+                !state.inboxes.contains_key(&format!("agent_{}", i)),
+                "No messages should be delivered when recipient limit exceeded"
+            );
+        }
+    }
+
+    // MAX_RECIPIENTS boundary: exactly 100 should succeed
+    #[tokio::test]
+    async fn dr5_h1_max_recipients_boundary_accepted() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let recipients: Vec<String> = (0..100).map(|i| format!("agent_{}", i)).collect();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": recipients,
+                "subject": "broadcast",
+                "body": "hello all",
+            }),
+        );
+
+        assert!(result.is_ok(), "Exactly 100 recipients must be accepted");
+
+        // Verify all 100 got the message
+        let mut delivered = 0;
+        for i in 0..100 {
+            let inbox = get_inbox(&state, json!({ "agent_name": format!("agent_{}", i) })).unwrap();
+            delivered += inbox_messages(&inbox).len();
+        }
+        assert_eq!(delivered, 100, "All 100 recipients received the message");
+    }
+
+    // ── H2 (DISPROVED): get_inbox entry() for nonexistent agent ──────────
+    // Using entry() API on a nonexistent key with the Vacant branch should
+    // NOT create a spurious DashMap entry. Regression guard.
+    #[tokio::test]
+    async fn dr5_h2_get_inbox_vacant_no_spurious_entry() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Inbox for "ghost" doesn't exist
+        assert!(!state.inboxes.contains_key("ghost"));
+
+        // get_inbox for nonexistent agent
+        let result = get_inbox(&state, json!({ "agent_name": "ghost" })).unwrap();
+        assert_eq!(inbox_messages(&result).len(), 0);
+        assert_eq!(result["remaining"], 0);
+
+        // DashMap should NOT have created an entry
+        assert!(
+            !state.inboxes.contains_key("ghost"),
+            "Vacant branch must not create a spurious DashMap entry"
+        );
+    }
+
+    // ── H3 (DISPROVED): Full drain removes empty DashMap entry ───────────
+    // When all messages are drained, occ.remove() should clean up the key.
+    #[tokio::test]
+    async fn dr5_h3_full_drain_removes_dashmap_entry() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send 5 messages to alice
+        for i in 0..5 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "bob",
+                    "to": ["alice"],
+                    "subject": format!("msg {}", i),
+                    "body": "hello",
+                }),
+            )
+            .unwrap();
+        }
+
+        assert!(state.inboxes.contains_key("alice"));
+
+        // Drain all (default limit 100 > 5 messages)
+        let result = get_inbox(&state, json!({ "agent_name": "alice" })).unwrap();
+        assert_eq!(inbox_messages(&result).len(), 5);
+        assert_eq!(result["remaining"], 0);
+
+        // Key should be removed from DashMap
+        assert!(
+            !state.inboxes.contains_key("alice"),
+            "Full drain must remove the empty DashMap entry via occ.remove()"
+        );
+    }
+
+    // ── H5-DR5 (DISPROVED): serde_json::to_string_pretty on Value is safe ─
+    // create_agent serializes the agent profile as JSON for Git commit.
+    // serde_json::to_string_pretty can only fail on non-string map keys,
+    // but Value built from json!() macros always has string keys.
+    #[tokio::test]
+    async fn dr5_h5_serde_json_to_string_pretty_is_safe() {
+        // Build a Value identical to the agent profile in create_agent
+        let profile = json!({
+            "id": "test-id",
+            "project_id": "proj-123",
+            "name": "Agent_Test",
+            "program": "test program",
+            "model": "test-model",
+            "registered_at": "2026-01-01T00:00:00Z"
+        });
+
+        // This must not panic
+        let serialized = serde_json::to_string_pretty(&profile);
+        assert!(
+            serialized.is_ok(),
+            "to_string_pretty on json!() Value must always succeed"
+        );
+    }
+
+    // ── H6-DR5 (DISPROVED): schema.get_field() unwraps are safe ──────────
+    // The persistence worker calls schema.get_field("id").unwrap() etc.
+    // These are safe because the schema was just built with those fields
+    // in PostOffice::new(). This test asserts the schema contract.
+    #[tokio::test]
+    async fn dr5_h6_schema_fields_always_exist() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let schema = state.index.schema();
+        let required_fields = [
+            "id",
+            "project_id",
+            "from_agent",
+            "to_recipients",
+            "subject",
+            "body",
+            "created_ts",
+        ];
+
+        for field_name in &required_fields {
+            assert!(
+                schema.get_field(field_name).is_some(),
+                "Schema must contain field '{}' (persistence worker unwrap safety)",
+                field_name
+            );
+        }
     }
 }
