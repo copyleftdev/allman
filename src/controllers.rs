@@ -157,13 +157,15 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("from_agent")
         .and_then(|v| v.as_str())
         .ok_or("Missing from_agent")?;
-    let to_agents = args
+    let to_agents: Vec<String> = args
         .get("to")
         .and_then(|v| v.as_array())
         .ok_or("Missing to recipients")?
         .iter()
-        .map(|v| v.as_str().unwrap_or("").to_string())
-        .collect::<Vec<_>>();
+        .filter_map(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
     let subject = args
         .get("subject")
         .and_then(|v| v.as_str())
@@ -435,14 +437,11 @@ mod tests {
         // Channel drops are now logged via tracing::warn (verified by code inspection).
     }
 
-    // ── H10: Empty String Recipients ────────────────────────────────────────
-    // Hypothesis: Non-string elements in `to` array silently become empty
-    // string inbox keys.
+    // ── H10: Non-string recipients are filtered out ────────────────────────
     #[tokio::test]
-    async fn h10_non_string_to_elements_become_empty_string() {
+    async fn h10_non_string_recipients_are_filtered() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send to a mix of valid and non-string recipients
         let result = send_message(
             &state,
             json!({
@@ -454,13 +453,53 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        // CONFIRMED: "bob" gets the message
+        // "bob" gets the message (valid string recipient)
         assert!(state.inboxes.contains_key("bob"));
-        // CONFIRMED: Empty string key exists in the inbox map from null/int coercion
+        // Non-string elements must NOT create empty-string inbox entries
         assert!(
-            state.inboxes.contains_key(""),
-            "Non-string to elements silently become empty-string inbox entries"
+            !state.inboxes.contains_key(""),
+            "Non-string to elements must be filtered out, not coerced to empty string"
         );
+    }
+
+    // Empty-string recipients in the array must also be filtered.
+    #[tokio::test]
+    async fn h10_empty_string_recipients_are_filtered() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob", ""],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_ok());
+
+        assert!(state.inboxes.contains_key("bob"));
+        assert!(
+            !state.inboxes.contains_key(""),
+            "Empty string recipients must be filtered out"
+        );
+    }
+
+    // All-invalid recipients should return an error.
+    #[tokio::test]
+    async fn h10_all_invalid_recipients_returns_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [123, null, ""],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_err(), "All-invalid recipients must return error");
     }
 
     // ── H18: search_messages limit must be clamped ─────────────────────────
