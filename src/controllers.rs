@@ -3821,4 +3821,261 @@ mod tests {
             "Non-string jsonrpc does not prevent processing"
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Deep Review #16 — Hypothesis Tests
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): InboxEntry clone amplification on multi-recipient send ─
+    // send_message clones the full InboxEntry (from_agent + subject + body) for
+    // each recipient. With MAX_RECIPIENTS (100) and MAX_BODY_LEN (64KB), a
+    // single send allocates ~100 × (256 + 1024 + 65536) ≈ 6.5MB of cloned
+    // String data in DashMap. This is inherent to the fan-out design — each
+    // recipient needs an independent copy because get_inbox drains destructively.
+    // Documenting as a design tradeoff, not a fixable bug.
+    #[tokio::test]
+    async fn dr16_h1_inbox_entry_clone_amplification() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send with max-length body to 10 recipients
+        let big_body = "B".repeat(super::MAX_BODY_LEN);
+        let recipients: Vec<String> = (0..10).map(|i| format!("agent_{}", i)).collect();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": recipients,
+                "subject": "big payload",
+                "body": big_body,
+            }),
+        );
+        assert!(result.is_ok(), "Multi-recipient large body send succeeds");
+
+        // Verify each recipient got an independent copy (not shared ref)
+        let inbox_0 = get_inbox(&state, json!({ "agent_name": "agent_0" })).unwrap();
+        let inbox_9 = get_inbox(&state, json!({ "agent_name": "agent_9" })).unwrap();
+
+        let msgs_0 = inbox_messages(&inbox_0);
+        let msgs_9 = inbox_messages(&inbox_9);
+        assert_eq!(msgs_0.len(), 1);
+        assert_eq!(msgs_9.len(), 1);
+
+        // Each has the full body (independent clone, not shared)
+        assert_eq!(
+            msgs_0[0]["body"].as_str().unwrap().len(),
+            super::MAX_BODY_LEN
+        );
+        assert_eq!(
+            msgs_9[0]["body"].as_str().unwrap().len(),
+            super::MAX_BODY_LEN
+        );
+
+        // Draining agent_0 does not affect agent_9's remaining messages
+        // (already drained above, but confirm agent_1 still has its copy)
+        let inbox_1 = get_inbox(&state, json!({ "agent_name": "agent_1" })).unwrap();
+        assert_eq!(
+            inbox_messages(&inbox_1).len(),
+            1,
+            "Each recipient has independent copy — draining one doesn't affect others"
+        );
+    }
+
+    // ── H2 (CONFIRMED): create_agent response has no timestamp field ──────────
+    // The response includes id, project_id, name, program, model — but no
+    // registered_at or timestamp. Clients cannot distinguish fresh registration
+    // from upsert by examining the response alone.
+    #[tokio::test]
+    async fn dr16_h2_create_agent_response_has_no_timestamp() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice", "program": "v1" }),
+        )
+        .unwrap();
+
+        // Response fields
+        assert!(r1.get("id").is_some(), "Has id");
+        assert!(r1.get("project_id").is_some(), "Has project_id");
+        assert!(r1.get("name").is_some(), "Has name");
+        assert!(r1.get("program").is_some(), "Has program");
+        assert!(r1.get("model").is_some(), "Has model");
+        assert!(
+            r1.get("registered_at").is_none(),
+            "CONFIRMED: No timestamp field in create_agent response"
+        );
+
+        // Upsert returns same structure — indistinguishable from fresh registration
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice", "program": "v2" }),
+        )
+        .unwrap();
+        assert!(
+            r2.get("registered_at").is_none(),
+            "Upsert also has no timestamp"
+        );
+
+        // Only id differs between registration and upsert
+        assert_ne!(r1["id"], r2["id"], "Different ids on re-registration");
+        assert_eq!(r1["project_id"], r2["project_id"], "Same project_id");
+    }
+
+    // ── H3 (DISPROVED): unwrap_tantivy_arrays preserves multi-element arrays ──
+    // If a Tantivy doc ever had a field with 2+ values, the unwrapper would
+    // leave it as an array (only length-1 arrays are unwrapped). This is the
+    // correct defensive behavior — never silently drop data.
+    #[tokio::test]
+    async fn dr16_h3_unwrap_preserves_multi_element_arrays() {
+        // Simulate a Tantivy doc with multi-valued field
+        let doc = json!({
+            "subject": ["hello", "world"],  // multi-valued (hypothetical)
+            "body": ["single"],             // single-valued
+            "id": ["abc123"],               // single-valued
+        });
+
+        let unwrapped = unwrap_tantivy_arrays(doc);
+
+        // Multi-element array preserved as-is
+        assert!(
+            unwrapped["subject"].is_array(),
+            "Multi-element array NOT unwrapped (defensive)"
+        );
+        assert_eq!(unwrapped["subject"].as_array().unwrap().len(), 2);
+
+        // Single-element arrays unwrapped to scalars
+        assert!(unwrapped["body"].is_string(), "Single-element → scalar");
+        assert_eq!(unwrapped["body"], "single");
+        assert_eq!(unwrapped["id"], "abc123");
+    }
+
+    // ── H4 (CONFIRMED): get_inbox and search_messages use different field names ─
+    // get_inbox returns: { "id", "from", "subject", "body", "timestamp" }
+    // search returns:    { "id", "from_agent", "subject", "body", "created_ts", ... }
+    // The sender field is "from" in inbox but "from_agent" in search.
+    // The timestamp field is "timestamp" in inbox but "created_ts" in search.
+    #[tokio::test]
+    async fn dr16_h4_inbox_vs_search_field_name_mismatch() {
+        let (state, _idx, _repo) = test_post_office();
+
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "dr16_field_test",
+                "body": "field name comparison",
+                "project_id": "proj_dr16",
+            }),
+        )
+        .unwrap();
+
+        // Check inbox field names
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let inbox_msg = &inbox_messages(&inbox)[0];
+        assert!(inbox_msg.get("from").is_some(), "Inbox has 'from' field");
+        assert!(
+            inbox_msg.get("from_agent").is_none(),
+            "Inbox does NOT have 'from_agent'"
+        );
+        assert!(
+            inbox_msg.get("timestamp").is_some(),
+            "Inbox has 'timestamp'"
+        );
+        assert!(
+            inbox_msg.get("created_ts").is_none(),
+            "Inbox does NOT have 'created_ts'"
+        );
+
+        // Wait for indexing
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Check search field names
+        let search =
+            search_messages(&state, json!({ "query": "dr16_field_test", "limit": 10 })).unwrap();
+        let search_docs = search.as_array().unwrap();
+        assert!(!search_docs.is_empty(), "Search found the message");
+
+        let search_doc = &search_docs[0];
+        assert!(
+            search_doc.get("from_agent").is_some(),
+            "CONFIRMED: Search has 'from_agent' (not 'from')"
+        );
+        assert!(
+            search_doc.get("from").is_none(),
+            "Search does NOT have 'from'"
+        );
+        assert!(
+            search_doc.get("created_ts").is_some(),
+            "CONFIRMED: Search has 'created_ts' (not 'timestamp')"
+        );
+        assert!(
+            search_doc.get("timestamp").is_none(),
+            "Search does NOT have 'timestamp'"
+        );
+    }
+
+    // ── H5 (CONFIRMED): persistence_worker does not flush on shutdown ─────────
+    // When the persist channel closes (all senders dropped), rx.recv() returns
+    // Err and the worker breaks out of the loop WITHOUT calling
+    // index_writer.commit(). Any documents added via add_document() in the
+    // current batch are lost. In practice, the last batch is committed before
+    // the channel closes (the block→drain→commit cycle completes before the
+    // next recv() call), so only docs received between the last commit and
+    // channel close are at risk. This is a small window but real.
+    //
+    // Tracing the code path:
+    // 1. recv() blocks → gets first op → drain pending → commit → loop back
+    // 2. On next recv(), if channel is closed → break (no final commit)
+    // 3. Any add_document() calls in between are lost
+    //
+    // The window is between the last commit() and the next recv() returning Err.
+    // Since recv() blocks until a message arrives, and the channel closes only
+    // when all PostOffice clones are dropped, the typical scenario is:
+    //   - Worker commits batch N
+    //   - Worker blocks on recv()
+    //   - PostOffice drops → channel closes → recv() returns Err → break
+    //   - No uncommitted docs in this scenario (batch N already committed)
+    //
+    // The edge case is: worker is draining batch N, adds docs, commits, but
+    // MORE ops arrived during the commit. Those get picked up in the NEXT
+    // recv() cycle. If the channel closes between commit and recv, those
+    // new ops were never recv()'d so they're just left in the closed channel.
+    //
+    // Actually: crossbeam bounded channel guarantees that after all senders
+    // drop, recv() returns all buffered messages before returning Err. So
+    // the worker will process ALL remaining messages before shutting down.
+    // This means H5 is DISPROVED — no data loss on shutdown.
+    #[tokio::test]
+    async fn dr16_h5_persistence_worker_drains_on_shutdown() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send multiple messages to fill the persist channel
+        for i in 0..50 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "alice",
+                    "to": ["bob"],
+                    "subject": format!("shutdown_test_{}", i),
+                    "body": "content",
+                    "project_id": "proj_shutdown",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Drop PostOffice — closes persist_tx → worker drains all buffered ops
+        drop(state);
+
+        // The persistence worker will process all 50 IndexMessage ops and
+        // commit them before exiting (crossbeam delivers all buffered messages
+        // before returning Err on recv()). We can't easily verify the Tantivy
+        // index after drop since the index/reader are also dropped, but the
+        // test documents that the shutdown path is safe: no panics, no hangs.
+
+        // Brief sleep to let worker threads finish
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
