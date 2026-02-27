@@ -122,19 +122,20 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         .unwrap_or("unknown");
     let name_hint = args.get("name_hint").and_then(|v| v.as_str());
 
+    // Validate all inputs BEFORE mutating any state.
+    let name = name_hint.unwrap_or("AnonymousAgent").to_string();
+    validate_agent_name(&name)?;
+
     let project_id = format!(
         "proj_{}",
         Uuid::new_v5(&Uuid::NAMESPACE_DNS, project_key.as_bytes()).simple()
     );
 
-    // Lock-free upsert into DashMap
+    // Lock-free upsert into DashMap (after all validation passes)
     state
         .projects
         .entry(project_id.clone())
         .or_insert_with(|| project_key.to_string());
-
-    let name = name_hint.unwrap_or("AnonymousAgent").to_string();
-    validate_agent_name(&name)?;
 
     // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
     // across the collision check and the insert/update, eliminating the
@@ -2488,12 +2489,12 @@ mod tests {
     // Deep Review #9 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED - Low): create_agent mutates projects before validation ─
-    // validate_agent_name is called AFTER state.projects.entry(). An invalid
-    // name causes the function to return Err, but the projects entry persists.
-    // Fix: move validation before the projects.entry() call.
+    // ── H1 (FIXED): create_agent validates before mutating state ────────
+    // Previously, state.projects.entry() was called before validate_agent_name,
+    // creating orphan project entries on invalid names. Now validation
+    // precedes all state mutation.
     #[tokio::test]
-    async fn dr9_h1_invalid_name_pollutes_projects_dashmap() {
+    async fn dr9_h1_invalid_name_no_orphan_project() {
         let (state, _idx, _repo) = test_post_office();
 
         let result = create_agent(
@@ -2502,18 +2503,14 @@ mod tests {
         );
         assert!(result.is_err(), "Invalid name must be rejected");
 
-        // BUG: projects entry was created before validation
+        // FIXED: projects entry must NOT be created when validation fails
         let project_id = format!(
             "proj_{}",
             Uuid::new_v5(&Uuid::NAMESPACE_DNS, "orphan_project".as_bytes()).simple()
         );
-        // This documents the current (buggy) behavior:
-        // The projects DashMap has an entry even though no agent was created.
-        let has_orphan = state.projects.contains_key(&project_id);
-        // After fix: this assert should be inverted (orphan should NOT exist).
         assert!(
-            has_orphan,
-            "BUG: projects entry created before validation — orphan exists"
+            !state.projects.contains_key(&project_id),
+            "No orphan project entry when name validation fails"
         );
 
         // No agent should exist
