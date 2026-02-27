@@ -313,6 +313,9 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    if from_agent.is_empty() {
+        return Err("from_agent must not be empty".to_string());
+    }
     if from_agent.len() > MAX_FROM_AGENT_LEN {
         return Err(format!(
             "from_agent exceeds {} character limit",
@@ -382,8 +385,17 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     if subject.chars().any(|c| c.is_control()) {
         return Err("Subject must not contain control characters".to_string());
     }
+    if body.contains('\0') {
+        return Err("Body must not contain null bytes".to_string());
+    }
     if body.len() > MAX_BODY_LEN {
         return Err(format!("Body exceeds {} byte limit", MAX_BODY_LEN));
+    }
+    if project_id.contains('\0') {
+        return Err("project_id must not contain null bytes".to_string());
+    }
+    if project_id.chars().any(|c| c.is_control()) {
+        return Err("project_id must not contain control characters".to_string());
     }
     if project_id.len() > MAX_PROJECT_ID_LEN {
         return Err(format!(
@@ -589,7 +601,7 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     Ok(json!({
         "results": results,
-        "total": results.len()
+        "count": results.len()
     }))
 }
 
@@ -3165,14 +3177,15 @@ mod tests {
                 "body": body_with_nulls,
             }),
         );
-        assert!(result.is_ok(), "Body with null bytes must be accepted");
+        // DR19 fix: body with null bytes is now rejected
+        assert!(result.is_err(), "Body with null bytes must be rejected");
 
+        // Message was never delivered — inbox is empty
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        assert_eq!(inbox_messages(&inbox).len(), 1);
         assert_eq!(
-            inbox_messages(&inbox)[0]["body"].as_str().unwrap(),
-            body_with_nulls,
-            "Null bytes preserved in body round-trip"
+            inbox_messages(&inbox).len(),
+            0,
+            "No message delivered when body has null bytes"
         );
     }
 
@@ -4687,14 +4700,14 @@ mod tests {
             "FIXED: search_messages has 'results' wrapper"
         );
         assert!(
-            search.get("total").is_some(),
-            "FIXED: search_messages has 'total' field"
+            search.get("count").is_some(),
+            "FIXED: search_messages has 'count' field"
         );
         assert!(
             search["results"].is_array(),
             "FIXED: search results is an array"
         );
-        assert!(search["total"].is_number(), "FIXED: total is a number");
+        assert!(search["count"].is_number(), "FIXED: count is a number");
     }
 
     // ── H5 (CONFIRMED): subject accepts null bytes and control characters ──
@@ -4755,7 +4768,7 @@ mod tests {
     async fn dr19_h1_from_agent_accepts_empty_string() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Empty from_agent — should be rejected but isn't
+        // FIXED: Empty from_agent is now rejected
         let r = send_message(
             &state,
             json!({
@@ -4765,20 +4778,23 @@ mod tests {
                 "body": "anonymous message"
             }),
         );
+        assert!(r.is_err(), "FIXED: Empty from_agent is rejected");
         assert!(
-            r.is_ok(),
-            "CONFIRMED: Empty from_agent is accepted — creates message with blank sender"
+            r.unwrap_err().contains("empty"),
+            "Error message mentions empty"
         );
 
-        // Verify the blank sender appears in inbox
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msgs = inbox_messages(&inbox);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(
-            msgs[0]["from_agent"].as_str().unwrap(),
-            "",
-            "CONFIRMED: Inbox shows empty string as sender"
+        // Non-empty from_agent still works
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "valid message"
+            }),
         );
+        assert!(r2.is_ok(), "Non-empty from_agent accepted");
     }
 
     // ── H2 (CONFIRMED): project_id accepts null bytes and control chars ──────
@@ -4788,7 +4804,7 @@ mod tests {
     async fn dr19_h2_project_id_accepts_null_bytes() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Null byte in project_id — accepted
+        // FIXED: Null byte in project_id — now rejected
         let r1 = send_message(
             &state,
             json!({
@@ -4799,12 +4815,9 @@ mod tests {
                 "project_id": "proj\0evil"
             }),
         );
-        assert!(
-            r1.is_ok(),
-            "CONFIRMED: project_id with null byte is accepted"
-        );
+        assert!(r1.is_err(), "FIXED: project_id with null byte is rejected");
 
-        // Control chars in project_id — accepted
+        // FIXED: Control chars in project_id — now rejected
         let r2 = send_message(
             &state,
             json!({
@@ -4816,18 +4829,22 @@ mod tests {
             }),
         );
         assert!(
-            r2.is_ok(),
-            "CONFIRMED: project_id with ANSI escape is accepted"
+            r2.is_err(),
+            "FIXED: project_id with ANSI escape is rejected"
         );
 
-        // Verify they appear in inbox
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msgs = inbox_messages(&inbox);
-        assert_eq!(msgs.len(), 2, "Both messages delivered");
-        assert!(
-            msgs[0]["project_id"].as_str().unwrap().contains('\0'),
-            "CONFIRMED: Null byte in project_id preserved in inbox"
+        // Clean project_id still works
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test3",
+                "body": "hi",
+                "project_id": "proj_clean_123"
+            }),
         );
+        assert!(r3.is_ok(), "Clean project_id accepted");
     }
 
     // ── H3 (CONFIRMED): Malformed JSON returns HTTP 422, not JSON-RPC -32700 ─
@@ -4855,11 +4872,11 @@ mod tests {
         assert!(r3.get("error").is_some(), "Null payload returns error");
     }
 
-    // ── H4 (CONFIRMED): search_messages "total" is misleading ────────────────
-    // total equals results.len() (bounded by limit), NOT the total number of
-    // matching documents in the index. Clients can't use it for pagination.
+    // ── H4 (CONFIRMED): search_messages "total" was misleading ─────────────
+    // Renamed to "count" — accurately reflects the number of results returned,
+    // not total matches in the index.
     #[tokio::test]
-    async fn dr19_h4_search_total_equals_returned_count() {
+    async fn dr19_h4_search_count_reflects_returned() {
         let (state, _idx, _repo) = test_post_office();
 
         // Send 5 messages with the same searchable keyword
@@ -4869,8 +4886,8 @@ mod tests {
                 json!({
                     "from_agent": "alice",
                     "to": ["bob"],
-                    "subject": format!("dr19_total_test msg {}", i),
-                    "body": "dr19_total_test searchable content"
+                    "subject": format!("dr19_count_test msg {}", i),
+                    "body": "dr19_count_test searchable content"
                 }),
             )
             .unwrap();
@@ -4879,21 +4896,24 @@ mod tests {
         // Wait for indexing
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // Search with limit=2 — should only return 2 results
+        // Search with limit=2
         let search =
-            search_messages(&state, json!({ "query": "dr19_total_test", "limit": 2 })).unwrap();
+            search_messages(&state, json!({ "query": "dr19_count_test", "limit": 2 })).unwrap();
 
         let results = search["results"].as_array().unwrap();
-        let total = search["total"].as_i64().unwrap();
+        let count = search["count"].as_i64().unwrap();
 
         assert!(results.len() <= 2, "Results bounded by limit");
         assert_eq!(
-            total,
+            count,
             results.len() as i64,
-            "CONFIRMED: total equals results.len(), NOT total matches in index"
+            "FIXED: 'count' accurately reflects number of results returned"
         );
-        // If total were the true match count, it would be >= 5
-        // But it's <= 2 because it just mirrors results.len()
+        // Field renamed from "total" to "count" to avoid pagination confusion
+        assert!(
+            search.get("total").is_none(),
+            "FIXED: misleading 'total' field removed"
+        );
     }
 
     // ── H5 (CONFIRMED): body accepts null bytes without validation ───────────
@@ -4904,7 +4924,7 @@ mod tests {
     async fn dr19_h5_body_accepts_null_bytes_and_control_chars() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Null byte in body — accepted
+        // FIXED: Null byte in body — now rejected
         let r1 = send_message(
             &state,
             json!({
@@ -4914,34 +4934,33 @@ mod tests {
                 "body": "before\0after"
             }),
         );
-        assert!(r1.is_ok(), "CONFIRMED: Body with null byte is accepted");
+        assert!(r1.is_err(), "FIXED: Body with null byte is rejected");
 
-        // Control chars in body — accepted
+        // Control chars in body — still accepted (tabs, newlines are valid in markdown)
         let r2 = send_message(
             &state,
             json!({
                 "from_agent": "alice",
                 "to": ["bob"],
                 "subject": "body test 2",
-                "body": "alert\x07\x08\x1b[31mRED\x1b[0m"
+                "body": "line1\nline2\ttabbed"
             }),
         );
         assert!(
             r2.is_ok(),
-            "CONFIRMED: Body with control chars (ANSI escape) is accepted"
+            "Body with tabs and newlines is accepted (valid markdown)"
         );
 
-        // Verify both in inbox with content preserved
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msgs = inbox_messages(&inbox);
-        assert_eq!(msgs.len(), 2, "Both messages delivered");
-        assert!(
-            msgs[0]["body"].as_str().unwrap().contains('\0'),
-            "CONFIRMED: Null byte preserved in body"
+        // Clean body still works
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "body test 3",
+                "body": "Normal body content with punctuation! And lines."
+            }),
         );
-        assert!(
-            msgs[1]["body"].as_str().unwrap().contains('\x1b'),
-            "CONFIRMED: ANSI escape preserved in body"
-        );
+        assert!(r3.is_ok(), "Clean body accepted");
     }
 }
