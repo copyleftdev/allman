@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const MAX_INBOX_SIZE: usize = 10_000;
 const MAX_AGENT_NAME_LEN: usize = 128;
+const MAX_FROM_AGENT_LEN: usize = 256;
 const MAX_RECIPIENTS: usize = 100;
 const MAX_SUBJECT_LEN: usize = 1_024;
 const MAX_BODY_LEN: usize = 65_536; // 64 KB
@@ -206,6 +207,12 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    if from_agent.len() > MAX_FROM_AGENT_LEN {
+        return Err(format!(
+            "from_agent exceeds {} character limit",
+            MAX_FROM_AGENT_LEN
+        ));
+    }
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
     }
@@ -1504,15 +1511,15 @@ mod tests {
         assert_eq!(record.program, "v2", "Record updated to latest");
     }
 
-    // ── H4: from_agent is not validated ──────────────────────────────────
-    // Any string can be used as from_agent, including long ones with
-    // special characters. This is bounded by the 1MB HTTP body limit.
+    // ── H4: from_agent accepts any string up to MAX_FROM_AGENT_LEN ─────
+    // from_agent is not validated against the agent registry but is
+    // length-limited to prevent amplification attacks.
     #[tokio::test]
     async fn h4_from_agent_accepts_any_string() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Long from_agent
-        let long_from = "X".repeat(500);
+        // 200-char from_agent — within MAX_FROM_AGENT_LEN (256)
+        let long_from = "X".repeat(200);
         let result = send_message(
             &state,
             json!({
@@ -1522,13 +1529,13 @@ mod tests {
                 "body": "hello",
             }),
         );
-        assert!(result.is_ok(), "Long from_agent is accepted");
+        assert!(result.is_ok(), "200-char from_agent is accepted");
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
             inbox_messages(&inbox)[0]["from"].as_str().unwrap(),
             long_from,
-            "Long from_agent preserved in inbox entry"
+            "from_agent preserved in inbox entry"
         );
     }
 
@@ -1794,16 +1801,13 @@ mod tests {
         // the race window is small and may not manifest every run.
     }
 
-    // ── H4: from_agent has no independent length limit ──────────────────
-    // Bounded only by the 1MB HTTP body limit at the Axum layer.
-    // This test documents the current behavior as a regression guard.
+    // ── H4: from_agent exceeding MAX_FROM_AGENT_LEN is rejected ─────────
+    // Previously unbounded, now capped at 256 chars to prevent amplification.
     #[tokio::test]
-    async fn h4_from_agent_no_independent_length_limit() {
+    async fn h4_from_agent_exceeding_limit_is_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 10KB from_agent — well within 1MB HTTP limit but much larger
-        // than agent names (128 char limit). This is accepted because
-        // from_agent is not validated against the agent registry.
+        // 10KB from_agent — exceeds MAX_FROM_AGENT_LEN (256)
         let long_from = "X".repeat(10_000);
         let result = send_message(
             &state,
@@ -1814,14 +1818,11 @@ mod tests {
                 "body": "hello",
             }),
         );
-        assert!(result.is_ok(), "10KB from_agent is accepted (no limit)");
-
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        assert_eq!(
-            inbox_messages(&inbox)[0]["from"].as_str().unwrap().len(),
-            10_000,
-            "Full 10KB from_agent is preserved in inbox"
+        assert!(
+            result.is_err(),
+            "10KB from_agent must be rejected (exceeds 256 limit)"
         );
+        assert!(result.unwrap_err().contains("from_agent exceeds"));
     }
 
     // ── H5: search_messages field:term syntax accesses any field ─────────
@@ -2025,42 +2026,68 @@ mod tests {
     // Deep Review #6 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H6 (CONFIRMED): from_agent has no length limit — secondary amplification
-    // send_message validates subject (1KB), body (64KB), and recipient count
-    // (100), but from_agent is unbounded. A ~900KB from_agent × 100
-    // recipients = ~90MB heap from a single 1MB HTTP request (~90x
-    // amplification). This test documents the vulnerability.
+    // ── H6 (FIXED): from_agent length is capped at MAX_FROM_AGENT_LEN ───
+    // Previously, from_agent was unbounded. A ~900KB from_agent × 100
+    // recipients = ~90MB heap from a 1MB request. Now capped at 256 chars.
     #[tokio::test]
-    async fn dr6_h6_from_agent_unbounded_amplification() {
+    async fn dr6_h6_from_agent_length_limit_enforced() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 10KB from_agent with 50 recipients — 10KB × 50 = 500KB heap.
-        // Demonstrates the cloning amplification pattern.
-        let big_from = "X".repeat(10_000);
-        let recipients: Vec<String> = (0..50).map(|i| format!("r_{}", i)).collect();
+        // 257 chars — exceeds MAX_FROM_AGENT_LEN (256)
+        let big_from = "X".repeat(257);
 
         let result = send_message(
             &state,
             json!({
                 "from_agent": big_from,
-                "to": recipients,
+                "to": ["bob"],
                 "subject": "test",
                 "body": "hello",
             }),
         );
 
-        // Currently succeeds — no from_agent length limit.
+        assert!(result.is_err(), "257-char from_agent must be rejected");
+        let err = result.unwrap_err();
         assert!(
-            result.is_ok(),
-            "10KB from_agent with 50 recipients is accepted (no limit)"
+            err.contains("from_agent exceeds"),
+            "Error should mention from_agent limit: {}",
+            err
         );
 
-        // Verify all recipients got the full 10KB from_agent
-        let inbox = get_inbox(&state, json!({ "agent_name": "r_0" })).unwrap();
+        // Verify zero delivery
+        assert!(
+            !state.inboxes.contains_key("bob"),
+            "No message delivered when from_agent exceeds limit"
+        );
+    }
+
+    // MAX_FROM_AGENT_LEN boundary: exactly 256 should succeed
+    #[tokio::test]
+    async fn dr6_h6_from_agent_boundary_accepted() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let from = "X".repeat(256);
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": from,
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Exactly 256-char from_agent must be accepted"
+        );
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
             inbox_messages(&inbox)[0]["from"].as_str().unwrap().len(),
-            10_000,
-            "Full 10KB from_agent is cloned into each inbox entry"
+            256,
+            "Full 256-char from_agent preserved in inbox entry"
         );
     }
 
