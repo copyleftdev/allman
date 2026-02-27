@@ -93,10 +93,7 @@ impl Agent {
             .and_then(|s| s.as_str())
         {
             let parsed: Value = serde_json::from_str(content_str)?;
-            let messages = parsed["messages"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let messages = parsed["messages"].as_array().cloned().unwrap_or_default();
             count = messages.len();
             for msg in messages {
                 let from = msg

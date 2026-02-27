@@ -1827,8 +1827,7 @@ mod tests {
         // The query parser is configured with subject+body as defaults.
         // But field:term syntax should still work for other stored fields.
         // This documents the current behavior — no project isolation on search.
-        let result =
-            search_messages(&state, json!({ "query": "from_agent:alice", "limit": 10 }));
+        let result = search_messages(&state, json!({ "query": "from_agent:alice", "limit": 10 }));
         // Should not error — Tantivy resolves the field name
         assert!(
             result.is_ok(),
