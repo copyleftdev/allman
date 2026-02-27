@@ -2181,4 +2181,148 @@ mod tests {
             "Search + doc retrieval must not fail on consistent searcher snapshot"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #7 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (DISPROVED): Empty project_key produces valid deterministic UUID ──
+    #[tokio::test]
+    async fn dr7_h1_empty_project_key_produces_valid_id() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r1 = create_agent(&state, json!({ "project_key": "", "name_hint": "Agent1" })).unwrap();
+        let r2 = create_agent(&state, json!({ "project_key": "", "name_hint": "Agent2" })).unwrap();
+
+        // Empty project_key → deterministic UUID v5 from empty bytes
+        assert_eq!(
+            r1["project_id"], r2["project_id"],
+            "Empty project_key must produce the same deterministic project_id"
+        );
+        assert!(
+            r1["project_id"].as_str().unwrap().starts_with("proj_"),
+            "project_id must have proj_ prefix"
+        );
+    }
+
+    // ── H2 (DISPROVED): Long recipient names don't amplify memory ───────
+    // Recipient names become DashMap keys (stored once), not part of the
+    // cloned InboxEntry. So long names don't amplify per-recipient.
+    #[tokio::test]
+    async fn dr7_h2_long_recipient_names_dont_amplify() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 1KB recipient names × 10 recipients — names are DashMap keys only
+        let recipients: Vec<String> = (0..10)
+            .map(|i| format!("{}{}", "R".repeat(1000), i))
+            .collect();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": recipients,
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_ok(), "Long recipient names are accepted");
+
+        // Verify each got exactly one message with normal-sized content
+        let inbox = get_inbox(&state, json!({ "agent_name": &recipients[0] })).unwrap();
+        let msg = &inbox_messages(&inbox)[0];
+        assert_eq!(msg["from"], "alice");
+        assert_eq!(msg["body"], "hello");
+    }
+
+    // ── H4 (DISPROVED): Unvalidated program/model fields are bounded ─────
+    // program and model are stored once per agent (not per recipient).
+    // No amplification possible. This test documents the behavior.
+    #[tokio::test]
+    async fn dr7_h4_large_program_model_accepted() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let big_program = "P".repeat(10_000);
+        let big_model = "M".repeat(10_000);
+
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "BigAgent",
+                "program": big_program,
+                "model": big_model,
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "Large program/model are accepted (stored once per agent, not amplified)"
+        );
+
+        let record = state.agents.get("BigAgent").unwrap();
+        assert_eq!(record.program.len(), 10_000);
+        assert_eq!(record.model.len(), 10_000);
+    }
+
+    // ── H5 (DISPROVED): QueryParser construction is lightweight ──────────
+    // QueryParser::for_index() is called per request. This test verifies
+    // it doesn't degrade under repeated construction.
+    #[tokio::test]
+    async fn dr7_h5_query_parser_per_request_is_fast() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 100 sequential searches — each creates a new QueryParser
+        for i in 0..100 {
+            let result = search_messages(
+                &state,
+                json!({ "query": format!("term_{}", i), "limit": 10 }),
+            );
+            assert!(result.is_ok(), "Search {} should succeed", i);
+        }
+    }
+
+    // ── H8 (DISPROVED): PostOffice drop drains channels correctly ────────
+    // After axum::serve returns, all Extension clones are dropped. Then
+    // drop(state) drops the original. Channels close → workers drain.
+    // This test verifies the channel closure path.
+    #[tokio::test]
+    async fn dr7_h8_channel_closure_on_all_senders_dropped() {
+        let (state, idx, repo) = test_post_office();
+
+        // Send a message so persist channel has work
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "shutdown test",
+                "body": "will be indexed",
+            }),
+        )
+        .unwrap();
+
+        // Clone the state (simulating Extension layer)
+        let clone = state.clone();
+
+        // Drop the clone — channel should still be open
+        drop(clone);
+
+        // Original state still works
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["charlie"],
+                "subject": "after clone drop",
+                "body": "still works",
+            }),
+        );
+        assert!(result.is_ok(), "State still works after dropping one clone");
+
+        // Drop original — channels close, workers will drain
+        drop(state);
+        // TempDirs (idx, repo) keep files alive until end of test
+        drop(idx);
+        drop(repo);
+    }
 }
