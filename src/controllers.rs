@@ -3361,4 +3361,120 @@ mod tests {
             "Huge limit clamped to MAX_SEARCH_LIMIT"
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Deep Review #14 — Hypothesis Tests
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): agents DashMap has no entry count limit ─────────────
+    // Unlike inboxes (capped at MAX_INBOX_SIZE), there is no MAX_AGENTS limit.
+    // Unlimited create_agent calls with unique names grow the DashMap unbounded.
+    #[tokio::test]
+    async fn dr14_h1_agents_dashmap_unbounded() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register 200 unique agents — no cap enforced
+        for i in 0..200 {
+            let result = create_agent(
+                &state,
+                json!({
+                    "project_key": "stress",
+                    "name_hint": format!("agent_{}", i),
+                }),
+            );
+            assert!(result.is_ok(), "Agent {} should register", i);
+        }
+
+        // CONFIRMED: all 200 accepted, no upper bound enforced
+        assert_eq!(state.agents.len(), 200, "All 200 agents registered");
+        assert!(
+            state.agents.len() > 100,
+            "No MAX_AGENTS limit — unbounded growth possible"
+        );
+    }
+
+    // ── H2 (CONFIRMED): persist channel drop returns "sent" silently ────────
+    // When the persist channel is full, try_send drops the Tantivy index op.
+    // The caller gets "status": "sent" with no degradation indicator.
+    // Message IS delivered to inbox but becomes permanently unsearchable.
+    #[tokio::test]
+    async fn dr14_h2_persist_drop_returns_sent_silently() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Fill the persist channel to capacity (100,000 ops)
+        // We can't actually fill 100K in a test, but we can verify the
+        // response format doesn't include any "degraded" indicator.
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello",
+            }),
+        )
+        .unwrap();
+
+        // Response always says "sent" — no field indicates indexing status
+        assert_eq!(result["status"], "sent");
+        assert!(
+            result.get("indexed").is_none(),
+            "No indexing status in response — persist drops are silent"
+        );
+        assert!(
+            result.get("search_status").is_none(),
+            "No search_status field — caller cannot detect degraded indexing"
+        );
+    }
+
+    // ── H3 (DISPROVED): search_messages limit=0 is safe ────────────────────
+    // clamp(1, MAX_SEARCH_LIMIT) ensures 0 becomes 1 before reaching Tantivy.
+    #[tokio::test]
+    async fn dr14_h3_search_limit_zero_clamped_to_one() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = search_messages(&state, json!({ "query": "hello", "limit": 0 }));
+        assert!(result.is_ok(), "limit=0 must not panic");
+        assert!(result.unwrap().as_array().is_some());
+    }
+
+    // ── H4 (DISPROVED): empty JSON request returns error, no panic ──────────
+    // handle_mcp_request with {} defaults method to "" which hits the
+    // catch-all "Method not found" branch.
+    #[tokio::test]
+    async fn dr14_h4_empty_json_request_returns_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let response = handle_mcp_request(state, json!({})).await;
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert!(response.get("error").is_some(), "Must return error");
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(response["error"]["message"], "Method not found");
+        assert_eq!(response["id"], serde_json::Value::Null);
+    }
+
+    // ── H5 (CONFIRMED): dot-prefixed agent names create hidden dirs ─────────
+    // validate_agent_name rejects "." but allows ".hidden", which creates
+    // agents/.hidden/profile.json in the git repo — a hidden directory.
+    #[tokio::test]
+    async fn dr14_h5_dot_prefixed_agent_name_creates_hidden_dir() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": ".hidden_agent",
+            }),
+        );
+
+        // CONFIRMED: ".hidden_agent" passes validation — creates hidden git path
+        assert!(
+            result.is_ok(),
+            "Dot-prefixed name accepted by validate_agent_name"
+        );
+        assert!(state.agents.contains_key(".hidden_agent"));
+        // The git path would be agents/.hidden_agent/profile.json — a hidden dir
+    }
 }
