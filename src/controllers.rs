@@ -204,15 +204,28 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         timestamp: now,
     };
 
+    // Pre-check all recipient inboxes BEFORE any delivery.
+    // This prevents partial delivery where some recipients get the message
+    // but the caller receives an error because a later recipient's inbox is full.
     for recipient in &to_agents {
-        let mut inbox = state.inboxes.entry(recipient.clone()).or_default();
-        if inbox.len() >= MAX_INBOX_SIZE {
-            return Err(format!(
-                "Recipient '{}' inbox full ({} messages) — drain with get_inbox first",
-                recipient, MAX_INBOX_SIZE
-            ));
+        let inbox = state.inboxes.get(recipient);
+        if let Some(ref ib) = inbox {
+            if ib.len() >= MAX_INBOX_SIZE {
+                return Err(format!(
+                    "Recipient '{}' inbox full ({} messages) — drain with get_inbox first",
+                    recipient, MAX_INBOX_SIZE
+                ));
+            }
         }
-        inbox.push(entry.clone());
+    }
+
+    // All inboxes have capacity — deliver atomically per recipient.
+    for recipient in &to_agents {
+        state
+            .inboxes
+            .entry(recipient.clone())
+            .or_default()
+            .push(entry.clone());
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
@@ -859,15 +872,14 @@ mod tests {
         // Caller gets an error (B is full)
         assert!(result.is_err(), "Should fail because recipient_b inbox is full");
 
-        // CONFIRMED BUG: recipient_a already received the message despite the error
+        // Fixed: pre-check prevents partial delivery. recipient_a should NOT
+        // have received the message since the entire send was rejected.
         let inbox_a = get_inbox(&state, json!({ "agent_name": "recipient_a" })).unwrap();
         let a_count = inbox_a.as_array().unwrap().len();
 
-        // This documents the partial delivery: A got it, but caller got an error.
-        // a_count == 1 proves partial delivery occurred.
         assert_eq!(
-            a_count, 1,
-            "PARTIAL DELIVERY CONFIRMED: recipient_a got the message despite error return"
+            a_count, 0,
+            "No partial delivery: recipient_a must not receive message when send is rejected"
         );
     }
 
