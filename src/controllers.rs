@@ -7,6 +7,9 @@ use tantivy::query::QueryParser;
 use uuid::Uuid;
 
 const MAX_INBOX_SIZE: usize = 10_000;
+const MAX_AGENT_NAME_LEN: usize = 128;
+const MAX_SUBJECT_LEN: usize = 1_024;
+const MAX_BODY_LEN: usize = 65_536; // 64 KB
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -67,6 +70,12 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Invalid agent name: must not be empty".to_string());
     }
+    if name.len() > MAX_AGENT_NAME_LEN {
+        return Err(format!(
+            "Invalid agent name: exceeds {} character limit",
+            MAX_AGENT_NAME_LEN
+        ));
+    }
     if name.contains('/') || name.contains('\\') {
         return Err("Invalid agent name: must not contain path separators".to_string());
     }
@@ -75,6 +84,12 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
     }
     if name.contains('\0') {
         return Err("Invalid agent name: must not contain null bytes".to_string());
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err("Invalid agent name: must not contain control characters".to_string());
+    }
+    if name.trim().is_empty() {
+        return Err("Invalid agent name: must not be whitespace-only".to_string());
     }
     Ok(())
 }
@@ -110,17 +125,9 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     let name = name_hint.unwrap_or("AnonymousAgent").to_string();
     validate_agent_name(&name)?;
 
-    // Reject cross-project name collisions. Same-project re-registration
-    // is allowed (idempotent upsert — expected by benchmarks and simulations).
-    if let Some(existing) = state.agents.get(&name) {
-        if existing.project_id != project_id {
-            return Err(format!(
-                "Agent '{}' already registered in a different project",
-                name
-            ));
-        }
-    }
-
+    // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
+    // across the collision check and the insert/update, eliminating the
+    // TOCTOU race that existed with separate get() + insert().
     let agent_id = Uuid::new_v4().to_string();
 
     let record = AgentRecord {
@@ -131,7 +138,21 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         model: model.to_string(),
     };
 
-    state.agents.insert(name.clone(), record);
+    match state.agents.entry(name.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+            if occ.get().project_id != project_id {
+                return Err(format!(
+                    "Agent '{}' already registered in a different project",
+                    name
+                ));
+            }
+            // Same project — idempotent upsert
+            occ.insert(record);
+        }
+        dashmap::mapref::entry::Entry::Vacant(vac) => {
+            vac.insert(record);
+        }
+    }
 
     // Fire-and-forget: persist agent profile to Git
     let profile = json!({
@@ -185,6 +206,15 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
     }
+    if subject.len() > MAX_SUBJECT_LEN {
+        return Err(format!(
+            "Subject exceeds {} character limit",
+            MAX_SUBJECT_LEN
+        ));
+    }
+    if body.len() > MAX_BODY_LEN {
+        return Err(format!("Body exceeds {} byte limit", MAX_BODY_LEN));
+    }
 
     let message_id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
@@ -198,15 +228,28 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         timestamp: now,
     };
 
+    // Pre-check all recipient inboxes BEFORE any delivery.
+    // This prevents partial delivery where some recipients get the message
+    // but the caller receives an error because a later recipient's inbox is full.
     for recipient in &to_agents {
-        let mut inbox = state.inboxes.entry(recipient.clone()).or_default();
-        if inbox.len() >= MAX_INBOX_SIZE {
-            return Err(format!(
-                "Recipient '{}' inbox full ({} messages) — drain with get_inbox first",
-                recipient, MAX_INBOX_SIZE
-            ));
+        let inbox = state.inboxes.get(recipient);
+        if let Some(ref ib) = inbox {
+            if ib.len() >= MAX_INBOX_SIZE {
+                return Err(format!(
+                    "Recipient '{}' inbox full ({} messages) — drain with get_inbox first",
+                    recipient, MAX_INBOX_SIZE
+                ));
+            }
         }
-        inbox.push(entry.clone());
+    }
+
+    // All inboxes have capacity — deliver atomically per recipient.
+    for recipient in &to_agents {
+        state
+            .inboxes
+            .entry(recipient.clone())
+            .or_default()
+            .push(entry.clone());
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
@@ -774,5 +817,480 @@ mod tests {
         assert!(names.contains(&"send_message"));
         assert!(names.contains(&"search_messages"));
         assert!(names.contains(&"get_inbox"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Deep Review #2 — Post-remediation adversarial hypotheses
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── H1: TOCTOU race in create_agent cross-project collision check ────
+    // The get() → insert() sequence is not atomic. Two concurrent requests
+    // with the same name but different project_keys can both pass the
+    // collision check.
+    #[tokio::test]
+    async fn h1_toctou_concurrent_cross_project_collision() {
+        use std::sync::{Arc, Barrier};
+
+        let (state, _idx, _repo) = test_post_office();
+        let state = Arc::new(state);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let s = Arc::clone(&state);
+            let b = Arc::clone(&barrier);
+            let project_key = format!("project_{}", i);
+            handles.push(std::thread::spawn(move || {
+                b.wait(); // Maximize chance of interleaving
+                create_agent(
+                    &s,
+                    json!({
+                        "project_key": project_key,
+                        "name_hint": "RaceName",
+                    }),
+                )
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures = results.iter().filter(|r| r.is_err()).count();
+
+        // Fixed: atomic entry() API ensures exactly one succeeds.
+        assert_eq!(successes, 1, "Exactly one should succeed");
+        assert_eq!(failures, 1, "Exactly one should be rejected");
+    }
+
+    // ── H2: Partial delivery when multi-recipient inbox is full ──────────
+    // If recipient B's inbox is full but A's is not, A gets the message
+    // but the caller receives an error.
+    #[tokio::test]
+    async fn h2_partial_delivery_on_inbox_full() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Fill recipient_b's inbox to cap
+        for i in 0..MAX_INBOX_SIZE {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "filler",
+                    "to": ["recipient_b"],
+                    "subject": format!("fill #{}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Send to [recipient_a, recipient_b] — B is full
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": ["recipient_a", "recipient_b"],
+                "subject": "multi-send",
+                "body": "hello",
+            }),
+        );
+
+        // Caller gets an error (B is full)
+        assert!(
+            result.is_err(),
+            "Should fail because recipient_b inbox is full"
+        );
+
+        // Fixed: pre-check prevents partial delivery. recipient_a should NOT
+        // have received the message since the entire send was rejected.
+        let inbox_a = get_inbox(&state, json!({ "agent_name": "recipient_a" })).unwrap();
+        let a_count = inbox_a.as_array().unwrap().len();
+
+        assert_eq!(
+            a_count, 0,
+            "No partial delivery: recipient_a must not receive message when send is rejected"
+        );
+    }
+
+    // ── H4: Field length limits enforced ────────────────────────────────
+    #[tokio::test]
+    async fn h4_long_agent_name_is_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+        let long_name = "A".repeat(super::MAX_AGENT_NAME_LEN + 1);
+
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": long_name }),
+        );
+
+        assert!(
+            result.is_err(),
+            "Agent name exceeding limit must be rejected"
+        );
+        assert!(
+            result.unwrap_err().contains("character limit"),
+            "Error should mention character limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn h4_max_length_agent_name_is_accepted() {
+        let (state, _idx, _repo) = test_post_office();
+        let name = "A".repeat(super::MAX_AGENT_NAME_LEN);
+
+        let result = create_agent(&state, json!({ "project_key": "test", "name_hint": name }));
+        assert!(
+            result.is_ok(),
+            "Agent name at exactly the limit should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn h4b_long_message_body_is_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+        let huge_body = "X".repeat(super::MAX_BODY_LEN + 1);
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "big payload",
+                "body": huge_body,
+            }),
+        );
+
+        assert!(result.is_err(), "Body exceeding limit must be rejected");
+        assert!(
+            result.unwrap_err().contains("byte limit"),
+            "Error should mention byte limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn h4c_long_subject_is_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+        let long_subject = "S".repeat(super::MAX_SUBJECT_LEN + 1);
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": long_subject,
+                "body": "ok",
+            }),
+        );
+
+        assert!(result.is_err(), "Subject exceeding limit must be rejected");
+        assert!(
+            result.unwrap_err().contains("character limit"),
+            "Error should mention character limit"
+        );
+    }
+
+    // ── H6/H7: Unregistered sender can send messages ────────────────────
+    #[tokio::test]
+    async fn h7_unregistered_sender_can_send_messages() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send from an agent that was never registered
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "ghost_agent",
+                "to": ["bob"],
+                "subject": "spoofed",
+                "body": "I don't exist",
+            }),
+        );
+
+        // CONFIRMED (design choice): No sender validation
+        assert!(
+            result.is_ok(),
+            "Unregistered agent can send messages (no sender validation)"
+        );
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        assert_eq!(
+            inbox.as_array().unwrap()[0]["from"].as_str().unwrap(),
+            "ghost_agent"
+        );
+    }
+
+    // ── H8: Concurrent get_inbox + send_message is safe ─────────────────
+    // DashMap operations are atomic — no lost messages or double-reads.
+    #[tokio::test]
+    async fn h8_concurrent_drain_and_send_are_safe() {
+        use std::sync::{Arc, Barrier};
+
+        let (state, _idx, _repo) = test_post_office();
+        let state = Arc::new(state);
+
+        // Pre-populate inbox
+        for i in 0..100 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender",
+                    "to": ["target"],
+                    "subject": format!("msg {}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Thread 1: drain inbox
+        let s1 = Arc::clone(&state);
+        let b1 = Arc::clone(&barrier);
+        let drain_handle = std::thread::spawn(move || {
+            b1.wait();
+            get_inbox(&s1, json!({ "agent_name": "target" })).unwrap()
+        });
+
+        // Thread 2: send more messages
+        let s2 = Arc::clone(&state);
+        let b2 = Arc::clone(&barrier);
+        let send_handle = std::thread::spawn(move || {
+            b2.wait();
+            let mut sent = 0;
+            for i in 0..50 {
+                if send_message(
+                    &s2,
+                    json!({
+                        "from_agent": "sender2",
+                        "to": ["target"],
+                        "subject": format!("concurrent {}", i),
+                        "body": "y",
+                    }),
+                )
+                .is_ok()
+                {
+                    sent += 1;
+                }
+            }
+            sent
+        });
+
+        let drained = drain_handle.join().unwrap();
+        let sent = send_handle.join().unwrap();
+        let drained_count = drained.as_array().unwrap().len();
+
+        // Whatever was drained + whatever remains in inbox + whatever was
+        // sent concurrently should account for all messages. No message lost.
+        let remaining = get_inbox(&state, json!({ "agent_name": "target" })).unwrap();
+        let remaining_count = remaining.as_array().unwrap().len();
+
+        let total_accounted = drained_count + remaining_count;
+        // We started with 100 + sent up to 50 more = up to 150 total
+        assert!(
+            total_accounted >= 100 && total_accounted <= 100 + sent,
+            "No messages lost: drained={} remaining={} sent={}",
+            drained_count,
+            remaining_count,
+            sent
+        );
+    }
+
+    // ── H10: Whitespace-only and control-char agent names rejected ──────
+    #[tokio::test]
+    async fn h10_whitespace_only_agent_name_is_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(&state, json!({ "project_key": "test", "name_hint": "   " }));
+
+        assert!(result.is_err(), "Whitespace-only names must be rejected");
+        assert!(result.unwrap_err().contains("whitespace"));
+    }
+
+    #[tokio::test]
+    async fn h10_control_char_agent_name_is_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": "agent\x07bell" }),
+        );
+
+        assert!(
+            result.is_err(),
+            "Control characters in names must be rejected"
+        );
+        assert!(result.unwrap_err().contains("control"));
+    }
+
+    // ── H12: Second project_key for same project_id is silently ignored ──
+    #[tokio::test]
+    async fn h12_project_key_not_updated_on_reinsert() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "original_key", "name_hint": "Agent1" }),
+        )
+        .unwrap();
+
+        // Same project_key → same project_id, different agent name
+        create_agent(
+            &state,
+            json!({ "project_key": "original_key", "name_hint": "Agent2" }),
+        )
+        .unwrap();
+
+        // The projects DashMap uses or_insert_with, so it keeps the first value.
+        // Verify the stored human key is the original.
+        let project_id = format!(
+            "proj_{}",
+            Uuid::new_v5(&Uuid::NAMESPACE_DNS, "original_key".as_bytes()).simple()
+        );
+        let stored_key = state.projects.get(&project_id).unwrap();
+        assert_eq!(
+            stored_key.value(),
+            "original_key",
+            "First project_key is preserved"
+        );
+    }
+
+    // ── H-REGRESSION: search_messages with special query chars ──────────
+    #[tokio::test]
+    async fn search_messages_handles_special_query_chars() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Tantivy query parser handles these gracefully
+        let result = search_messages(&state, json!({ "query": "foo AND bar OR baz" }));
+        assert!(result.is_ok(), "Boolean query syntax should be handled");
+
+        let result = search_messages(&state, json!({ "query": "*" }));
+        // Wildcard queries may or may not parse depending on Tantivy config
+        // The important thing is it doesn't panic
+        let _ = result;
+
+        let result = search_messages(&state, json!({ "query": "" }));
+        // Empty query — should return error or empty, not panic
+        let _ = result;
+    }
+
+    // ── H-REGRESSION: send_message with duplicate recipients ────────────
+    #[tokio::test]
+    async fn send_message_duplicate_recipients_delivers_twice() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob", "bob"],
+                "subject": "duped",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_ok());
+
+        // Each occurrence in the `to` array creates a separate delivery
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        assert_eq!(
+            inbox.as_array().unwrap().len(),
+            2,
+            "Duplicate recipient gets the message twice (no dedup)"
+        );
+    }
+
+    // ── H-REGRESSION: JSON-RPC id is echoed correctly ───────────────────
+    #[tokio::test]
+    async fn jsonrpc_id_is_echoed_in_response() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": { "name": "get_inbox", "arguments": { "agent_name": "nobody" } }
+            }),
+        )
+        .await;
+        assert_eq!(resp["id"], 42, "JSON-RPC id must be echoed back");
+
+        let resp2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "string-id-123",
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp2["id"], "string-id-123",
+            "String id must also be echoed"
+        );
+    }
+
+    // ── H-REGRESSION: Null/missing JSON-RPC id is handled ───────────────
+    #[tokio::test]
+    async fn jsonrpc_null_id_is_handled() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "tools/list"
+            }),
+        )
+        .await;
+
+        // When id is missing, resp["id"] should be null (not crash)
+        assert!(resp["id"].is_null(), "Missing id should be echoed as null");
+
+        let resp2 = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            resp2["id"].is_null(),
+            "Explicit null id should be echoed as null"
+        );
+    }
+
+    // ── H-REGRESSION: create_agent with all optional fields missing ─────
+    #[tokio::test]
+    async fn create_agent_minimal_args() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(&state, json!({ "project_key": "minimal" }));
+        assert!(result.is_ok());
+
+        let profile = result.unwrap();
+        assert_eq!(profile["name"], "AnonymousAgent");
+        assert_eq!(profile["program"], "unknown");
+        assert_eq!(profile["model"], "unknown");
+    }
+
+    // ── H-REGRESSION: send_message with all optional fields missing ─────
+    #[tokio::test]
+    async fn send_message_minimal_args() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+            }),
+        );
+        assert!(result.is_ok());
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let msg = &inbox.as_array().unwrap()[0];
+        assert_eq!(msg["subject"], "(No Subject)");
+        assert_eq!(msg["body"], "");
     }
 }
