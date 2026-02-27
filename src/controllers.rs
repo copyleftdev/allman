@@ -139,11 +139,13 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         "program": program,
         "model": model
     });
-    let _ = state.persist_tx.try_send(PersistOp::GitCommit {
+    if let Err(e) = state.persist_tx.try_send(PersistOp::GitCommit {
         path: format!("agents/{}/profile.json", name),
         content: serde_json::to_string_pretty(&profile).unwrap(),
         message: format!("Register agent {}", name),
-    });
+    }) {
+        tracing::warn!("Persist channel full, dropping git commit for agent {}: {}", name, e);
+    }
 
     Ok(json!(profile))
 }
@@ -197,7 +199,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
-    let _ = state.persist_tx.try_send(PersistOp::IndexMessage {
+    if let Err(e) = state.persist_tx.try_send(PersistOp::IndexMessage {
         id: message_id.clone(),
         project_id: project_id.to_string(),
         from_agent: from_agent.to_string(),
@@ -205,7 +207,9 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         subject: subject.to_string(),
         body: body.to_string(),
         created_ts: now,
-    });
+    }) {
+        tracing::warn!("Persist channel full, dropping index op for message {}: {}", message_id, e);
+    }
 
     Ok(json!({ "id": message_id, "status": "sent" }))
 }
@@ -274,7 +278,9 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     for (_score, doc_address) in top_docs {
         let retrieved_doc = searcher.doc(doc_address).map_err(|e| e.to_string())?;
         let doc_json = schema.to_json(&retrieved_doc);
-        results.push(serde_json::from_str::<Value>(&doc_json).unwrap());
+        let parsed = serde_json::from_str::<Value>(&doc_json)
+            .map_err(|e| format!("Failed to parse doc JSON: {}", e))?;
+        results.push(parsed);
     }
 
     Ok(json!(results))
@@ -406,16 +412,13 @@ mod tests {
         );
     }
 
-    // ── H4: Silent Channel Drop ─────────────────────────────────────────────
-    // Hypothesis: When the persist channel (100k capacity) is full,
-    // try_send silently drops the operation and send_message still returns Ok.
+    // ── H4: Persist channel drops are logged, not silent ───────────────────
+    // send_message still returns Ok (hot path must not block on persistence),
+    // but channel failures are now logged via tracing::warn.
     #[tokio::test]
-    async fn h4_persist_channel_drop_returns_ok() {
+    async fn h4_persist_channel_drop_returns_ok_but_logs() {
         let (state, _idx, _repo) = test_post_office();
 
-        // The persist channel has capacity 100,000. We can't easily fill it
-        // in a unit test without blocking the worker. Instead, verify that
-        // send_message returns Ok regardless of channel state.
         let result = send_message(
             &state,
             json!({
@@ -427,11 +430,9 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "send_message always succeeds even if indexing might fail"
+            "send_message returns Ok — hot path is independent of persist pipeline"
         );
-
-        // CONFIRMED by code inspection: line 169 uses `let _ = state.persist_tx.try_send(...)`.
-        // There is no feedback path from the persist pipeline to the caller.
+        // Channel drops are now logged via tracing::warn (verified by code inspection).
     }
 
     // ── H10: Empty String Recipients ────────────────────────────────────────
