@@ -30,6 +30,13 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let id = req.get("id");
     let params = req.get("params").cloned().unwrap_or(json!({}));
 
+    // JSON-RPC 2.0: requests without "id" are notifications.
+    // The spec says "The Server MUST NOT reply to a Notification."
+    // Return Value::Null to signal no response should be sent.
+    if id.is_none() {
+        return Value::Null;
+    }
+
     match method {
         "tools/call" => {
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -166,6 +173,9 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("Invalid agent name: must not be whitespace-only".to_string());
     }
+    if name != name.trim() {
+        return Err("Invalid agent name: must not have leading or trailing whitespace".to_string());
+    }
     Ok(())
 }
 
@@ -300,15 +310,18 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("from_agent")
         .and_then(|v| v.as_str())
         .ok_or("Missing from_agent")?;
-    let to_agents: Vec<String> = args
-        .get("to")
-        .and_then(|v| v.as_array())
-        .ok_or("Missing to recipients")?
-        .iter()
-        .filter_map(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    let to_agents: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        args.get("to")
+            .and_then(|v| v.as_array())
+            .ok_or("Missing to recipients")?
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .filter(|s| seen.insert(s.to_string()))
+            .map(|s| s.to_string())
+            .collect()
+    };
     let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
     let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let project_id = args
@@ -445,7 +458,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
-    let indexed = match state.persist_tx.try_send(PersistOp::IndexMessage {
+    if let Err(e) = state.persist_tx.try_send(PersistOp::IndexMessage {
         id: message_id.clone(),
         project_id: project_id.to_string(),
         from_agent: from_agent.to_string(),
@@ -454,18 +467,14 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         body: body.to_string(),
         created_ts: now,
     }) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(
-                "Persist channel full, dropping index op for message {}: {}",
-                message_id,
-                e
-            );
-            false
-        }
-    };
+        tracing::warn!(
+            "Persist channel full, dropping index op for message {}: {}",
+            message_id,
+            e
+        );
+    }
 
-    Ok(json!({ "id": message_id, "status": "sent", "indexed": indexed }))
+    Ok(json!({ "id": message_id, "status": "sent" }))
 }
 
 // ── get_inbox ────────────────────────────────────────────────────────────────
@@ -574,6 +583,9 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("Missing query")?;
+    if query_str.trim().is_empty() {
+        return Err("query must not be empty or whitespace-only".to_string());
+    }
     if query_str.contains('\0') {
         return Err("query must not contain null bytes".to_string());
     }
@@ -1482,12 +1494,12 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        // Each occurrence in the `to` array creates a separate delivery
+        // Duplicates are now deduplicated — bob gets exactly 1 copy (DR21 H1 fix)
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
             inbox_messages(&inbox).len(),
-            2,
-            "Duplicate recipient gets the message twice (no dedup)"
+            1,
+            "Duplicate recipients are deduplicated — single delivery"
         );
     }
 
@@ -1792,7 +1804,7 @@ mod tests {
             .unwrap();
         }
 
-        // Send with duplicate recipients — pre-check sees 9999 twice, both pass
+        // Send with duplicate recipients — now deduplicated (DR21 H1 fix)
         let result = send_message(
             &state,
             json!({
@@ -1804,11 +1816,10 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "Duplicate recipients both pass pre-check (same inbox scanned twice)"
+            "Deduplicated duplicate recipients pass pre-check"
         );
 
-        // Bob now has MAX + 1 messages (cap exceeded by duplicate).
-        // Count via paginated drain.
+        // Bob now has exactly MAX messages (9999 + 1 deduplicated delivery).
         let mut total = 0usize;
         loop {
             let r = get_inbox(&state, json!({ "agent_name": "bob", "limit": 1000 })).unwrap();
@@ -1819,9 +1830,8 @@ mod tests {
             total += batch;
         }
         assert_eq!(
-            total,
-            MAX_INBOX_SIZE + 1,
-            "Duplicate recipient pushes both succeed, soft cap exceeded by 1"
+            total, MAX_INBOX_SIZE,
+            "Deduplicated duplicate delivers exactly 1 copy, filling to MAX"
         );
     }
 
@@ -3522,12 +3532,11 @@ mod tests {
 
         let result = search_messages(&state, json!({ "query": "" }));
 
-        // Empty query succeeds gracefully — Tantivy returns empty results
-        assert!(result.is_ok(), "Empty query must not panic");
-        let results = result.unwrap();
+        // Empty query is now explicitly rejected (DR21 H3 fix)
+        assert!(result.is_err(), "Empty query must be rejected");
         assert!(
-            results.get("results").is_some(),
-            "Returns a valid envelope with 'results'"
+            result.unwrap_err().contains("empty or whitespace-only"),
+            "Error should mention empty/whitespace"
         );
     }
 
@@ -3603,15 +3612,14 @@ mod tests {
         assert!(result.is_ok(), "Upsert must succeed regardless of count");
     }
 
-    // ── H2 (CONFIRMED): persist channel drop returns "sent" silently ────────
+    // ── H2 (UPDATED): persist channel drop returns "sent" silently ─────────
     // When the persist channel is full, try_send drops the Tantivy index op.
-    // The caller gets "status": "sent" with no degradation indicator.
-    // Message IS delivered to inbox but becomes permanently unsearchable.
+    // The caller gets "status": "sent" with no internal state leakage.
+    // (DR21 H5 removed the "indexed" field from the response.)
     #[tokio::test]
     async fn dr14_h2_send_message_reports_indexed_status() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Normal send — persist channel has capacity, indexed should be true
         let result = send_message(
             &state,
             json!({
@@ -3625,12 +3633,8 @@ mod tests {
 
         assert_eq!(result["status"], "sent");
         assert!(
-            result.get("indexed").is_some(),
-            "Response must include 'indexed' field"
-        );
-        assert_eq!(
-            result["indexed"], true,
-            "indexed=true when persist channel accepts the op"
+            result.get("indexed").is_none(),
+            "Response must NOT expose internal 'indexed' status (removed in DR21)"
         );
     }
 
@@ -3652,13 +3656,19 @@ mod tests {
     async fn dr14_h4_empty_json_request_returns_error() {
         let (state, _idx, _repo) = test_post_office();
 
+        // Empty JSON object has no "id" — treated as notification (DR21 H4 fix)
         let response = handle_mcp_request(state, json!({})).await;
+        assert!(
+            response.is_null(),
+            "Empty JSON has no id — notification returns Value::Null"
+        );
 
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert!(response.get("error").is_some(), "Must return error");
-        assert_eq!(response["error"]["code"], -32601);
-        assert_eq!(response["error"]["message"], "Method not found");
-        assert_eq!(response["id"], serde_json::Value::Null);
+        // With "id" present, it still returns Method not found
+        let response2 = handle_mcp_request(test_post_office().0, json!({ "id": 1 })).await;
+        assert_eq!(response2["jsonrpc"], "2.0");
+        assert!(response2.get("error").is_some(), "Must return error");
+        assert_eq!(response2["error"]["code"], -32601);
+        assert_eq!(response2["error"]["message"], "Method not found");
     }
 
     // ── H5 (CONFIRMED): dot-prefixed agent names create hidden dirs ─────────
@@ -4870,21 +4880,29 @@ mod tests {
     async fn dr19_h3_non_object_payload_handled() {
         let (state, _idx, _repo) = test_post_office();
 
-        // String payload (not a JSON object)
+        // Non-object payloads have no "id" field — treated as notifications (DR21 H4)
+        // All return Value::Null (no response per JSON-RPC 2.0 spec)
+
+        // String payload
         let r1 = handle_mcp_request(state.clone(), json!("not an object")).await;
-        assert_eq!(r1["jsonrpc"], "2.0");
         assert!(
-            r1.get("error").is_some(),
-            "CONFIRMED: Non-object payload returns error (but true malformed JSON never reaches this code — Axum returns HTTP 422 instead of JSON-RPC -32700)"
+            r1.is_null(),
+            "String payload has no id — notification returns null"
         );
 
         // Array payload
         let r2 = handle_mcp_request(state.clone(), json!([1, 2, 3])).await;
-        assert!(r2.get("error").is_some(), "Array payload returns error");
+        assert!(
+            r2.is_null(),
+            "Array payload has no id — notification returns null"
+        );
 
         // Null payload
         let r3 = handle_mcp_request(state, json!(null)).await;
-        assert!(r3.get("error").is_some(), "Null payload returns error");
+        assert!(
+            r3.is_null(),
+            "Null payload has no id — notification returns null"
+        );
     }
 
     // ── H4 (CONFIRMED): search_messages "total" was misleading ─────────────
@@ -5133,9 +5151,9 @@ mod tests {
     // Deep Review #21 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED): Duplicate recipients cause duplicate delivery ────
-    // send_message iterates to_agents without deduplication. Sending to
-    // ["Alice", "Alice"] delivers two copies to Alice's inbox.
+    // ── H1 (FIXED): Duplicate recipients are deduplicated ──────────────
+    // send_message now deduplicates the to_agents list before delivery.
+    // ["alice", "alice", "alice"] delivers exactly one copy.
     #[tokio::test]
     async fn dr21_h1_duplicate_recipients_cause_duplicate_delivery() {
         let (state, _idx, _repo) = test_post_office();
@@ -5149,25 +5167,24 @@ mod tests {
                 "body": "same message three times"
             }),
         );
-        assert!(result.is_ok(), "Duplicate recipients are accepted");
+        assert!(
+            result.is_ok(),
+            "Duplicate recipients are accepted (deduplicated)"
+        );
 
         let inbox = get_inbox(&state, json!({ "agent_name": "alice" })).unwrap();
         let msgs = inbox_messages(&inbox);
 
-        // CONFIRMED: Alice gets 3 copies of the same message
+        // FIXED: Alice gets exactly 1 copy after deduplication
         assert_eq!(
             msgs.len(),
-            3,
-            "CONFIRMED: Duplicate recipients deliver duplicate messages"
+            1,
+            "FIXED: Duplicate recipients are deduplicated — only 1 copy delivered"
         );
-        // All three have the same message_id
-        assert_eq!(msgs[0]["id"], msgs[1]["id"]);
-        assert_eq!(msgs[1]["id"], msgs[2]["id"]);
     }
 
-    // ── H2 (CONFIRMED): Leading/trailing whitespace creates distinct agents ─
-    // " Alice" and "Alice" are different DashMap keys. A user could register
-    // " Alice" and never find their inbox querying for "Alice".
+    // ── H2 (FIXED): Leading/trailing whitespace in agent names is rejected ─
+    // validate_agent_name now rejects names with leading or trailing whitespace.
     #[tokio::test]
     async fn dr21_h2_whitespace_agent_names_are_distinct() {
         let (state, _idx, _repo) = test_post_office();
@@ -5176,80 +5193,49 @@ mod tests {
             &state,
             json!({ "project_key": "proj", "name_hint": "Alice" }),
         );
-        assert!(r1.is_ok());
+        assert!(r1.is_ok(), "Clean name is accepted");
 
         let r2 = create_agent(
             &state,
             json!({ "project_key": "proj", "name_hint": " Alice" }),
         );
-        assert!(r2.is_ok(), "Leading space creates a distinct agent");
+        assert!(r2.is_err(), "FIXED: Leading space is rejected");
+        assert!(
+            r2.unwrap_err().contains("leading or trailing whitespace"),
+            "Error should mention whitespace"
+        );
 
         let r3 = create_agent(
             &state,
             json!({ "project_key": "proj", "name_hint": "Alice " }),
         );
-        assert!(r3.is_ok(), "Trailing space creates a distinct agent");
+        assert!(r3.is_err(), "FIXED: Trailing space is rejected");
 
-        // CONFIRMED: Three distinct agents exist
-        assert_eq!(state.agents.len(), 3, "CONFIRMED: Whitespace variants are distinct agents");
-        assert!(state.agents.contains_key("Alice"));
-        assert!(state.agents.contains_key(" Alice"));
-        assert!(state.agents.contains_key("Alice "));
-
-        // Messages to "Alice" don't reach " Alice"
-        send_message(
-            &state,
-            json!({
-                "from_agent": "bob",
-                "to": ["Alice"],
-                "subject": "test",
-                "body": "for Alice"
-            }),
-        )
-        .unwrap();
-
-        let inbox_alice = get_inbox(&state, json!({ "agent_name": "Alice" })).unwrap();
-        let inbox_space = get_inbox(&state, json!({ "agent_name": " Alice" })).unwrap();
-        assert_eq!(inbox_messages(&inbox_alice).len(), 1);
+        // Only one agent exists
         assert_eq!(
-            inbox_messages(&inbox_space).len(),
-            0,
-            "CONFIRMED: ' Alice' inbox is empty — messages go to 'Alice' only"
+            state.agents.len(),
+            1,
+            "FIXED: Only clean 'Alice' is registered"
         );
     }
 
-    // ── H3 (CONFIRMED): Whitespace-only search query returns error ───────
-    // Tantivy's QueryParser rejects whitespace-only queries with a parse error.
+    // ── H3 (FIXED): Whitespace-only search query is explicitly rejected ─
+    // search_messages now rejects whitespace-only queries before reaching Tantivy.
     #[tokio::test]
     async fn dr21_h3_whitespace_only_search_query() {
         let (state, _idx, _repo) = test_post_office();
 
         let result = search_messages(&state, json!({ "query": "   " }));
-        // Tantivy QueryParser returns "query must not be empty" or similar error
-        // Either Ok with empty results or Err with parse error — both are acceptable
-        match result {
-            Ok(v) => {
-                // If it succeeds, it should return 0 results
-                let results = v["results"].as_array().unwrap();
-                assert!(
-                    results.is_empty(),
-                    "Whitespace-only query should return no results if accepted"
-                );
-            }
-            Err(e) => {
-                // If it fails, it should be a parse error, not a panic
-                assert!(
-                    e.contains("parse") || e.contains("Query") || e.contains("empty"),
-                    "Error should be a query parse error, got: {}",
-                    e
-                );
-            }
-        }
+        assert!(result.is_err(), "FIXED: Whitespace-only query is rejected");
+        assert!(
+            result.unwrap_err().contains("empty or whitespace-only"),
+            "Error should mention empty/whitespace"
+        );
     }
 
-    // ── H4 (CONFIRMED): Notifications (no id) still get responses ────────
-    // JSON-RPC 2.0 says notifications (requests without id) MUST NOT receive
-    // responses. The server always returns a response with "id": null.
+    // ── H4 (FIXED): Notifications (no id) return Value::Null ───────────
+    // handle_mcp_request now returns Value::Null for notifications,
+    // signaling the HTTP layer to respond with 204 No Content.
     #[tokio::test]
     async fn dr21_h4_notification_without_id_gets_response() {
         let (state, _idx, _repo) = test_post_office();
@@ -5262,22 +5248,15 @@ mod tests {
 
         let response = handle_mcp_request(state, request).await;
 
-        // CONFIRMED: Server returns a response even without id
+        // FIXED: Notifications return Value::Null (no response per JSON-RPC 2.0)
         assert!(
-            response.get("result").is_some() || response.get("error").is_some(),
-            "CONFIRMED: Notification (no id) still receives a response"
-        );
-        // The id field is null (serialized from Option::None)
-        assert_eq!(
-            response["id"],
-            Value::Null,
-            "Missing id is echoed as null in response"
+            response.is_null(),
+            "FIXED: Notification (no id) returns Value::Null — no response sent"
         );
     }
 
-    // ── H5 (CONFIRMED): send_message response leaks `indexed` status ────
-    // The `indexed` boolean in the response exposes whether the persist
-    // channel had capacity. This is an internal implementation detail.
+    // ── H5 (FIXED): send_message response no longer exposes `indexed` ───
+    // The internal persist channel status is no longer leaked to clients.
     #[tokio::test]
     async fn dr21_h5_send_message_response_contains_indexed_field() {
         let (state, _idx, _repo) = test_post_office();
@@ -5293,14 +5272,12 @@ mod tests {
         )
         .unwrap();
 
-        // CONFIRMED: Response contains "indexed" boolean — internal state leak
+        // FIXED: Response only contains id and status — no internal state leak
         assert!(
-            result.get("indexed").is_some(),
-            "CONFIRMED: Response exposes internal 'indexed' status"
+            result.get("indexed").is_none(),
+            "FIXED: 'indexed' field removed from response"
         );
-        assert!(
-            result["indexed"].is_boolean(),
-            "indexed is a boolean exposing persist channel state"
-        );
+        assert!(result.get("id").is_some(), "Response has id");
+        assert_eq!(result["status"], "sent", "Response has status");
     }
 }

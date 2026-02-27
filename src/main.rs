@@ -7,7 +7,8 @@ use crate::state::PostOffice;
 use axum::{
     body::Bytes,
     extract::DefaultBodyLimit,
-    response::IntoResponse,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
@@ -73,7 +74,7 @@ async fn health_check() -> &'static str {
 
 // JSON-RPC 2.0 handler. Parses raw bytes to return -32700 on malformed JSON
 // instead of Axum's default HTTP 422 (which violates the JSON-RPC spec).
-async fn mcp_handler(Extension(state): Extension<PostOffice>, body: Bytes) -> impl IntoResponse {
+async fn mcp_handler(Extension(state): Extension<PostOffice>, body: Bytes) -> Response {
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -81,7 +82,8 @@ async fn mcp_handler(Extension(state): Extension<PostOffice>, body: Bytes) -> im
                 "jsonrpc": "2.0",
                 "id": null,
                 "error": { "code": -32700, "message": "Parse error" }
-            }));
+            }))
+            .into_response();
         }
     };
     let method = payload
@@ -94,5 +96,11 @@ async fn mcp_handler(Extension(state): Extension<PostOffice>, body: Bytes) -> im
         .unwrap_or("");
     tracing::debug!(method, tool, "MCP request");
     let response = controllers::handle_mcp_request(state, payload).await;
-    Json(response)
+
+    // JSON-RPC 2.0: notifications (no id) return Value::Null — respond with 204.
+    if response.is_null() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    Json(response).into_response()
 }
