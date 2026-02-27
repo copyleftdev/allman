@@ -51,6 +51,7 @@ pub struct AgentRecord {
     pub name: String,
     pub program: String,
     pub model: String,
+    pub registered_at: i64,
 }
 
 // ── Core State ───────────────────────────────────────────────────────────────

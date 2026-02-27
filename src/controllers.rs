@@ -23,6 +23,7 @@ const MAX_INBOX_LIMIT: usize = 1_000;
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 1_000;
 const MAX_AGENTS: usize = 100_000;
+const MAX_PROJECTS: usize = 100_000;
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -67,10 +68,59 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                 "id": id,
                 "result": {
                     "tools": [
-                        { "name": "create_agent", "description": "Register a new agent" },
-                        { "name": "send_message", "description": "Send a message" },
-                        { "name": "search_messages", "description": "Search messages" },
-                        { "name": "get_inbox", "description": "Get unread messages" }
+                        {
+                            "name": "create_agent",
+                            "description": "Register a new agent in a project",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "project_key": { "type": "string", "description": "Human-readable project identifier" },
+                                    "name_hint": { "type": "string", "description": "Agent name (defaults to AnonymousAgent)" },
+                                    "program": { "type": "string", "description": "Program/version identifier" },
+                                    "model": { "type": "string", "description": "LLM model name" }
+                                },
+                                "required": ["project_key"]
+                            }
+                        },
+                        {
+                            "name": "send_message",
+                            "description": "Send a message to one or more agents",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "from_agent": { "type": "string", "description": "Sender agent name" },
+                                    "to": { "type": "array", "items": { "type": "string" }, "description": "Recipient agent names" },
+                                    "subject": { "type": "string", "description": "Message subject" },
+                                    "body": { "type": "string", "description": "Message body" },
+                                    "project_id": { "type": "string", "description": "Project ID for search indexing" }
+                                },
+                                "required": ["from_agent", "to"]
+                            }
+                        },
+                        {
+                            "name": "search_messages",
+                            "description": "Full-text search over indexed messages",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "query": { "type": "string", "description": "Search query (Tantivy syntax)" },
+                                    "limit": { "type": "integer", "description": "Max results to return (default 10, max 1000)" }
+                                },
+                                "required": ["query"]
+                            }
+                        },
+                        {
+                            "name": "get_inbox",
+                            "description": "Drain unread messages from an agent's inbox",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "agent_name": { "type": "string", "description": "Agent whose inbox to drain" },
+                                    "limit": { "type": "integer", "description": "Max messages to drain (default 100, max 1000)" }
+                                },
+                                "required": ["agent_name"]
+                            }
+                        }
                     ]
                 }
             })
@@ -168,6 +218,7 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     // across the collision check and the insert/update, eliminating the
     // TOCTOU race that existed with separate get() + insert().
     let agent_id = Uuid::new_v4().to_string();
+    let registered_at = Utc::now().timestamp();
 
     let record = AgentRecord {
         id: agent_id.clone(),
@@ -175,6 +226,7 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         name: name.clone(),
         program: program.to_string(),
         model: model.to_string(),
+        registered_at,
     };
 
     match state.agents.entry(name.clone()) {
@@ -195,13 +247,23 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     // Record project mapping AFTER successful agent registration.
     // No state mutation occurs on any error path.
-    state
-        .projects
-        .entry(project_id.clone())
-        .or_insert_with(|| project_key.to_string());
+    // Soft cap: only insert if under limit (existing projects always pass).
+    if !state.projects.contains_key(&project_id) && state.projects.len() >= MAX_PROJECTS {
+        // Agent was already inserted — this is a soft cap, not a hard error.
+        // The agent exists but the project mapping is not recorded.
+        tracing::warn!(
+            "Project limit reached ({} max), skipping project mapping for {}",
+            MAX_PROJECTS,
+            project_id
+        );
+    } else {
+        state
+            .projects
+            .entry(project_id.clone())
+            .or_insert_with(|| project_key.to_string());
+    }
 
     // Fire-and-forget: persist agent profile to Git
-    let registered_at = Utc::now().timestamp();
     let profile = json!({
         "id": agent_id,
         "project_id": project_id,
@@ -256,6 +318,12 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
             "from_agent exceeds {} character limit",
             MAX_FROM_AGENT_LEN
         ));
+    }
+    if from_agent.contains('\0') {
+        return Err("from_agent must not contain null bytes".to_string());
+    }
+    if from_agent.chars().any(|c| c.is_control()) {
+        return Err("from_agent must not contain control characters".to_string());
     }
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
@@ -332,7 +400,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         id: message_id.clone(),
         project_id: project_id.to_string(),
         from_agent: from_agent.to_string(),
-        to_recipients: to_agents.join(" "),
+        to_recipients: to_agents.join("\x1F"),
         subject: subject.to_string(),
         body: body.to_string(),
         created_ts: now,
@@ -1713,10 +1781,8 @@ mod tests {
             }),
         );
         assert!(result.is_ok());
-        // to_recipients is stored as "bob charlie" in Tantivy.
-        // For simple names (no spaces), the join is unambiguous.
-        // This is a known limitation for names with spaces, but
-        // validate_agent_name doesn't currently reject spaces.
+        // to_recipients is stored as "bob\x1Fcharlie" in Tantivy (unit separator).
+        // Unambiguous for all names since \x1F can't appear in agent names.
     }
 
     // ── H-REGRESSION: Entire JSON-RPC round-trip for each tool ──────────
@@ -2700,7 +2766,7 @@ mod tests {
     async fn dr9_h4_to_recipients_is_opaque_string_token() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send to multiple recipients — to_recipients becomes "bob charlie"
+        // Send to multiple recipients — to_recipients becomes "bob\x1Fcharlie"
         send_message(
             &state,
             json!({
@@ -3359,16 +3425,11 @@ mod tests {
             }),
         );
 
-        // Accepted — from_agent has no content validation (only length).
-        assert!(result.is_ok(), "Null bytes in from_agent are accepted");
-
-        // Verify the message is delivered intact with null byte preserved
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msgs = inbox_messages(&inbox);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(
-            msgs[0]["from_agent"], evil_from,
-            "Null byte preserved in from field"
+        // Rejected — from_agent now validates for null bytes (DR17 H5 fix).
+        assert!(result.is_err(), "Null bytes in from_agent are rejected");
+        assert!(
+            result.unwrap_err().contains("null bytes"),
+            "Error mentions null bytes"
         );
     }
 
@@ -4085,5 +4146,234 @@ mod tests {
 
         // Brief sleep to let worker threads finish
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Deep Review #17 — Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── H1 (FIXED): to_recipients uses \x1F unit separator for unambiguous split
+    // Agent names can contain spaces (DR15 H3). Using ASCII Unit Separator
+    // (\x1F) as delimiter guarantees unambiguous round-trip since control chars
+    // are rejected by validate_agent_name and from_agent validation.
+    #[tokio::test]
+    async fn dr17_h1_to_recipients_uses_unit_separator() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register agents with spaces in names
+        create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Agent A" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Agent B" }),
+        )
+        .unwrap();
+
+        // Send to two space-containing recipients
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": ["Agent A", "Agent B"],
+                "subject": "dr17_join_test",
+                "body": "ambiguity check",
+                "project_id": "proj_dr17"
+            }),
+        )
+        .unwrap();
+        assert_eq!(r["status"], "sent");
+
+        // Wait for Tantivy indexing
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Search for this message
+        let search =
+            search_messages(&state, json!({ "query": "dr17_join_test", "limit": 10 })).unwrap();
+        let docs = search.as_array().unwrap();
+        assert!(!docs.is_empty(), "Message indexed");
+
+        // FIXED: to_recipients uses \x1F unit separator — unambiguous split
+        let to_field = docs[0]["to_recipients"].as_str().unwrap();
+        assert_eq!(
+            to_field, "Agent A\x1FAgent B",
+            "FIXED: Unit separator produces unambiguous recipient list"
+        );
+
+        // Round-trip: split on \x1F recovers exactly 2 recipients
+        let parts: Vec<&str> = to_field.split('\x1F').collect();
+        assert_eq!(parts.len(), 2, "Exactly 2 recipients recovered");
+        assert_eq!(parts[0], "Agent A");
+        assert_eq!(parts[1], "Agent B");
+    }
+
+    // ── H2 (FIXED): tools/list now includes inputSchema per MCP spec ──────────
+    // Each tool declares its JSON Schema so clients can validate arguments.
+    #[tokio::test]
+    async fn dr17_h2_tools_list_has_input_schema() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4, "Four tools returned");
+
+        for tool in tools {
+            assert!(tool.get("name").is_some(), "Has name");
+            assert!(tool.get("description").is_some(), "Has description");
+            assert!(
+                tool.get("inputSchema").is_some(),
+                "FIXED: Every tool has inputSchema"
+            );
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["type"], "object", "Schema type is object");
+            assert!(schema.get("properties").is_some(), "Schema has properties");
+            assert!(
+                schema.get("required").is_some(),
+                "Schema has required array"
+            );
+        }
+
+        // Verify specific required fields
+        let create_agent_tool = &tools[0];
+        assert_eq!(create_agent_tool["name"], "create_agent");
+        let required = create_agent_tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(
+            required.contains(&json!("project_key")),
+            "create_agent requires project_key"
+        );
+
+        let send_message_tool = &tools[1];
+        assert_eq!(send_message_tool["name"], "send_message");
+        let required = send_message_tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(
+            required.contains(&json!("from_agent")),
+            "send_message requires from_agent"
+        );
+        assert!(required.contains(&json!("to")), "send_message requires to");
+    }
+
+    // ── H3 (FIXED): projects DashMap now has MAX_PROJECTS soft cap ─────────────
+    // state.projects is still write-only (no tool reads it), but at least it
+    // won't grow unbounded. Matches the MAX_AGENTS pattern.
+    #[tokio::test]
+    async fn dr17_h3_projects_dashmap_capped() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register agents across many distinct projects
+        for i in 0..50 {
+            create_agent(
+                &state,
+                json!({
+                    "project_key": format!("project_{}", i),
+                    "name_hint": format!("agent_{}", i)
+                }),
+            )
+            .unwrap();
+        }
+
+        // Projects map grows with each unique project_key (up to cap)
+        assert_eq!(
+            state.projects.len(),
+            50,
+            "FIXED: 50 projects accepted (under MAX_PROJECTS cap)"
+        );
+
+        // The cap is MAX_PROJECTS (100_000) — same as MAX_AGENTS.
+        // We can't test the full cap in a unit test, but the logic is there.
+    }
+
+    // ── H4 (FIXED): AgentRecord now includes registered_at ────────────────────
+    // Both the DashMap record and the API response include registered_at.
+    #[tokio::test]
+    async fn dr17_h4_agent_record_has_registered_at() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice" }),
+        )
+        .unwrap();
+
+        // API response has registered_at
+        assert!(
+            resp.get("registered_at").is_some(),
+            "API response includes registered_at"
+        );
+        let api_registered_at = resp["registered_at"].as_i64().unwrap();
+        assert!(api_registered_at > 0, "Valid timestamp");
+
+        // DashMap record NOW has registered_at
+        let record = state.agents.get("Alice").unwrap();
+        assert_eq!(record.name, "Alice");
+        assert_eq!(record.id, resp["id"].as_str().unwrap());
+        assert_eq!(
+            record.registered_at, api_registered_at,
+            "FIXED: DashMap record matches API response timestamp"
+        );
+    }
+
+    // ── H5 (FIXED): from_agent in send_message now rejects control chars ───────
+    // from_agent is validated for null bytes and control characters.
+    #[tokio::test]
+    async fn dr17_h5_send_message_from_agent_rejects_control_chars() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Null byte in from_agent — now rejected
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "evil\0sender",
+                "to": ["bob"],
+                "subject": "null byte test",
+                "body": "test"
+            }),
+        );
+        assert!(r1.is_err(), "FIXED: from_agent with null byte is rejected");
+        assert!(
+            r1.unwrap_err().contains("null bytes"),
+            "Error mentions null bytes"
+        );
+
+        // Control characters (bell, backspace, escape) in from_agent — now rejected
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "evil\x07\x08\x1bsender",
+                "to": ["bob"],
+                "subject": "control char test",
+                "body": "test"
+            }),
+        );
+        assert!(
+            r2.is_err(),
+            "FIXED: from_agent with control chars is rejected"
+        );
+        assert!(
+            r2.unwrap_err().contains("control characters"),
+            "Error mentions control characters"
+        );
+
+        // Clean from_agent still works
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "clean_sender",
+                "to": ["bob"],
+                "subject": "clean test",
+                "body": "test"
+            }),
+        );
+        assert!(r3.is_ok(), "Clean from_agent is accepted");
     }
 }
