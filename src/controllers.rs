@@ -176,6 +176,12 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("project_key")
         .and_then(|v| v.as_str())
         .ok_or("Missing project_key")?;
+    if project_key.contains('\0') {
+        return Err("project_key must not contain null bytes".to_string());
+    }
+    if project_key.chars().any(|c| c.is_control()) {
+        return Err("project_key must not contain control characters".to_string());
+    }
     if project_key.len() > MAX_PROJECT_KEY_LEN {
         return Err(format!(
             "project_key exceeds {} character limit",
@@ -303,10 +309,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
-    let subject = args
-        .get("subject")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(No Subject)");
+    let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
     let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let project_id = args
         .get("project_id")
@@ -474,11 +477,20 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("agent_name")
         .and_then(|v| v.as_str())
         .ok_or("Missing agent_name")?;
+    if agent_name.is_empty() {
+        return Err("agent_name must not be empty".to_string());
+    }
     if agent_name.len() > MAX_RECIPIENT_NAME_LEN {
         return Err(format!(
             "agent_name exceeds {} byte limit",
             MAX_RECIPIENT_NAME_LEN
         ));
+    }
+    if agent_name.contains('\0') {
+        return Err("agent_name must not contain null bytes".to_string());
+    }
+    if agent_name.chars().any(|c| c.is_control()) {
+        return Err("agent_name must not contain control characters".to_string());
     }
 
     let limit = args
@@ -562,6 +574,9 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("Missing query")?;
+    if query_str.contains('\0') {
+        return Err("query must not contain null bytes".to_string());
+    }
     if query_str.len() > MAX_QUERY_LEN {
         return Err(format!("query exceeds {} byte limit", MAX_QUERY_LEN));
     }
@@ -1570,7 +1585,7 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         let msg = &inbox_messages(&inbox)[0];
-        assert_eq!(msg["subject"], "(No Subject)");
+        assert_eq!(msg["subject"], "");
         assert_eq!(msg["body"], "");
     }
 
@@ -4975,31 +4990,25 @@ mod tests {
     async fn dr20_h1_get_inbox_agent_name_no_content_validation() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Empty agent_name — accepted (returns empty inbox)
+        // FIXED: Empty agent_name — now rejected
         let r1 = get_inbox(&state, json!({ "agent_name": "" }));
-        assert!(
-            r1.is_ok(),
-            "CONFIRMED: Empty agent_name is accepted by get_inbox"
-        );
+        assert!(r1.is_err(), "FIXED: Empty agent_name is rejected");
+        assert!(r1.unwrap_err().contains("empty"));
 
-        // Null byte in agent_name — accepted
+        // FIXED: Null byte in agent_name — now rejected
         let r2 = get_inbox(&state, json!({ "agent_name": "bob\0evil" }));
-        assert!(
-            r2.is_ok(),
-            "CONFIRMED: agent_name with null byte is accepted by get_inbox"
-        );
+        assert!(r2.is_err(), "FIXED: agent_name with null byte is rejected");
 
-        // Control chars in agent_name — accepted
+        // FIXED: Control chars in agent_name — now rejected
         let r3 = get_inbox(&state, json!({ "agent_name": "bob\x1b[31m" }));
         assert!(
-            r3.is_ok(),
-            "CONFIRMED: agent_name with control chars is accepted by get_inbox"
+            r3.is_err(),
+            "FIXED: agent_name with control chars is rejected"
         );
 
-        // All return empty inboxes (no messages were sent to these names)
-        assert_eq!(inbox_messages(&r1.unwrap()).len(), 0);
-        assert_eq!(inbox_messages(&r2.unwrap()).len(), 0);
-        assert_eq!(inbox_messages(&r3.unwrap()).len(), 0);
+        // Clean agent_name still works
+        let r4 = get_inbox(&state, json!({ "agent_name": "bob" }));
+        assert!(r4.is_ok(), "Clean agent_name accepted");
     }
 
     // ── H2 (CONFIRMED): search query has no null byte validation ─────────────
@@ -5008,15 +5017,14 @@ mod tests {
     async fn dr20_h2_search_query_accepts_null_bytes() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Query with null byte — accepted by search_messages
+        // FIXED: Query with null byte — now rejected before reaching Tantivy
         let r = search_messages(&state, json!({ "query": "test\0injected" }));
-        // Tantivy may parse or reject this — either outcome proves the point
-        // that our validation layer doesn't catch it first
-        assert!(
-            r.is_ok() || r.is_err(),
-            "CONFIRMED: Null byte in query reaches Tantivy instead of being caught by validation"
-        );
-        // The key issue: no explicit null byte check before QueryParser
+        assert!(r.is_err(), "FIXED: Null byte in query is rejected");
+        assert!(r.unwrap_err().contains("null bytes"));
+
+        // Clean query still works
+        let r2 = search_messages(&state, json!({ "query": "hello" }));
+        assert!(r2.is_ok(), "Clean query accepted");
     }
 
     // ── H3 (CONFIRMED): project_key has no content validation ────────────────
@@ -5026,29 +5034,29 @@ mod tests {
     async fn dr20_h3_project_key_accepts_null_bytes() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Null byte in project_key — accepted
+        // FIXED: Null byte in project_key — now rejected
         let r1 = create_agent(
             &state,
             json!({ "project_key": "proj\0evil", "name_hint": "Alice" }),
         );
-        assert!(
-            r1.is_ok(),
-            "CONFIRMED: project_key with null byte is accepted"
-        );
+        assert!(r1.is_err(), "FIXED: project_key with null byte is rejected");
 
-        // Control chars in project_key — accepted
+        // FIXED: Control chars in project_key — now rejected
         let r2 = create_agent(
             &state,
             json!({ "project_key": "proj\x1b[31mRED", "name_hint": "Bob" }),
         );
         assert!(
-            r2.is_ok(),
-            "CONFIRMED: project_key with ANSI escape is accepted"
+            r2.is_err(),
+            "FIXED: project_key with ANSI escape is rejected"
         );
 
-        // Verify projects DashMap has entries with clean UUIDs
-        // (project_key is hashed, so project_id is always clean)
-        assert!(state.projects.len() >= 2, "Projects registered");
+        // Clean project_key still works
+        let r3 = create_agent(
+            &state,
+            json!({ "project_key": "clean_project", "name_hint": "Charlie" }),
+        );
+        assert!(r3.is_ok(), "Clean project_key accepted");
     }
 
     // ── H4 (CONFIRMED): models.rs has 3 dead structs ────────────────────────
@@ -5075,64 +5083,49 @@ mod tests {
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(inbox_messages(&inbox).len(), 1);
 
-        // CONFIRMED: Agent, Message, FileReservation are dead code
-        // They compile only because of #[allow(dead_code)]
-        // AgentRecord in state.rs is what's actually used (not models::Agent)
+        // FIXED: Dead structs (Agent, Message, FileReservation) removed from models.rs
+        // Only InboxEntry remains — the sole models struct used in production code
+        // AgentRecord in state.rs is what's actually used for agent state
     }
 
-    // ── H5 (CONFIRMED): Default "(No Subject)" is searchable text ────────────
-    // When subject is omitted, "(No Subject)" is indexed as TEXT in Tantivy.
-    // The tokenizer produces "no" and "subject" tokens, so a query for
-    // "subject" matches every message that omitted a subject field.
+    // ── H5 (CONFIRMED): Default subject no longer pollutes search ───────────
+    // Previously "(No Subject)" was indexed as TEXT, making "subject" match
+    // every message without an explicit subject. Now defaults to empty string.
     #[tokio::test]
-    async fn dr20_h5_default_subject_pollutes_search() {
+    async fn dr20_h5_default_subject_no_longer_pollutes_search() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send message with explicit subject
+        // Send message with explicit subject containing "subject"
         send_message(
             &state,
             json!({
                 "from_agent": "alice",
                 "to": ["bob"],
-                "subject": "important meeting",
-                "body": "dr20_h5_marker explicit subject"
+                "subject": "important subject matter",
+                "body": "dr20_h5_fix_marker explicit"
             }),
         )
         .unwrap();
 
-        // Send message WITHOUT subject — gets "(No Subject)" default
+        // Send message WITHOUT subject — now defaults to ""
         send_message(
             &state,
             json!({
                 "from_agent": "alice",
                 "to": ["charlie"],
-                "body": "dr20_h5_marker no subject provided"
+                "body": "dr20_h5_fix_marker no subject"
             }),
         )
         .unwrap();
 
-        // Wait for indexing
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Search for "subject" — should only match real subjects, not defaults
-        let search = search_messages(&state, json!({ "query": "subject", "limit": 10 })).unwrap();
-        let results = search["results"].as_array().unwrap();
-
-        // CONFIRMED: The default "(No Subject)" contains the word "subject"
-        // so it matches a search for "subject", polluting results
-        let has_default_subject = results.iter().any(|r| {
-            r.get("subject")
-                .and_then(|s| s.as_str())
-                .map(|s| s.contains("No Subject"))
-                .unwrap_or(false)
-        });
-
-        // If indexing happened, the default subject message will match
-        if !results.is_empty() {
-            assert!(
-                has_default_subject,
-                "CONFIRMED: Default '(No Subject)' matches search for 'subject'"
-            );
-        }
+        // Verify the default is now empty string in inbox
+        let inbox = get_inbox(&state, json!({ "agent_name": "charlie" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0]["subject"].as_str().unwrap(),
+            "",
+            "FIXED: Default subject is empty string, not '(No Subject)'"
+        );
     }
 }
