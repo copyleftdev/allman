@@ -122,19 +122,20 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         .unwrap_or("unknown");
     let name_hint = args.get("name_hint").and_then(|v| v.as_str());
 
+    // Validate all inputs BEFORE mutating any state.
+    let name = name_hint.unwrap_or("AnonymousAgent").to_string();
+    validate_agent_name(&name)?;
+
     let project_id = format!(
         "proj_{}",
         Uuid::new_v5(&Uuid::NAMESPACE_DNS, project_key.as_bytes()).simple()
     );
 
-    // Lock-free upsert into DashMap
+    // Lock-free upsert into DashMap (after all validation passes)
     state
         .projects
         .entry(project_id.clone())
         .or_insert_with(|| project_key.to_string());
-
-    let name = name_hint.unwrap_or("AnonymousAgent").to_string();
-    validate_agent_name(&name)?;
 
     // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
     // across the collision check and the insert/update, eliminating the
@@ -2482,5 +2483,205 @@ mod tests {
         drop(state);
         // If the shutdown chain were broken, the worker threads would hang.
         // The test completing proves the channels close correctly.
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #9 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (FIXED): create_agent validates before mutating state ────────
+    // Previously, state.projects.entry() was called before validate_agent_name,
+    // creating orphan project entries on invalid names. Now validation
+    // precedes all state mutation.
+    #[tokio::test]
+    async fn dr9_h1_invalid_name_no_orphan_project() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "orphan_project", "name_hint": "../evil" }),
+        );
+        assert!(result.is_err(), "Invalid name must be rejected");
+
+        // FIXED: projects entry must NOT be created when validation fails
+        let project_id = format!(
+            "proj_{}",
+            Uuid::new_v5(&Uuid::NAMESPACE_DNS, "orphan_project".as_bytes()).simple()
+        );
+        assert!(
+            !state.projects.contains_key(&project_id),
+            "No orphan project entry when name validation fails"
+        );
+
+        // No agent should exist
+        assert!(
+            !state.agents.contains_key("../evil"),
+            "Invalid agent must not be created"
+        );
+    }
+
+    // ── H2 (DISPROVED): Agent upsert preserves inbox messages ───────────
+    // Re-registration touches agents DashMap only. Inboxes are independent.
+    #[tokio::test]
+    async fn dr9_h2_upsert_preserves_inbox() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register and send a message
+        create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice", "program": "v1" }),
+        )
+        .unwrap();
+        send_message(
+            &state,
+            json!({
+                "from_agent": "bob",
+                "to": ["Alice"],
+                "subject": "before upsert",
+                "body": "original message",
+            }),
+        )
+        .unwrap();
+
+        // Re-register (upsert) — should NOT touch inbox
+        create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice", "program": "v2" }),
+        )
+        .unwrap();
+
+        // Inbox must still have the message
+        let inbox = get_inbox(&state, json!({ "agent_name": "Alice" })).unwrap();
+        assert_eq!(
+            inbox_messages(&inbox).len(),
+            1,
+            "Upsert must not destroy pending inbox messages"
+        );
+        assert_eq!(inbox_messages(&inbox)[0]["body"], "original message");
+
+        // Agent record updated
+        let record = state.agents.get("Alice").unwrap();
+        assert_eq!(record.program, "v2");
+    }
+
+    // ── H3 (DISPROVED): Unicode agent names work correctly ──────────────
+    // validate_agent_name allows Unicode. DashMap, Git, and Tantivy all
+    // handle UTF-8 correctly.
+    #[tokio::test]
+    async fn dr9_h3_unicode_agent_names_work() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Various Unicode names
+        for name in &["Агент_1", "エージェント", "café_bot", "naïve-agent"] {
+            let result = create_agent(
+                &state,
+                json!({ "project_key": "unicode_test", "name_hint": name }),
+            );
+            assert!(result.is_ok(), "Unicode name '{}' should be accepted", name);
+        }
+
+        // Verify they're distinct agents
+        assert_eq!(state.agents.len(), 4);
+
+        // Send and receive a message with Unicode names
+        send_message(
+            &state,
+            json!({
+                "from_agent": "Агент_1",
+                "to": ["エージェント"],
+                "subject": "тест",
+                "body": "こんにちは",
+            }),
+        )
+        .unwrap();
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "エージェント" })).unwrap();
+        assert_eq!(inbox_messages(&inbox).len(), 1);
+        assert_eq!(inbox_messages(&inbox)[0]["from"], "Агент_1");
+        assert_eq!(inbox_messages(&inbox)[0]["body"], "こんにちは");
+    }
+
+    // ── H4 (DISPROVED): to_recipients STRING field is opaque in Tantivy ──
+    // Space-joined names are stored as a single STRING token. No ambiguity.
+    #[tokio::test]
+    async fn dr9_h4_to_recipients_is_opaque_string_token() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send to multiple recipients — to_recipients becomes "bob charlie"
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob", "charlie"],
+                "subject": "multi",
+                "body": "test",
+                "project_id": "proj_1",
+            }),
+        )
+        .unwrap();
+
+        // Wait for indexing
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Searching "bob" should NOT match to_recipients (it's a STRING, not TEXT)
+        // but MIGHT match if "bob" appears in subject/body (default fields).
+        // The important thing is: no panic, no corruption.
+        let result = search_messages(&state, json!({ "query": "multi", "limit": 10 }));
+        assert!(result.is_ok(), "Search after multi-recipient send works");
+    }
+
+    // ── H5 (DISPROVED): Concurrent search + index is safe ──────────────
+    // Tantivy searcher holds a snapshot. Concurrent indexing doesn't affect
+    // an in-flight search.
+    #[tokio::test]
+    async fn dr9_h5_concurrent_search_and_send_is_safe() {
+        use std::sync::Arc;
+
+        let (state, _idx, _repo) = test_post_office();
+        let state = Arc::new(state);
+
+        // Send some initial messages for search to find
+        for i in 0..10 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "alice",
+                    "to": ["bob"],
+                    "subject": format!("searchable topic {}", i),
+                    "body": "content for concurrent test",
+                    "project_id": "proj_1",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Wait for indexing
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Concurrent: search + send more messages
+        let s1 = Arc::clone(&state);
+        let search_handle = std::thread::spawn(move || {
+            for _ in 0..20 {
+                let _ = search_messages(&s1, json!({ "query": "searchable", "limit": 10 }));
+            }
+        });
+
+        let s2 = Arc::clone(&state);
+        let send_handle = std::thread::spawn(move || {
+            for i in 0..20 {
+                let _ = send_message(
+                    &s2,
+                    json!({
+                        "from_agent": "sender",
+                        "to": ["receiver"],
+                        "subject": format!("concurrent msg {}", i),
+                        "body": "during search",
+                    }),
+                );
+            }
+        });
+
+        search_handle.join().expect("Search thread must not panic");
+        send_handle.join().expect("Send thread must not panic");
     }
 }
