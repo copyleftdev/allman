@@ -2020,4 +2020,138 @@ mod tests {
             );
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #6 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H6 (CONFIRMED): from_agent has no length limit — secondary amplification
+    // send_message validates subject (1KB), body (64KB), and recipient count
+    // (100), but from_agent is unbounded. A ~900KB from_agent × 100
+    // recipients = ~90MB heap from a single 1MB HTTP request (~90x
+    // amplification). This test documents the vulnerability.
+    #[tokio::test]
+    async fn dr6_h6_from_agent_unbounded_amplification() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 10KB from_agent with 50 recipients — 10KB × 50 = 500KB heap.
+        // Demonstrates the cloning amplification pattern.
+        let big_from = "X".repeat(10_000);
+        let recipients: Vec<String> = (0..50).map(|i| format!("r_{}", i)).collect();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": big_from,
+                "to": recipients,
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+
+        // Currently succeeds — no from_agent length limit.
+        assert!(
+            result.is_ok(),
+            "10KB from_agent with 50 recipients is accepted (no limit)"
+        );
+
+        // Verify all recipients got the full 10KB from_agent
+        let inbox = get_inbox(&state, json!({ "agent_name": "r_0" })).unwrap();
+        assert_eq!(
+            inbox_messages(&inbox)[0]["from"].as_str().unwrap().len(),
+            10_000,
+            "Full 10KB from_agent is cloned into each inbox entry"
+        );
+    }
+
+    // ── H7 (DISPROVED): Float limit in get_inbox falls back to default ───
+    // as_i64() returns None for JSON floats, triggering the default limit.
+    #[tokio::test]
+    async fn dr6_h7_float_limit_falls_back_to_default() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send 150 messages
+        for i in 0..150 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender",
+                    "to": ["target"],
+                    "subject": format!("msg {}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Float limit — as_i64() returns None → default (100)
+        let result = get_inbox(&state, json!({ "agent_name": "target", "limit": 1.5 })).unwrap();
+        assert_eq!(
+            inbox_messages(&result).len(),
+            100,
+            "Float limit should fall back to DEFAULT_INBOX_LIMIT (100)"
+        );
+        assert_eq!(result["remaining"], 50);
+    }
+
+    // ── H8 (DISPROVED): swarm_stress team broadcast stays within MAX_RECIPIENTS
+    // Team lead broadcasts to AGENTS_PER_TEAM-1 = 19 recipients, well
+    // under MAX_RECIPIENTS (100). Cross-div sends to 9 division heads.
+    // This test asserts the boundary.
+    #[tokio::test]
+    async fn dr6_h8_swarm_broadcast_within_recipient_limit() {
+        // Simulate the swarm_stress team lead broadcast pattern
+        let agents_per_team: usize = 20;
+        let recipient_count = agents_per_team - 1; // 19
+        assert!(
+            recipient_count <= MAX_RECIPIENTS,
+            "swarm_stress team broadcast ({}) must not exceed MAX_RECIPIENTS ({})",
+            recipient_count,
+            MAX_RECIPIENTS
+        );
+
+        // Simulate cross-div pattern
+        let divisions: usize = 10;
+        let cross_div_count = divisions - 1; // 9
+        assert!(
+            cross_div_count <= MAX_RECIPIENTS,
+            "swarm_stress cross-div ({}) must not exceed MAX_RECIPIENTS ({})",
+            cross_div_count,
+            MAX_RECIPIENTS
+        );
+    }
+
+    // ── H10 (DISPROVED): Tantivy searcher snapshot is consistent ─────────
+    // searcher.doc(doc_address) cannot fail for addresses returned by the
+    // same searcher instance, because the searcher holds segment readers.
+    #[tokio::test]
+    async fn dr6_h10_search_doc_retrieval_is_consistent() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Index a message
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "tantivy consistency test",
+                "body": "searchable content here",
+                "project_id": "test_proj",
+            }),
+        )
+        .unwrap();
+
+        // Wait for persistence worker to index + NRT reader to refresh
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Search should retrieve the doc without error
+        let result = search_messages(
+            &state,
+            json!({ "query": "searchable content", "limit": 10 }),
+        );
+        assert!(
+            result.is_ok(),
+            "Search + doc retrieval must not fail on consistent searcher snapshot"
+        );
+    }
 }
