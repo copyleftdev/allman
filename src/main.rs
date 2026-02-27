@@ -38,16 +38,30 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/mcp", post(mcp_handler))
-        .layer(Extension(state));
+        .layer(Extension(state.clone()));
 
     // Address to bind to
     let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
     tracing::info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Drain the persist pipeline before exiting
+    tracing::info!("Server stopped, draining persist pipeline...");
+    drop(state);
+    tracing::info!("Shutdown complete");
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to install CTRL+C handler");
+    tracing::info!("Received shutdown signal");
 }
 
 async fn health_check() -> &'static str {
