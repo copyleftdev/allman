@@ -5,12 +5,13 @@ mod state;
 
 use crate::state::PostOffice;
 use axum::{
+    body::Bytes,
     extract::DefaultBodyLimit,
     response::IntoResponse,
     routing::{get, post},
     Extension, Json, Router,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -70,11 +71,19 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-// Basic placeholder for the MCP JSON-RPC handler
-async fn mcp_handler(
-    Extension(state): Extension<PostOffice>,
-    Json(payload): Json<Value>,
-) -> impl IntoResponse {
+// JSON-RPC 2.0 handler. Parses raw bytes to return -32700 on malformed JSON
+// instead of Axum's default HTTP 422 (which violates the JSON-RPC spec).
+async fn mcp_handler(Extension(state): Extension<PostOffice>, body: Bytes) -> impl IntoResponse {
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": "Parse error" }
+            }));
+        }
+    };
     let method = payload
         .get("method")
         .and_then(|v| v.as_str())
