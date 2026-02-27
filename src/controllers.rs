@@ -131,12 +131,6 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         Uuid::new_v5(&Uuid::NAMESPACE_DNS, project_key.as_bytes()).simple()
     );
 
-    // Lock-free upsert into DashMap (after all validation passes)
-    state
-        .projects
-        .entry(project_id.clone())
-        .or_insert_with(|| project_key.to_string());
-
     // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
     // across the collision check and the insert/update, eliminating the
     // TOCTOU race that existed with separate get() + insert().
@@ -165,6 +159,13 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
             vac.insert(record);
         }
     }
+
+    // Record project mapping AFTER successful agent registration.
+    // No state mutation occurs on any error path.
+    state
+        .projects
+        .entry(project_id.clone())
+        .or_insert_with(|| project_key.to_string());
 
     // Fire-and-forget: persist agent profile to Git
     let profile = json!({
@@ -2683,5 +2684,148 @@ mod tests {
 
         search_handle.join().expect("Search thread must not panic");
         send_handle.join().expect("Send thread must not panic");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #10 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (FIXED): cross-project collision creates no orphan project ───
+    // Previously, state.projects.entry() ran before state.agents.entry().
+    // Now projects.entry() runs after successful agent registration only.
+    // No state mutation on any error path.
+    #[tokio::test]
+    async fn dr10_h1_cross_project_collision_no_orphan_project() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register Alice in project_a
+        create_agent(
+            &state,
+            json!({ "project_key": "proj_a", "name_hint": "Alice" }),
+        )
+        .unwrap();
+
+        // Try to register Alice in project_b — cross-project collision
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "proj_b", "name_hint": "Alice" }),
+        );
+        assert!(result.is_err(), "Cross-project collision must be rejected");
+
+        // FIXED: project_b entry must NOT exist
+        let project_id_b = format!(
+            "proj_{}",
+            Uuid::new_v5(&Uuid::NAMESPACE_DNS, "proj_b".as_bytes()).simple()
+        );
+        assert!(
+            !state.projects.contains_key(&project_id_b),
+            "No orphan project entry on cross-project collision"
+        );
+
+        // Only project_a should exist
+        assert_eq!(state.projects.len(), 1, "Only one project registered");
+    }
+
+    // ── H2 (DISPROVED): Inbox messages are returned in FIFO order ───────
+    // Vec::push appends to back, drain(..limit) drains from front.
+    #[tokio::test]
+    async fn dr10_h2_inbox_messages_are_fifo() {
+        let (state, _idx, _repo) = test_post_office();
+
+        for i in 0..5 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": format!("sender_{}", i),
+                    "to": ["receiver"],
+                    "subject": format!("msg_{}", i),
+                    "body": format!("body_{}", i),
+                }),
+            )
+            .unwrap();
+        }
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "receiver" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 5);
+
+        for (i, msg) in msgs.iter().enumerate() {
+            assert_eq!(
+                msg["from"].as_str().unwrap(),
+                format!("sender_{}", i),
+                "Message {} must be in FIFO order",
+                i
+            );
+        }
+    }
+
+    // ── H3 (DISPROVED): Byte length is correct for agent name limit ─────
+    // validate_agent_name uses .len() (byte count), not .chars().count().
+    // This is correct: byte length bounds memory, which is the purpose.
+    #[tokio::test]
+    async fn dr10_h3_byte_length_not_char_count_for_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 4-byte UTF-8 chars: 32 chars = 128 bytes = at the limit
+        let name_at_limit = "𝐀".repeat(32); // U+1D400, 4 bytes each
+        assert_eq!(name_at_limit.len(), 128, "32 × 4-byte chars = 128 bytes");
+
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": name_at_limit }),
+        );
+        assert!(
+            result.is_ok(),
+            "128-byte name (32 Unicode chars) must be accepted"
+        );
+
+        // 33 chars = 132 bytes = over the limit
+        let name_over = "𝐀".repeat(33);
+        assert_eq!(name_over.len(), 132);
+
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": name_over }),
+        );
+        assert!(
+            result.is_err(),
+            "132-byte name (33 Unicode chars) must be rejected"
+        );
+    }
+
+    // ── H4 (DISPROVED): Missing required field causes no state mutation ──
+    #[tokio::test]
+    async fn dr10_h4_missing_project_key_no_mutation() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(&state, json!({ "name_hint": "Alice" }));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Missing project_key");
+
+        // No state mutated
+        assert_eq!(state.projects.len(), 0, "No project created");
+        assert_eq!(state.agents.len(), 0, "No agent created");
+    }
+
+    // ── H5 (DISPROVED): Self-send works correctly ───────────────────────
+    #[tokio::test]
+    async fn dr10_h5_self_send_works() {
+        let (state, _idx, _repo) = test_post_office();
+
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["alice"],
+                "subject": "note to self",
+                "body": "remember to test",
+            }),
+        )
+        .unwrap();
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "alice" })).unwrap();
+        assert_eq!(inbox_messages(&inbox).len(), 1);
+        assert_eq!(inbox_messages(&inbox)[0]["from"], "alice");
+        assert_eq!(inbox_messages(&inbox)[0]["subject"], "note to self");
     }
 }
