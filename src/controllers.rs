@@ -10,6 +10,8 @@ const MAX_INBOX_SIZE: usize = 10_000;
 const MAX_AGENT_NAME_LEN: usize = 128;
 const MAX_SUBJECT_LEN: usize = 1_024;
 const MAX_BODY_LEN: usize = 65_536; // 64 KB
+const DEFAULT_INBOX_LIMIT: usize = 100;
+const MAX_INBOX_LIMIT: usize = 1_000;
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -273,21 +275,45 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
 }
 
 // ── get_inbox ────────────────────────────────────────────────────────────────
-// Hot path: DashMap remove (atomic drain). No disk I/O.
+// Hot path: DashMap partial or full drain. No disk I/O.
+// Supports optional `limit` parameter (default 100, max 1000) to bound
+// response size. Returns `remaining` count so callers know to fetch more.
 fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
     let agent_name = args
         .get("agent_name")
         .and_then(|v| v.as_str())
         .ok_or("Missing agent_name")?;
 
-    // Atomic drain: remove all unread messages for this agent
-    let messages = state
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(DEFAULT_INBOX_LIMIT as i64)
+        .clamp(1, MAX_INBOX_LIMIT as i64) as usize;
+
+    // Atomic drain: remove the entry, take up to `limit` messages,
+    // put the rest back if any remain.
+    let all_messages = state
         .inboxes
         .remove(agent_name)
         .map(|(_, entries)| entries)
         .unwrap_or_default();
 
-    let result: Vec<Value> = messages
+    let total = all_messages.len();
+    let (taken, remaining) = if total <= limit {
+        (all_messages, Vec::new())
+    } else {
+        let mut all = all_messages;
+        let rest = all.split_off(limit);
+        (all, rest)
+    };
+
+    // Put remaining messages back into the inbox
+    let remaining_count = remaining.len();
+    if !remaining.is_empty() {
+        state.inboxes.insert(agent_name.to_string(), remaining);
+    }
+
+    let result: Vec<Value> = taken
         .into_iter()
         .map(|e| {
             json!({
@@ -300,7 +326,10 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         })
         .collect();
 
-    Ok(json!(result))
+    Ok(json!({
+        "messages": result,
+        "remaining": remaining_count
+    }))
 }
 
 // ── search_messages ──────────────────────────────────────────────────────────
@@ -356,6 +385,11 @@ mod tests {
         let repo_dir = TempDir::new().unwrap();
         let po = PostOffice::new(idx_dir.path(), repo_dir.path()).unwrap();
         (po, idx_dir, repo_dir)
+    }
+
+    /// Helper: extract messages array from get_inbox response.
+    fn inbox_messages(resp: &Value) -> &Vec<Value> {
+        resp["messages"].as_array().unwrap()
     }
 
     // ── H1: Agent Name Collision ────────────────────────────────────────────
@@ -491,8 +525,20 @@ mod tests {
             .unwrap();
         }
 
-        // Drain the inbox
-        get_inbox(&state, json!({ "agent_name": "recipient" })).unwrap();
+        // Drain the inbox (pass max limit to drain all)
+        get_inbox(
+            &state,
+            json!({ "agent_name": "recipient", "limit": 1000 }),
+        )
+        .unwrap();
+        // Drain remaining (10K total, 1K per call)
+        for _ in 0..9 {
+            get_inbox(
+                &state,
+                json!({ "agent_name": "recipient", "limit": 1000 }),
+            )
+            .unwrap();
+        }
 
         // Should accept messages again
         let result = send_message(
@@ -707,13 +753,15 @@ mod tests {
         .unwrap();
 
         let first = get_inbox(&state, json!({ "agent_name": "b" })).unwrap();
-        let first_arr = first.as_array().unwrap();
-        assert_eq!(first_arr.len(), 1, "First drain should return the message");
+        assert_eq!(
+            inbox_messages(&first).len(),
+            1,
+            "First drain should return the message"
+        );
 
         let second = get_inbox(&state, json!({ "agent_name": "b" })).unwrap();
-        let second_arr = second.as_array().unwrap();
         assert_eq!(
-            second_arr.len(),
+            inbox_messages(&second).len(),
             0,
             "Second drain should be empty — messages consumed"
         );
@@ -777,7 +825,7 @@ mod tests {
         for name in &["bob", "charlie", "dave"] {
             let inbox = get_inbox(&state, json!({ "agent_name": name })).unwrap();
             assert_eq!(
-                inbox.as_array().unwrap().len(),
+                inbox_messages(&inbox).len(),
                 1,
                 "{} should have exactly 1 message",
                 name
@@ -790,7 +838,8 @@ mod tests {
     async fn get_inbox_nonexistent_agent_returns_empty() {
         let (state, _idx, _repo) = test_post_office();
         let r = get_inbox(&state, json!({ "agent_name": "nobody" })).unwrap();
-        assert_eq!(r.as_array().unwrap().len(), 0);
+        assert_eq!(inbox_messages(&r).len(), 0);
+        assert_eq!(r["remaining"], 0);
     }
 
     // ── H-DEFAULT: create_agent without name_hint defaults to AnonymousAgent ─
@@ -902,10 +951,10 @@ mod tests {
         // Fixed: pre-check prevents partial delivery. recipient_a should NOT
         // have received the message since the entire send was rejected.
         let inbox_a = get_inbox(&state, json!({ "agent_name": "recipient_a" })).unwrap();
-        let a_count = inbox_a.as_array().unwrap().len();
 
         assert_eq!(
-            a_count, 0,
+            inbox_messages(&inbox_a).len(),
+            0,
             "No partial delivery: recipient_a must not receive message when send is rejected"
         );
     }
@@ -1011,7 +1060,7 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
-            inbox.as_array().unwrap()[0]["from"].as_str().unwrap(),
+            inbox_messages(&inbox)[0]["from"].as_str().unwrap(),
             "ghost_agent"
         );
     }
@@ -1046,7 +1095,7 @@ mod tests {
         let b1 = Arc::clone(&barrier);
         let drain_handle = std::thread::spawn(move || {
             b1.wait();
-            get_inbox(&s1, json!({ "agent_name": "target" })).unwrap()
+            get_inbox(&s1, json!({ "agent_name": "target", "limit": 1000 })).unwrap()
         });
 
         // Thread 2: send more messages
@@ -1075,20 +1124,31 @@ mod tests {
 
         let drained = drain_handle.join().unwrap();
         let sent = send_handle.join().unwrap();
-        let drained_count = drained.as_array().unwrap().len();
+        let drained_count =
+            inbox_messages(&drained).len() + drained["remaining"].as_u64().unwrap() as usize;
 
-        // Whatever was drained + whatever remains in inbox + whatever was
-        // sent concurrently should account for all messages. No message lost.
-        let remaining = get_inbox(&state, json!({ "agent_name": "target" })).unwrap();
-        let remaining_count = remaining.as_array().unwrap().len();
+        // Drain whatever remains (use max limit)
+        let mut remaining_total = 0usize;
+        loop {
+            let r = get_inbox(
+                &state,
+                json!({ "agent_name": "target", "limit": 1000 }),
+            )
+            .unwrap();
+            let batch = inbox_messages(&r).len();
+            if batch == 0 {
+                break;
+            }
+            remaining_total += batch;
+        }
 
-        let total_accounted = drained_count + remaining_count;
+        let total_accounted = drained_count + remaining_total;
         // We started with 100 + sent up to 50 more = up to 150 total
         assert!(
             total_accounted >= 100 && total_accounted <= 100 + sent,
             "No messages lost: drained={} remaining={} sent={}",
             drained_count,
-            remaining_count,
+            remaining_total,
             sent
         );
     }
@@ -1190,7 +1250,7 @@ mod tests {
         // Each occurrence in the `to` array creates a separate delivery
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
-            inbox.as_array().unwrap().len(),
+            inbox_messages(&inbox).len(),
             2,
             "Duplicate recipient gets the message twice (no dedup)"
         );
@@ -1289,7 +1349,7 @@ mod tests {
         assert!(result.is_ok());
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msg = &inbox.as_array().unwrap()[0];
+        let msg = &inbox_messages(&inbox)[0];
         assert_eq!(msg["subject"], "(No Subject)");
         assert_eq!(msg["body"], "");
     }
@@ -1355,8 +1415,20 @@ mod tests {
             "At least one send should succeed (cap was not reached)"
         );
         // Document: cap can be exceeded by at most the number of concurrent senders.
-        let inbox = get_inbox(&state, json!({ "agent_name": "target" })).unwrap();
-        let total = inbox.as_array().unwrap().len();
+        // Drain all messages to count total (paginated).
+        let mut total = 0usize;
+        loop {
+            let r = get_inbox(
+                &state,
+                json!({ "agent_name": "target", "limit": 1000 }),
+            )
+            .unwrap();
+            let batch = inbox_messages(&r).len();
+            if batch == 0 {
+                break;
+            }
+            total += batch;
+        }
         assert!(
             total >= MAX_INBOX_SIZE && total <= MAX_INBOX_SIZE + 1,
             "Inbox may slightly exceed soft cap under race: got {}",
@@ -1364,14 +1436,12 @@ mod tests {
         );
     }
 
-    // ── H2: get_inbox response size with full inbox ─────────────────────
-    // A full inbox drain produces a large JSON array. This test verifies
-    // it works correctly at moderate scale (not OOM in test).
+    // ── H2: get_inbox pagination bounds response size ──────────────────
     #[tokio::test]
-    async fn h2_full_inbox_drain_returns_all_messages() {
+    async fn h2_get_inbox_pagination() {
         let (state, _idx, _repo) = test_post_office();
 
-        let count = 500; // moderate scale for test speed
+        let count = 250;
         for i in 0..count {
             send_message(
                 &state,
@@ -1385,19 +1455,30 @@ mod tests {
             .unwrap();
         }
 
-        let inbox = get_inbox(&state, json!({ "agent_name": "receiver" })).unwrap();
-        let messages = inbox.as_array().unwrap();
-        assert_eq!(
-            messages.len(),
-            count,
-            "All {} messages must be returned in drain",
-            count
-        );
+        // Default limit is 100
+        let page1 = get_inbox(&state, json!({ "agent_name": "receiver" })).unwrap();
+        let msgs1 = inbox_messages(&page1);
+        assert_eq!(msgs1.len(), 100, "Default limit returns 100");
+        assert_eq!(page1["remaining"], 150, "150 remain after first page");
 
         // Verify messages are well-formed
-        assert!(messages[0]["id"].is_string());
-        assert_eq!(messages[0]["from"], "sender");
-        assert!(messages[0]["timestamp"].is_i64());
+        assert!(msgs1[0]["id"].is_string());
+        assert_eq!(msgs1[0]["from"], "sender");
+        assert!(msgs1[0]["timestamp"].is_i64());
+
+        // Second page with explicit limit
+        let page2 = get_inbox(
+            &state,
+            json!({ "agent_name": "receiver", "limit": 200 }),
+        )
+        .unwrap();
+        let msgs2 = inbox_messages(&page2);
+        assert_eq!(msgs2.len(), 150, "Second page returns remaining 150");
+        assert_eq!(page2["remaining"], 0, "No more remaining");
+
+        // Third call returns empty
+        let page3 = get_inbox(&state, json!({ "agent_name": "receiver" })).unwrap();
+        assert_eq!(inbox_messages(&page3).len(), 0, "Inbox is empty");
     }
 
     // ── H3: create_agent upsert generates new id each time ──────────────
@@ -1456,7 +1537,7 @@ mod tests {
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
-            inbox.as_array().unwrap()[0]["from"].as_str().unwrap(),
+            inbox_messages(&inbox)[0]["from"].as_str().unwrap(),
             long_from,
             "Long from_agent preserved in inbox entry"
         );
@@ -1499,10 +1580,23 @@ mod tests {
             "Duplicate recipients both pass pre-check (same inbox scanned twice)"
         );
 
-        // Bob now has MAX + 1 messages (cap exceeded by duplicate)
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        // Bob now has MAX + 1 messages (cap exceeded by duplicate).
+        // Count via paginated drain.
+        let mut total = 0usize;
+        loop {
+            let r = get_inbox(
+                &state,
+                json!({ "agent_name": "bob", "limit": 1000 }),
+            )
+            .unwrap();
+            let batch = inbox_messages(&r).len();
+            if batch == 0 {
+                break;
+            }
+            total += batch;
+        }
         assert_eq!(
-            inbox.as_array().unwrap().len(),
+            total,
             MAX_INBOX_SIZE + 1,
             "Duplicate recipient pushes both succeed, soft cap exceeded by 1"
         );
@@ -1600,15 +1694,16 @@ mod tests {
         .await;
         assert!(resp.get("result").is_some(), "get_inbox succeeded");
 
-        // Parse the nested content text
+        // Parse the nested content text — now returns {messages: [...], remaining: N}
         let text = resp["result"]["content"][0]["text"]
             .as_str()
             .unwrap();
-        let messages: Value = serde_json::from_str(text).unwrap();
-        let arr = messages.as_array().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let arr = parsed["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 1, "Receiver has exactly 1 message");
         assert_eq!(arr[0]["from"], "Sender");
         assert_eq!(arr[0]["subject"], "Hello");
         assert_eq!(arr[0]["body"], "End-to-end test");
+        assert_eq!(parsed["remaining"], 0);
     }
 }
