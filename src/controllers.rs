@@ -526,18 +526,10 @@ mod tests {
         }
 
         // Drain the inbox (pass max limit to drain all)
-        get_inbox(
-            &state,
-            json!({ "agent_name": "recipient", "limit": 1000 }),
-        )
-        .unwrap();
+        get_inbox(&state, json!({ "agent_name": "recipient", "limit": 1000 })).unwrap();
         // Drain remaining (10K total, 1K per call)
         for _ in 0..9 {
-            get_inbox(
-                &state,
-                json!({ "agent_name": "recipient", "limit": 1000 }),
-            )
-            .unwrap();
+            get_inbox(&state, json!({ "agent_name": "recipient", "limit": 1000 })).unwrap();
         }
 
         // Should accept messages again
@@ -1130,11 +1122,7 @@ mod tests {
         // Drain whatever remains (use max limit)
         let mut remaining_total = 0usize;
         loop {
-            let r = get_inbox(
-                &state,
-                json!({ "agent_name": "target", "limit": 1000 }),
-            )
-            .unwrap();
+            let r = get_inbox(&state, json!({ "agent_name": "target", "limit": 1000 })).unwrap();
             let batch = inbox_messages(&r).len();
             if batch == 0 {
                 break;
@@ -1418,11 +1406,7 @@ mod tests {
         // Drain all messages to count total (paginated).
         let mut total = 0usize;
         loop {
-            let r = get_inbox(
-                &state,
-                json!({ "agent_name": "target", "limit": 1000 }),
-            )
-            .unwrap();
+            let r = get_inbox(&state, json!({ "agent_name": "target", "limit": 1000 })).unwrap();
             let batch = inbox_messages(&r).len();
             if batch == 0 {
                 break;
@@ -1430,7 +1414,7 @@ mod tests {
             total += batch;
         }
         assert!(
-            total >= MAX_INBOX_SIZE && total <= MAX_INBOX_SIZE + 1,
+            (MAX_INBOX_SIZE..=MAX_INBOX_SIZE + 1).contains(&total),
             "Inbox may slightly exceed soft cap under race: got {}",
             total
         );
@@ -1467,11 +1451,7 @@ mod tests {
         assert!(msgs1[0]["timestamp"].is_i64());
 
         // Second page with explicit limit
-        let page2 = get_inbox(
-            &state,
-            json!({ "agent_name": "receiver", "limit": 200 }),
-        )
-        .unwrap();
+        let page2 = get_inbox(&state, json!({ "agent_name": "receiver", "limit": 200 })).unwrap();
         let msgs2 = inbox_messages(&page2);
         assert_eq!(msgs2.len(), 150, "Second page returns remaining 150");
         assert_eq!(page2["remaining"], 0, "No more remaining");
@@ -1584,11 +1564,7 @@ mod tests {
         // Count via paginated drain.
         let mut total = 0usize;
         loop {
-            let r = get_inbox(
-                &state,
-                json!({ "agent_name": "bob", "limit": 1000 }),
-            )
-            .unwrap();
+            let r = get_inbox(&state, json!({ "agent_name": "bob", "limit": 1000 })).unwrap();
             let batch = inbox_messages(&r).len();
             if batch == 0 {
                 break;
@@ -1695,9 +1671,7 @@ mod tests {
         assert!(resp.get("result").is_some(), "get_inbox succeeded");
 
         // Parse the nested content text — now returns {messages: [...], remaining: N}
-        let text = resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         let arr = parsed["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 1, "Receiver has exactly 1 message");
