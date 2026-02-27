@@ -5128,4 +5128,179 @@ mod tests {
             "FIXED: Default subject is empty string, not '(No Subject)'"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #21 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): Duplicate recipients cause duplicate delivery ────
+    // send_message iterates to_agents without deduplication. Sending to
+    // ["Alice", "Alice"] delivers two copies to Alice's inbox.
+    #[tokio::test]
+    async fn dr21_h1_duplicate_recipients_cause_duplicate_delivery() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "bob",
+                "to": ["alice", "alice", "alice"],
+                "subject": "triplicate",
+                "body": "same message three times"
+            }),
+        );
+        assert!(result.is_ok(), "Duplicate recipients are accepted");
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "alice" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+
+        // CONFIRMED: Alice gets 3 copies of the same message
+        assert_eq!(
+            msgs.len(),
+            3,
+            "CONFIRMED: Duplicate recipients deliver duplicate messages"
+        );
+        // All three have the same message_id
+        assert_eq!(msgs[0]["id"], msgs[1]["id"]);
+        assert_eq!(msgs[1]["id"], msgs[2]["id"]);
+    }
+
+    // ── H2 (CONFIRMED): Leading/trailing whitespace creates distinct agents ─
+    // " Alice" and "Alice" are different DashMap keys. A user could register
+    // " Alice" and never find their inbox querying for "Alice".
+    #[tokio::test]
+    async fn dr21_h2_whitespace_agent_names_are_distinct() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice" }),
+        );
+        assert!(r1.is_ok());
+
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": " Alice" }),
+        );
+        assert!(r2.is_ok(), "Leading space creates a distinct agent");
+
+        let r3 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice " }),
+        );
+        assert!(r3.is_ok(), "Trailing space creates a distinct agent");
+
+        // CONFIRMED: Three distinct agents exist
+        assert_eq!(state.agents.len(), 3, "CONFIRMED: Whitespace variants are distinct agents");
+        assert!(state.agents.contains_key("Alice"));
+        assert!(state.agents.contains_key(" Alice"));
+        assert!(state.agents.contains_key("Alice "));
+
+        // Messages to "Alice" don't reach " Alice"
+        send_message(
+            &state,
+            json!({
+                "from_agent": "bob",
+                "to": ["Alice"],
+                "subject": "test",
+                "body": "for Alice"
+            }),
+        )
+        .unwrap();
+
+        let inbox_alice = get_inbox(&state, json!({ "agent_name": "Alice" })).unwrap();
+        let inbox_space = get_inbox(&state, json!({ "agent_name": " Alice" })).unwrap();
+        assert_eq!(inbox_messages(&inbox_alice).len(), 1);
+        assert_eq!(
+            inbox_messages(&inbox_space).len(),
+            0,
+            "CONFIRMED: ' Alice' inbox is empty — messages go to 'Alice' only"
+        );
+    }
+
+    // ── H3 (CONFIRMED): Whitespace-only search query returns error ───────
+    // Tantivy's QueryParser rejects whitespace-only queries with a parse error.
+    #[tokio::test]
+    async fn dr21_h3_whitespace_only_search_query() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = search_messages(&state, json!({ "query": "   " }));
+        // Tantivy QueryParser returns "query must not be empty" or similar error
+        // Either Ok with empty results or Err with parse error — both are acceptable
+        match result {
+            Ok(v) => {
+                // If it succeeds, it should return 0 results
+                let results = v["results"].as_array().unwrap();
+                assert!(
+                    results.is_empty(),
+                    "Whitespace-only query should return no results if accepted"
+                );
+            }
+            Err(e) => {
+                // If it fails, it should be a parse error, not a panic
+                assert!(
+                    e.contains("parse") || e.contains("Query") || e.contains("empty"),
+                    "Error should be a query parse error, got: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // ── H4 (CONFIRMED): Notifications (no id) still get responses ────────
+    // JSON-RPC 2.0 says notifications (requests without id) MUST NOT receive
+    // responses. The server always returns a response with "id": null.
+    #[tokio::test]
+    async fn dr21_h4_notification_without_id_gets_response() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Request without "id" field — this is a JSON-RPC notification
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list"
+        });
+
+        let response = handle_mcp_request(state, request).await;
+
+        // CONFIRMED: Server returns a response even without id
+        assert!(
+            response.get("result").is_some() || response.get("error").is_some(),
+            "CONFIRMED: Notification (no id) still receives a response"
+        );
+        // The id field is null (serialized from Option::None)
+        assert_eq!(
+            response["id"],
+            Value::Null,
+            "Missing id is echoed as null in response"
+        );
+    }
+
+    // ── H5 (CONFIRMED): send_message response leaks `indexed` status ────
+    // The `indexed` boolean in the response exposes whether the persist
+    // channel had capacity. This is an internal implementation detail.
+    #[tokio::test]
+    async fn dr21_h5_send_message_response_contains_indexed_field() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        )
+        .unwrap();
+
+        // CONFIRMED: Response contains "indexed" boolean — internal state leak
+        assert!(
+            result.get("indexed").is_some(),
+            "CONFIRMED: Response exposes internal 'indexed' status"
+        );
+        assert!(
+            result["indexed"].is_boolean(),
+            "indexed is a boolean exposing persist channel state"
+        );
+    }
 }
