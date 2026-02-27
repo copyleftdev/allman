@@ -2828,4 +2828,183 @@ mod tests {
         assert_eq!(inbox_messages(&inbox)[0]["from"], "alice");
         assert_eq!(inbox_messages(&inbox)[0]["subject"], "note to self");
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #11 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): program and model lack explicit length bounds ────
+    // Every other user-facing text input has a MAX_* constant:
+    //   agent_name (128), from_agent (256), project_key (256),
+    //   subject (1024), body (65536), recipients count (100).
+    // But program and model have no explicit bound. The 1MB HTTP body limit
+    // is the only implicit cap. This test documents the gap.
+    #[tokio::test]
+    async fn dr11_h1_program_model_no_length_validation() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 100KB program and model — no app-level rejection
+        let big_program = "P".repeat(100_000);
+        let big_model = "M".repeat(100_000);
+
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "BigAgent",
+                "program": big_program,
+                "model": big_model,
+            }),
+        );
+
+        // CONFIRMED: no length validation on program/model.
+        // These are accepted at any size (only bounded by HTTP body limit).
+        assert!(
+            result.is_ok(),
+            "100KB program/model accepted — no explicit length validation"
+        );
+
+        let record = state.agents.get("BigAgent").unwrap();
+        assert_eq!(record.program.len(), 100_000);
+        assert_eq!(record.model.len(), 100_000);
+    }
+
+    // ── H2 (CONFIRMED): Agent "." passes validation, anomalous Git path ──
+    // "." is not empty, not "..", has no slashes/null/control chars, and is
+    // not whitespace-only — so it passes validate_agent_name. The resulting
+    // Git path "agents/./profile.json" normalizes to "agents/profile.json"
+    // on the filesystem. DashMap usage is unaffected (exact string key).
+    #[tokio::test]
+    async fn dr11_h2_dot_agent_name_is_valid() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(&state, json!({ "project_key": "test", "name_hint": "." }));
+        assert!(
+            result.is_ok(),
+            "Agent name '.' passes validation (not '..')"
+        );
+
+        // Stored correctly in DashMap with exact key "."
+        assert!(state.agents.contains_key("."));
+        let record = state.agents.get(".").unwrap();
+        assert_eq!(record.name, ".");
+
+        // Messaging works — DashMap key is exact string match
+        send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["."],
+                "subject": "to dot",
+                "body": "hello dot agent",
+            }),
+        )
+        .unwrap();
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "." })).unwrap();
+        assert_eq!(inbox_messages(&inbox).len(), 1);
+        assert_eq!(inbox_messages(&inbox)[0]["from"], "alice");
+    }
+
+    // ── H3 (DISPROVED): Non-string method returns error, no panic ────────
+    // handle_mcp_request uses .as_str() which returns None for non-strings,
+    // falling through to "" → _ arm → -32601 Method not found.
+    #[tokio::test]
+    async fn dr11_h3_nonstring_method_returns_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // method is an integer, not a string
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": 42 }),
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"], -32601,
+            "Non-string method should return Method not found"
+        );
+
+        // method is a boolean
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": true }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32601);
+
+        // method is an array
+        let resp = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 3, "method": ["tools/call"] }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    // ── H4 (DISPROVED): Body with null bytes is correctly handled ────────
+    // Rust strings support \0. serde_json serializes as \u0000 in JSON.
+    #[tokio::test]
+    async fn dr11_h4_body_with_null_bytes_handled() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let body_with_nulls = "hello\0world\0end";
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "null test",
+                "body": body_with_nulls,
+            }),
+        );
+        assert!(result.is_ok(), "Body with null bytes must be accepted");
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        assert_eq!(inbox_messages(&inbox).len(), 1);
+        assert_eq!(
+            inbox_messages(&inbox)[0]["body"].as_str().unwrap(),
+            body_with_nulls,
+            "Null bytes preserved in body round-trip"
+        );
+    }
+
+    // ── H5 (DISPROVED): Exact limit boundary triggers full drain + cleanup ─
+    // When inbox.len() == limit, the <= branch fires: mem::take + occ.remove.
+    // The DashMap entry is cleaned up, not left as an empty Vec.
+    #[tokio::test]
+    async fn dr11_h5_exact_limit_triggers_full_drain() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send exactly 50 messages
+        for i in 0..50 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender",
+                    "to": ["target"],
+                    "subject": format!("msg {}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        assert!(state.inboxes.contains_key("target"));
+
+        // Drain with limit == inbox.len() (exact boundary)
+        let result = get_inbox(&state, json!({ "agent_name": "target", "limit": 50 })).unwrap();
+        assert_eq!(
+            inbox_messages(&result).len(),
+            50,
+            "All 50 messages returned"
+        );
+        assert_eq!(result["remaining"], 0, "Zero remaining");
+
+        // DashMap entry must be cleaned up (occ.remove() in <= branch)
+        assert!(
+            !state.inboxes.contains_key("target"),
+            "Exact boundary must trigger full drain + DashMap entry removal"
+        );
+    }
 }
