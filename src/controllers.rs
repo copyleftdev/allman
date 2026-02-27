@@ -4743,4 +4743,205 @@ mod tests {
         );
         assert!(r3.is_ok(), "Clean subject accepted");
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Deep Review #19 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): from_agent in send_message accepts empty string ──────
+    // validate_agent_name rejects empty names, but send_message's inline
+    // validation for from_agent does not check for empty string.
+    #[tokio::test]
+    async fn dr19_h1_from_agent_accepts_empty_string() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Empty from_agent — should be rejected but isn't
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "anonymous message"
+            }),
+        );
+        assert!(
+            r.is_ok(),
+            "CONFIRMED: Empty from_agent is accepted — creates message with blank sender"
+        );
+
+        // Verify the blank sender appears in inbox
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0]["from_agent"].as_str().unwrap(),
+            "",
+            "CONFIRMED: Inbox shows empty string as sender"
+        );
+    }
+
+    // ── H2 (CONFIRMED): project_id accepts null bytes and control chars ──────
+    // project_id in send_message only has a length check. No content validation.
+    // Null bytes and control chars persist in inbox and Tantivy index.
+    #[tokio::test]
+    async fn dr19_h2_project_id_accepts_null_bytes() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Null byte in project_id — accepted
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hi",
+                "project_id": "proj\0evil"
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "CONFIRMED: project_id with null byte is accepted"
+        );
+
+        // Control chars in project_id — accepted
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test2",
+                "body": "hi",
+                "project_id": "proj\x1b[31mRED"
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "CONFIRMED: project_id with ANSI escape is accepted"
+        );
+
+        // Verify they appear in inbox
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 2, "Both messages delivered");
+        assert!(
+            msgs[0]["project_id"].as_str().unwrap().contains('\0'),
+            "CONFIRMED: Null byte in project_id preserved in inbox"
+        );
+    }
+
+    // ── H3 (CONFIRMED): Malformed JSON returns HTTP 422, not JSON-RPC -32700 ─
+    // Axum's Json<Value> extractor rejects non-JSON before handle_mcp_request
+    // executes. This is an integration-level issue — we can only document it here
+    // and test that handle_mcp_request itself handles non-object payloads gracefully.
+    #[tokio::test]
+    async fn dr19_h3_non_object_payload_handled() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // String payload (not a JSON object)
+        let r1 = handle_mcp_request(state.clone(), json!("not an object")).await;
+        assert_eq!(r1["jsonrpc"], "2.0");
+        assert!(
+            r1.get("error").is_some(),
+            "CONFIRMED: Non-object payload returns error (but true malformed JSON never reaches this code — Axum returns HTTP 422 instead of JSON-RPC -32700)"
+        );
+
+        // Array payload
+        let r2 = handle_mcp_request(state.clone(), json!([1, 2, 3])).await;
+        assert!(r2.get("error").is_some(), "Array payload returns error");
+
+        // Null payload
+        let r3 = handle_mcp_request(state, json!(null)).await;
+        assert!(r3.get("error").is_some(), "Null payload returns error");
+    }
+
+    // ── H4 (CONFIRMED): search_messages "total" is misleading ────────────────
+    // total equals results.len() (bounded by limit), NOT the total number of
+    // matching documents in the index. Clients can't use it for pagination.
+    #[tokio::test]
+    async fn dr19_h4_search_total_equals_returned_count() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send 5 messages with the same searchable keyword
+        for i in 0..5 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "alice",
+                    "to": ["bob"],
+                    "subject": format!("dr19_total_test msg {}", i),
+                    "body": "dr19_total_test searchable content"
+                }),
+            )
+            .unwrap();
+        }
+
+        // Wait for indexing
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Search with limit=2 — should only return 2 results
+        let search =
+            search_messages(&state, json!({ "query": "dr19_total_test", "limit": 2 })).unwrap();
+
+        let results = search["results"].as_array().unwrap();
+        let total = search["total"].as_i64().unwrap();
+
+        assert!(results.len() <= 2, "Results bounded by limit");
+        assert_eq!(
+            total,
+            results.len() as i64,
+            "CONFIRMED: total equals results.len(), NOT total matches in index"
+        );
+        // If total were the true match count, it would be >= 5
+        // But it's <= 2 because it just mirrors results.len()
+    }
+
+    // ── H5 (CONFIRMED): body accepts null bytes without validation ───────────
+    // subject and from_agent both reject null bytes and control chars.
+    // body only has a length check. Null bytes persist in inbox and are
+    // indexed into Tantivy.
+    #[tokio::test]
+    async fn dr19_h5_body_accepts_null_bytes_and_control_chars() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Null byte in body — accepted
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "body test 1",
+                "body": "before\0after"
+            }),
+        );
+        assert!(r1.is_ok(), "CONFIRMED: Body with null byte is accepted");
+
+        // Control chars in body — accepted
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "body test 2",
+                "body": "alert\x07\x08\x1b[31mRED\x1b[0m"
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "CONFIRMED: Body with control chars (ANSI escape) is accepted"
+        );
+
+        // Verify both in inbox with content preserved
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 2, "Both messages delivered");
+        assert!(
+            msgs[0]["body"].as_str().unwrap().contains('\0'),
+            "CONFIRMED: Null byte preserved in body"
+        );
+        assert!(
+            msgs[1]["body"].as_str().unwrap().contains('\x1b'),
+            "CONFIRMED: ANSI escape preserved in body"
+        );
+    }
 }
