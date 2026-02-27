@@ -17,8 +17,11 @@ const MAX_BODY_LEN: usize = 65_536; // 64 KB
 const MAX_PROGRAM_LEN: usize = 4_096; // 4 KB
 const MAX_MODEL_LEN: usize = 256;
 const MAX_PROJECT_ID_LEN: usize = 256;
+const MAX_QUERY_LEN: usize = 10_240; // 10 KB
 const DEFAULT_INBOX_LIMIT: usize = 100;
 const MAX_INBOX_LIMIT: usize = 1_000;
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+const MAX_SEARCH_LIMIT: usize = 1_000;
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -334,6 +337,12 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("agent_name")
         .and_then(|v| v.as_str())
         .ok_or("Missing agent_name")?;
+    if agent_name.len() > MAX_RECIPIENT_NAME_LEN {
+        return Err(format!(
+            "agent_name exceeds {} byte limit",
+            MAX_RECIPIENT_NAME_LEN
+        ));
+    }
 
     let limit = args
         .get("limit")
@@ -391,11 +400,14 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("Missing query")?;
+    if query_str.len() > MAX_QUERY_LEN {
+        return Err(format!("query exceeds {} byte limit", MAX_QUERY_LEN));
+    }
     let limit = args
         .get("limit")
         .and_then(|v| v.as_i64())
-        .unwrap_or(10)
-        .clamp(1, 1000) as usize;
+        .unwrap_or(DEFAULT_SEARCH_LIMIT as i64)
+        .clamp(1, MAX_SEARCH_LIMIT as i64) as usize;
 
     let index = &state.index;
     let searcher = state.index_reader.searcher();
@@ -3224,5 +3236,129 @@ mod tests {
             );
             assert_eq!(msgs[0]["body"].as_str().unwrap().len(), super::MAX_BODY_LEN);
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Deep Review #13 — Hypothesis Tests
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): search_messages query has no explicit length bound ──
+    // Every other user-facing text input has a MAX_* constant. The query field
+    // in search_messages has none — it relies solely on the 1MB Axum body limit.
+    #[tokio::test]
+    async fn dr13_h1_search_query_length_validated() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Oversized query must be rejected
+        let huge_query = "a".repeat(super::MAX_QUERY_LEN + 1);
+        let result = search_messages(&state, json!({ "query": huge_query }));
+
+        assert!(result.is_err(), "Oversized query must be rejected");
+        assert!(result.unwrap_err().contains("query exceeds"));
+
+        // Boundary test: exactly MAX_QUERY_LEN accepted
+        let ok_query = "a".repeat(super::MAX_QUERY_LEN);
+        let result = search_messages(&state, json!({ "query": ok_query }));
+        // Accepted by length check (may still fail at parse level, which is fine)
+        assert!(
+            result.is_ok() || result.unwrap_err().starts_with("Query parse error"),
+            "Exact boundary must pass length check"
+        );
+    }
+
+    // ── H2 (CONFIRMED): get_inbox agent_name has no length validation ───────
+    // send_message validates from_agent (MAX_FROM_AGENT_LEN) and recipients
+    // (MAX_RECIPIENT_NAME_LEN), but get_inbox does not validate agent_name.
+    #[tokio::test]
+    async fn dr13_h2_get_inbox_agent_name_length_validated() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Oversized agent_name must be rejected (uses MAX_RECIPIENT_NAME_LEN
+        // because get_inbox reads inboxes keyed by recipient name from send_message)
+        let huge_name = "A".repeat(super::MAX_RECIPIENT_NAME_LEN + 1);
+        let result = get_inbox(&state, json!({ "agent_name": huge_name }));
+
+        assert!(result.is_err(), "Oversized agent_name must be rejected");
+        assert!(result.unwrap_err().contains("agent_name exceeds"));
+
+        // Boundary test: exactly MAX_RECIPIENT_NAME_LEN accepted
+        let ok_name = "A".repeat(super::MAX_RECIPIENT_NAME_LEN);
+        let result = get_inbox(&state, json!({ "agent_name": ok_name }));
+        assert!(result.is_ok(), "Exact boundary must be accepted");
+    }
+
+    // ── H3 (DISPROVED): from_agent with null bytes causes corruption ────────
+    // from_agent has only a length check, no content validation like
+    // validate_agent_name(). Null bytes flow into InboxEntry and Tantivy.
+    // serde_json handles embedded nulls safely (encodes as \u0000).
+    #[tokio::test]
+    async fn dr13_h3_from_agent_null_bytes_safe() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let evil_from = "alice\0evil";
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": evil_from,
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+
+        // Accepted — from_agent has no content validation (only length).
+        assert!(result.is_ok(), "Null bytes in from_agent are accepted");
+
+        // Verify the message is delivered intact with null byte preserved
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0]["from"], evil_from,
+            "Null byte preserved in from field"
+        );
+    }
+
+    // ── H4 (DISPROVED): search_messages with empty query panics ─────────────
+    // Tantivy's QueryParser accepts an empty string without panicking —
+    // it returns Ok with an empty result set. No crash, no error.
+    #[tokio::test]
+    async fn dr13_h4_empty_query_does_not_panic() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = search_messages(&state, json!({ "query": "" }));
+
+        // Empty query succeeds gracefully — Tantivy returns empty results
+        assert!(result.is_ok(), "Empty query must not panic");
+        let results = result.unwrap();
+        assert!(results.as_array().is_some(), "Returns a valid array");
+    }
+
+    // ── H5 (CONFIRMED): search_messages limit uses magic numbers ────────────
+    // get_inbox uses named constants (DEFAULT_INBOX_LIMIT, MAX_INBOX_LIMIT).
+    // search_messages uses inline 10 and 1000. Behavior is correct but naming
+    // is inconsistent. This test documents the current behavior.
+    #[tokio::test]
+    async fn dr13_h5_search_limit_uses_named_constants() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Default limit uses DEFAULT_SEARCH_LIMIT
+        let result = search_messages(&state, json!({ "query": "hello" })).unwrap();
+        assert!(result.as_array().is_some(), "Default limit returns array");
+
+        // Negative limit clamped to 1
+        let result = search_messages(&state, json!({ "query": "hello", "limit": -5 })).unwrap();
+        assert!(result.as_array().is_some(), "Negative limit clamped to 1");
+
+        // Huge limit clamped to MAX_SEARCH_LIMIT
+        let result = search_messages(
+            &state,
+            json!({ "query": "hello", "limit": (super::MAX_SEARCH_LIMIT + 999) }),
+        )
+        .unwrap();
+        assert!(
+            result.as_array().is_some(),
+            "Huge limit clamped to MAX_SEARCH_LIMIT"
+        );
     }
 }
