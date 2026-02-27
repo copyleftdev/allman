@@ -7,6 +7,7 @@ pub struct InboxEntry {
     pub subject: String,
     pub body: String,
     pub timestamp: i64,
+    pub project_id: String,
 }
 
 #[allow(dead_code)]
