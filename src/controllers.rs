@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const MAX_INBOX_SIZE: usize = 10_000;
 const MAX_AGENT_NAME_LEN: usize = 128;
+const MAX_RECIPIENTS: usize = 100;
 const MAX_SUBJECT_LEN: usize = 1_024;
 const MAX_BODY_LEN: usize = 65_536; // 64 KB
 const DEFAULT_INBOX_LIMIT: usize = 100;
@@ -207,6 +208,13 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
+    }
+    if to_agents.len() > MAX_RECIPIENTS {
+        return Err(format!(
+            "Too many recipients ({}, max {})",
+            to_agents.len(),
+            MAX_RECIPIENTS
+        ));
     }
     if subject.len() > MAX_SUBJECT_LEN {
         return Err(format!(
@@ -1839,19 +1847,16 @@ mod tests {
     // Deep Review #5 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED): No recipient count limit — memory amplification ──
-    // send_message has no MAX_RECIPIENTS constant. A crafted request with
-    // many recipients and a large body causes O(N * body_size) heap alloc.
-    // Within 1MB HTTP limit: ~235K single-char recipients × 64KB body
-    // = ~14.5 GB heap. This test documents the vulnerability.
+    // ── H1 (FIXED): Recipient count is capped at MAX_RECIPIENTS ────────
+    // Previously, send_message had no limit on recipient count. A crafted
+    // 1MB request could cause ~14.5GB heap allocation via amplification.
+    // Now capped at MAX_RECIPIENTS (100).
     #[tokio::test]
-    async fn dr5_h1_no_recipient_count_limit() {
+    async fn dr5_h1_recipient_count_limit_enforced() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 500 recipients — well within reason but demonstrates the pattern.
-        // Each recipient gets a full clone of the InboxEntry.
-        let recipients: Vec<String> = (0..500).map(|i| format!("agent_{}", i)).collect();
-        let body = "A".repeat(1_000); // 1KB body × 500 = 500KB heap
+        // 101 recipients — exceeds MAX_RECIPIENTS (100)
+        let recipients: Vec<String> = (0..101).map(|i| format!("agent_{}", i)).collect();
 
         let result = send_message(
             &state,
@@ -1859,30 +1864,53 @@ mod tests {
                 "from_agent": "attacker",
                 "to": recipients,
                 "subject": "amplify",
-                "body": body,
+                "body": "payload",
             }),
         );
 
-        // Currently succeeds — no limit on recipient count.
-        // This is the bug: the only protection is the 1MB HTTP body limit,
-        // but a small JSON array of short names + large body amplifies to
-        // much more heap allocation than the request size.
+        assert!(result.is_err(), "101 recipients must be rejected");
+        let err = result.unwrap_err();
         assert!(
-            result.is_ok(),
-            "500 recipients accepted (no MAX_RECIPIENTS limit)"
+            err.contains("Too many recipients"),
+            "Error message should mention recipient limit: {}",
+            err
         );
 
-        // Verify all 500 got a copy
+        // Verify zero delivery (no partial send)
+        for i in 0..101 {
+            assert!(
+                !state.inboxes.contains_key(&format!("agent_{}", i)),
+                "No messages should be delivered when recipient limit exceeded"
+            );
+        }
+    }
+
+    // MAX_RECIPIENTS boundary: exactly 100 should succeed
+    #[tokio::test]
+    async fn dr5_h1_max_recipients_boundary_accepted() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let recipients: Vec<String> = (0..100).map(|i| format!("agent_{}", i)).collect();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": recipients,
+                "subject": "broadcast",
+                "body": "hello all",
+            }),
+        );
+
+        assert!(result.is_ok(), "Exactly 100 recipients must be accepted");
+
+        // Verify all 100 got the message
         let mut delivered = 0;
-        for i in 0..500 {
-            let inbox = get_inbox(
-                &state,
-                json!({ "agent_name": format!("agent_{}", i) }),
-            )
-            .unwrap();
+        for i in 0..100 {
+            let inbox = get_inbox(&state, json!({ "agent_name": format!("agent_{}", i) })).unwrap();
             delivered += inbox_messages(&inbox).len();
         }
-        assert_eq!(delivered, 500, "All 500 recipients received the message");
+        assert_eq!(delivered, 100, "All 100 recipients received the message");
     }
 
     // ── H2 (DISPROVED): get_inbox entry() for nonexistent agent ──────────
