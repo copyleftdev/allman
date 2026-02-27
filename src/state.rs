@@ -174,7 +174,6 @@ fn persistence_worker(
             }
         }
 
-        let batch_size = batch.len();
         let mut indexed = 0usize;
 
         for op in batch {
@@ -220,7 +219,7 @@ fn persistence_worker(
         // Single commit for the entire batch
         if indexed > 0 {
             if let Err(e) = index_writer.commit() {
-                tracing::error!("Tantivy batch commit failed ({} docs): {}", batch_size, e);
+                tracing::error!("Tantivy batch commit failed ({} docs): {}", indexed, e);
             }
         }
     }
