@@ -5280,4 +5280,195 @@ mod tests {
         assert!(result.get("id").is_some(), "Response has id");
         assert_eq!(result["status"], "sent", "Response has status");
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #22 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): project_key whitespace creates distinct projects ─
+    // project_key validation checks null bytes, control chars, and length,
+    // but NOT leading/trailing whitespace. " proj" and "proj" produce
+    // different UUID v5 seeds → different project_ids.
+    #[tokio::test]
+    async fn dr22_h1_project_key_whitespace_creates_distinct_projects() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "myproject", "name_hint": "Agent1" }),
+        )
+        .unwrap();
+
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": " myproject", "name_hint": "Agent2" }),
+        )
+        .unwrap();
+
+        let r3 = create_agent(
+            &state,
+            json!({ "project_key": "myproject ", "name_hint": "Agent3" }),
+        )
+        .unwrap();
+
+        // CONFIRMED: All three produce different project_ids
+        assert_ne!(
+            r1["project_id"], r2["project_id"],
+            "CONFIRMED: Leading whitespace in project_key creates a different project"
+        );
+        assert_ne!(
+            r1["project_id"], r3["project_id"],
+            "CONFIRMED: Trailing whitespace in project_key creates a different project"
+        );
+        assert_eq!(
+            state.projects.len(),
+            3,
+            "Three distinct projects exist from whitespace variants"
+        );
+    }
+
+    // ── H2 (CONFIRMED): from_agent accepts whitespace-padded names ───────
+    // send_message's from_agent validation checks empty, length, null, and
+    // control chars, but NOT leading/trailing whitespace. " Alice" is
+    // accepted as from_agent but rejected by create_agent.
+    #[tokio::test]
+    async fn dr22_h2_from_agent_accepts_whitespace_padded_names() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // " Alice" is rejected as an agent name
+        let create_result = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": " Alice" }),
+        );
+        assert!(
+            create_result.is_err(),
+            "Leading whitespace rejected in create_agent"
+        );
+
+        // But accepted as from_agent in send_message
+        let send_result = send_message(
+            &state,
+            json!({
+                "from_agent": " Alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            send_result.is_ok(),
+            "CONFIRMED: ' Alice' accepted as from_agent despite being invalid as agent name"
+        );
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0]["from_agent"], " Alice",
+            "CONFIRMED: Whitespace-padded from_agent stored as-is"
+        );
+    }
+
+    // ── H3 (CONFIRMED): get_inbox agent_name lacks path separator check ──
+    // get_inbox validates empty, length, null, control chars but NOT
+    // path separators or "..". No security impact (DashMap lookup only),
+    // but asymmetric with create_agent's validate_agent_name.
+    #[tokio::test]
+    async fn dr22_h3_get_inbox_accepts_path_separators() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Path separators rejected by create_agent
+        let create_result = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "foo/bar" }),
+        );
+        assert!(create_result.is_err(), "Path sep rejected in create_agent");
+
+        // But accepted in get_inbox (returns empty inbox, no security impact)
+        let inbox_result = get_inbox(&state, json!({ "agent_name": "foo/bar" }));
+        assert!(
+            inbox_result.is_ok(),
+            "CONFIRMED: 'foo/bar' accepted in get_inbox (DashMap lookup only)"
+        );
+        assert_eq!(
+            inbox_messages(&inbox_result.unwrap()).len(),
+            0,
+            "Empty inbox for non-existent agent"
+        );
+
+        // ".." also accepted in get_inbox
+        let inbox_result2 = get_inbox(&state, json!({ "agent_name": "foo..bar" }));
+        assert!(
+            inbox_result2.is_ok(),
+            "CONFIRMED: '..' pattern accepted in get_inbox"
+        );
+    }
+
+    // ── H4 (DISPROVED): explicit "id": null correctly returns response ───
+    // Regression guard for DR21 H4: "id": null is a request (not a
+    // notification). Only MISSING id triggers the notification path.
+    #[tokio::test]
+    async fn dr22_h4_explicit_null_id_returns_response() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Explicit "id": null — this is a request, not a notification
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "method": "tools/list"
+        });
+
+        let response = handle_mcp_request(state, request).await;
+
+        // DISPROVED: The server correctly distinguishes "id": null from missing id
+        assert!(
+            !response.is_null(),
+            "DISPROVED: explicit 'id': null gets a proper response (not a notification)"
+        );
+        assert!(
+            response.get("result").is_some(),
+            "tools/list returns a result"
+        );
+        assert_eq!(
+            response["id"],
+            Value::Null,
+            "id: null is echoed correctly in the response"
+        );
+    }
+
+    // ── H5 (CONFIRMED): whitespace-only project_key accepted ─────────────
+    // project_key "   " has no null bytes, no control chars, len=3 < 256.
+    // It passes all validation and creates a valid but meaningless project.
+    #[tokio::test]
+    async fn dr22_h5_whitespace_only_project_key_accepted() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "   ", "name_hint": "Agent1" }),
+        );
+
+        // CONFIRMED: Whitespace-only project_key is accepted
+        assert!(
+            result.is_ok(),
+            "CONFIRMED: Whitespace-only project_key passes all validation"
+        );
+        let resp = result.unwrap();
+        assert!(
+            resp["project_id"].as_str().unwrap().starts_with("proj_"),
+            "Valid project_id generated from whitespace-only key"
+        );
+
+        // It creates a distinct project from empty string
+        let result2 = create_agent(
+            &state,
+            json!({ "project_key": "", "name_hint": "Agent2" }),
+        );
+        assert!(result2.is_ok());
+        assert_ne!(
+            resp["project_id"],
+            result2.unwrap()["project_id"],
+            "Whitespace-only and empty produce different projects"
+        );
+    }
 }
