@@ -198,6 +198,12 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
             MAX_PROJECT_KEY_LEN
         ));
     }
+    if project_key.trim().is_empty() && !project_key.is_empty() {
+        return Err("project_key must not be whitespace-only".to_string());
+    }
+    if project_key != project_key.trim() {
+        return Err("project_key must not have leading or trailing whitespace".to_string());
+    }
     let program = args
         .get("program")
         .and_then(|v| v.as_str())
@@ -343,6 +349,9 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
     if from_agent.chars().any(|c| c.is_control()) {
         return Err("from_agent must not contain control characters".to_string());
+    }
+    if from_agent != from_agent.trim() {
+        return Err("from_agent must not have leading or trailing whitespace".to_string());
     }
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
@@ -500,6 +509,15 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
     if agent_name.chars().any(|c| c.is_control()) {
         return Err("agent_name must not contain control characters".to_string());
+    }
+    if agent_name.contains('/') || agent_name.contains('\\') {
+        return Err("agent_name must not contain path separators".to_string());
+    }
+    if agent_name.contains("..") {
+        return Err("agent_name must not contain '..'".to_string());
+    }
+    if agent_name != agent_name.trim() {
+        return Err("agent_name must not have leading or trailing whitespace".to_string());
     }
 
     let limit = args
@@ -2662,8 +2680,10 @@ mod tests {
         assert_eq!(inbox_messages(&inbox)[0]["from_agent"], "alice");
     }
 
-    // ── H3 (DISPROVED): Whitespace-only recipient is functional ─────────
-    // Not filtered by `.filter(|s| !s.is_empty())`. Works as DashMap key.
+    // ── H3 (UPDATED): Whitespace-only recipient still accepted in send ──
+    // send_message accepts whitespace-only recipients (no validation on
+    // recipient content beyond null/control/path checks). But get_inbox
+    // now rejects whitespace-only agent_name (DR22 H3 fix).
     #[tokio::test]
     async fn dr8_h3_whitespace_recipient_is_functional() {
         let (state, _idx, _repo) = test_post_office();
@@ -2677,14 +2697,16 @@ mod tests {
                 "body": "hello",
             }),
         );
-        assert!(result.is_ok(), "Whitespace-only recipient is accepted");
+        assert!(
+            result.is_ok(),
+            "Whitespace-only recipient is accepted in send"
+        );
 
-        // Retrievable via get_inbox with the same whitespace key
-        let inbox = get_inbox(&state, json!({ "agent_name": "   " })).unwrap();
-        assert_eq!(
-            inbox_messages(&inbox).len(),
-            1,
-            "Whitespace recipient functional as DashMap key"
+        // get_inbox now rejects whitespace-only agent_name (DR22 fix)
+        let inbox_result = get_inbox(&state, json!({ "agent_name": "   " }));
+        assert!(
+            inbox_result.is_err(),
+            "UPDATED: Whitespace-only agent_name rejected by get_inbox (DR22)"
         );
     }
 
@@ -5285,10 +5307,9 @@ mod tests {
     // Deep Review #22 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED): project_key whitespace creates distinct projects ─
-    // project_key validation checks null bytes, control chars, and length,
-    // but NOT leading/trailing whitespace. " proj" and "proj" produce
-    // different UUID v5 seeds → different project_ids.
+    // ── H1 (FIXED): project_key with whitespace is rejected ────────────
+    // project_key now rejects leading/trailing whitespace, preventing
+    // confusingly distinct projects from " proj" vs "proj".
     #[tokio::test]
     async fn dr22_h1_project_key_whitespace_creates_distinct_projects() {
         let (state, _idx, _repo) = test_post_office();
@@ -5296,46 +5317,42 @@ mod tests {
         let r1 = create_agent(
             &state,
             json!({ "project_key": "myproject", "name_hint": "Agent1" }),
-        )
-        .unwrap();
+        );
+        assert!(r1.is_ok(), "Clean project_key is accepted");
 
         let r2 = create_agent(
             &state,
             json!({ "project_key": " myproject", "name_hint": "Agent2" }),
-        )
-        .unwrap();
+        );
+        assert!(
+            r2.is_err(),
+            "FIXED: Leading whitespace in project_key rejected"
+        );
+        assert!(r2.unwrap_err().contains("leading or trailing whitespace"));
 
         let r3 = create_agent(
             &state,
             json!({ "project_key": "myproject ", "name_hint": "Agent3" }),
-        )
-        .unwrap();
+        );
+        assert!(
+            r3.is_err(),
+            "FIXED: Trailing whitespace in project_key rejected"
+        );
 
-        // CONFIRMED: All three produce different project_ids
-        assert_ne!(
-            r1["project_id"], r2["project_id"],
-            "CONFIRMED: Leading whitespace in project_key creates a different project"
-        );
-        assert_ne!(
-            r1["project_id"], r3["project_id"],
-            "CONFIRMED: Trailing whitespace in project_key creates a different project"
-        );
         assert_eq!(
             state.projects.len(),
-            3,
-            "Three distinct projects exist from whitespace variants"
+            1,
+            "FIXED: Only one project created from clean key"
         );
     }
 
-    // ── H2 (CONFIRMED): from_agent accepts whitespace-padded names ───────
-    // send_message's from_agent validation checks empty, length, null, and
-    // control chars, but NOT leading/trailing whitespace. " Alice" is
-    // accepted as from_agent but rejected by create_agent.
+    // ── H2 (FIXED): from_agent rejects whitespace-padded names ─────────
+    // from_agent now has the same whitespace check as validate_agent_name.
     #[tokio::test]
     async fn dr22_h2_from_agent_accepts_whitespace_padded_names() {
         let (state, _idx, _repo) = test_post_office();
 
-        // " Alice" is rejected as an agent name
+        // " Alice" rejected as agent name
         let create_result = create_agent(
             &state,
             json!({ "project_key": "proj", "name_hint": " Alice" }),
@@ -5345,7 +5362,7 @@ mod tests {
             "Leading whitespace rejected in create_agent"
         );
 
-        // But accepted as from_agent in send_message
+        // Now also rejected as from_agent
         let send_result = send_message(
             &state,
             json!({
@@ -5356,23 +5373,28 @@ mod tests {
             }),
         );
         assert!(
-            send_result.is_ok(),
-            "CONFIRMED: ' Alice' accepted as from_agent despite being invalid as agent name"
+            send_result.is_err(),
+            "FIXED: ' Alice' rejected as from_agent"
         );
+        assert!(send_result
+            .unwrap_err()
+            .contains("leading or trailing whitespace"));
 
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msgs = inbox_messages(&inbox);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(
-            msgs[0]["from_agent"], " Alice",
-            "CONFIRMED: Whitespace-padded from_agent stored as-is"
+        // Trailing whitespace also rejected
+        let send_result2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Alice ",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello"
+            }),
         );
+        assert!(send_result2.is_err(), "FIXED: Trailing whitespace rejected");
     }
 
-    // ── H3 (CONFIRMED): get_inbox agent_name lacks path separator check ──
-    // get_inbox validates empty, length, null, control chars but NOT
-    // path separators or "..". No security impact (DashMap lookup only),
-    // but asymmetric with create_agent's validate_agent_name.
+    // ── H3 (FIXED): get_inbox agent_name now rejects path separators ────
+    // get_inbox validation is now symmetric with create_agent.
     #[tokio::test]
     async fn dr22_h3_get_inbox_accepts_path_separators() {
         let (state, _idx, _repo) = test_post_office();
@@ -5384,23 +5406,27 @@ mod tests {
         );
         assert!(create_result.is_err(), "Path sep rejected in create_agent");
 
-        // But accepted in get_inbox (returns empty inbox, no security impact)
+        // Now also rejected in get_inbox
         let inbox_result = get_inbox(&state, json!({ "agent_name": "foo/bar" }));
         assert!(
-            inbox_result.is_ok(),
-            "CONFIRMED: 'foo/bar' accepted in get_inbox (DashMap lookup only)"
+            inbox_result.is_err(),
+            "FIXED: 'foo/bar' rejected in get_inbox"
         );
-        assert_eq!(
-            inbox_messages(&inbox_result.unwrap()).len(),
-            0,
-            "Empty inbox for non-existent agent"
-        );
+        assert!(inbox_result.unwrap_err().contains("path separators"));
 
-        // ".." also accepted in get_inbox
+        // ".." also rejected in get_inbox
         let inbox_result2 = get_inbox(&state, json!({ "agent_name": "foo..bar" }));
         assert!(
-            inbox_result2.is_ok(),
-            "CONFIRMED: '..' pattern accepted in get_inbox"
+            inbox_result2.is_err(),
+            "FIXED: '..' pattern rejected in get_inbox"
+        );
+        assert!(inbox_result2.unwrap_err().contains("'..'"));
+
+        // Backslash rejected too
+        let inbox_result3 = get_inbox(&state, json!({ "agent_name": "foo\\bar" }));
+        assert!(
+            inbox_result3.is_err(),
+            "FIXED: Backslash rejected in get_inbox"
         );
     }
 
@@ -5436,9 +5462,8 @@ mod tests {
         );
     }
 
-    // ── H5 (CONFIRMED): whitespace-only project_key accepted ─────────────
-    // project_key "   " has no null bytes, no control chars, len=3 < 256.
-    // It passes all validation and creates a valid but meaningless project.
+    // ── H5 (FIXED): whitespace-only project_key rejected ────────────────
+    // project_key "   " is now rejected before reaching UUID generation.
     #[tokio::test]
     async fn dr22_h5_whitespace_only_project_key_accepted() {
         let (state, _idx, _repo) = test_post_office();
@@ -5448,27 +5473,15 @@ mod tests {
             json!({ "project_key": "   ", "name_hint": "Agent1" }),
         );
 
-        // CONFIRMED: Whitespace-only project_key is accepted
+        // FIXED: Whitespace-only project_key is rejected
         assert!(
-            result.is_ok(),
-            "CONFIRMED: Whitespace-only project_key passes all validation"
+            result.is_err(),
+            "FIXED: Whitespace-only project_key is rejected"
         );
-        let resp = result.unwrap();
-        assert!(
-            resp["project_id"].as_str().unwrap().starts_with("proj_"),
-            "Valid project_id generated from whitespace-only key"
-        );
+        assert!(result.unwrap_err().contains("whitespace-only"));
 
-        // It creates a distinct project from empty string
-        let result2 = create_agent(
-            &state,
-            json!({ "project_key": "", "name_hint": "Agent2" }),
-        );
-        assert!(result2.is_ok());
-        assert_ne!(
-            resp["project_id"],
-            result2.unwrap()["project_id"],
-            "Whitespace-only and empty produce different projects"
-        );
+        // Empty string is still accepted (valid edge case — documented in DR7)
+        let result2 = create_agent(&state, json!({ "project_key": "", "name_hint": "Agent2" }));
+        assert!(result2.is_ok(), "Empty project_key still accepted");
     }
 }
