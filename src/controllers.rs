@@ -7,6 +7,9 @@ use tantivy::query::QueryParser;
 use uuid::Uuid;
 
 const MAX_INBOX_SIZE: usize = 10_000;
+const MAX_AGENT_NAME_LEN: usize = 128;
+const MAX_SUBJECT_LEN: usize = 1_024;
+const MAX_BODY_LEN: usize = 65_536; // 64 KB
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -66,6 +69,12 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
 fn validate_agent_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Invalid agent name: must not be empty".to_string());
+    }
+    if name.len() > MAX_AGENT_NAME_LEN {
+        return Err(format!(
+            "Invalid agent name: exceeds {} character limit",
+            MAX_AGENT_NAME_LEN
+        ));
     }
     if name.contains('/') || name.contains('\\') {
         return Err("Invalid agent name: must not contain path separators".to_string());
@@ -190,6 +199,15 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
+    }
+    if subject.len() > MAX_SUBJECT_LEN {
+        return Err(format!(
+            "Subject exceeds {} character limit",
+            MAX_SUBJECT_LEN
+        ));
+    }
+    if body.len() > MAX_BODY_LEN {
+        return Err(format!("Body exceeds {} byte limit", MAX_BODY_LEN));
     }
 
     let message_id = Uuid::new_v4().to_string();
@@ -883,34 +901,40 @@ mod tests {
         );
     }
 
-    // ── H4: No field length limits — very long agent names are accepted ──
+    // ── H4: Field length limits enforced ────────────────────────────────
     #[tokio::test]
-    async fn h4_very_long_agent_name_is_accepted() {
+    async fn h4_long_agent_name_is_rejected() {
         let (state, _idx, _repo) = test_post_office();
-        let long_name = "A".repeat(10_000);
+        let long_name = "A".repeat(super::MAX_AGENT_NAME_LEN + 1);
 
         let result = create_agent(
             &state,
             json!({ "project_key": "test", "name_hint": long_name }),
         );
 
-        // CONFIRMED: No length limit — 10KB name is accepted and stored.
-        // This name will be used as a filesystem path component in git commits.
+        assert!(result.is_err(), "Agent name exceeding limit must be rejected");
         assert!(
-            result.is_ok(),
-            "Very long agent name is accepted (no length limit exists)"
-        );
-        assert!(
-            state.agents.contains_key(&long_name),
-            "10KB name stored in DashMap"
+            result.unwrap_err().contains("character limit"),
+            "Error should mention character limit"
         );
     }
 
-    // ── H4b: Very long message body is accepted ──────────────────────────
     #[tokio::test]
-    async fn h4b_very_long_message_body_is_accepted() {
+    async fn h4_max_length_agent_name_is_accepted() {
         let (state, _idx, _repo) = test_post_office();
-        let huge_body = "X".repeat(1_000_000); // 1MB body
+        let name = "A".repeat(super::MAX_AGENT_NAME_LEN);
+
+        let result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": name }),
+        );
+        assert!(result.is_ok(), "Agent name at exactly the limit should be accepted");
+    }
+
+    #[tokio::test]
+    async fn h4b_long_message_body_is_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+        let huge_body = "X".repeat(super::MAX_BODY_LEN + 1);
 
         let result = send_message(
             &state,
@@ -922,18 +946,32 @@ mod tests {
             }),
         );
 
-        // CONFIRMED: No body size limit at the application layer.
+        assert!(result.is_err(), "Body exceeding limit must be rejected");
         assert!(
-            result.is_ok(),
-            "1MB message body is accepted (no size limit exists)"
+            result.unwrap_err().contains("byte limit"),
+            "Error should mention byte limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn h4c_long_subject_is_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+        let long_subject = "S".repeat(super::MAX_SUBJECT_LEN + 1);
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": long_subject,
+                "body": "ok",
+            }),
         );
 
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msg = &inbox.as_array().unwrap()[0];
-        assert_eq!(
-            msg["body"].as_str().unwrap().len(),
-            1_000_000,
-            "Full 1MB body stored in inbox"
+        assert!(result.is_err(), "Subject exceeding limit must be rejected");
+        assert!(
+            result.unwrap_err().contains("character limit"),
+            "Error should mention character limit"
         );
     }
 

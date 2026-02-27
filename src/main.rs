@@ -5,6 +5,7 @@ mod state;
 
 use crate::state::PostOffice;
 use axum::{
+    extract::DefaultBodyLimit,
     response::IntoResponse,
     routing::{get, post},
     Extension, Json, Router,
@@ -38,7 +39,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/mcp", post(mcp_handler))
-        .layer(Extension(state.clone()));
+        .layer(Extension(state.clone()))
+        .layer(DefaultBodyLimit::max(1_048_576)); // 1 MB request body limit
 
     // Address to bind to
     let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
