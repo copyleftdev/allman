@@ -97,7 +97,7 @@ impl Agent {
             count = messages.len();
             for msg in messages {
                 let from = msg
-                    .get("from")
+                    .get("from_agent")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 let body = msg.get("body").and_then(|v| v.as_str()).unwrap_or("");
