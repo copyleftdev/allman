@@ -85,6 +85,12 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
     if name.contains('\0') {
         return Err("Invalid agent name: must not contain null bytes".to_string());
     }
+    if name.chars().any(|c| c.is_control()) {
+        return Err("Invalid agent name: must not contain control characters".to_string());
+    }
+    if name.trim().is_empty() {
+        return Err("Invalid agent name: must not be whitespace-only".to_string());
+    }
     Ok(())
 }
 
@@ -1081,9 +1087,9 @@ mod tests {
         );
     }
 
-    // ── H10: Whitespace-only and control-char agent names ────────────────
+    // ── H10: Whitespace-only and control-char agent names rejected ──────
     #[tokio::test]
-    async fn h10_whitespace_only_agent_name_is_accepted() {
+    async fn h10_whitespace_only_agent_name_is_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
         let result = create_agent(
@@ -1091,15 +1097,12 @@ mod tests {
             json!({ "project_key": "test", "name_hint": "   " }),
         );
 
-        // CONFIRMED: Whitespace-only names pass validation
-        assert!(
-            result.is_ok(),
-            "Whitespace-only name passes current validation"
-        );
+        assert!(result.is_err(), "Whitespace-only names must be rejected");
+        assert!(result.unwrap_err().contains("whitespace"));
     }
 
     #[tokio::test]
-    async fn h10_control_char_agent_name_is_accepted() {
+    async fn h10_control_char_agent_name_is_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
         let result = create_agent(
@@ -1107,11 +1110,8 @@ mod tests {
             json!({ "project_key": "test", "name_hint": "agent\x07bell" }),
         );
 
-        // CONFIRMED: Control characters (except \0) pass validation
-        assert!(
-            result.is_ok(),
-            "Control character in name passes current validation"
-        );
+        assert!(result.is_err(), "Control characters in names must be rejected");
+        assert!(result.unwrap_err().contains("control"));
     }
 
     // ── H12: Second project_key for same project_id is silently ignored ──
