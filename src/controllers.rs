@@ -17,8 +17,11 @@ const MAX_BODY_LEN: usize = 65_536; // 64 KB
 const MAX_PROGRAM_LEN: usize = 4_096; // 4 KB
 const MAX_MODEL_LEN: usize = 256;
 const MAX_PROJECT_ID_LEN: usize = 256;
+const MAX_QUERY_LEN: usize = 10_240; // 10 KB
 const DEFAULT_INBOX_LIMIT: usize = 100;
 const MAX_INBOX_LIMIT: usize = 1_000;
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+const MAX_SEARCH_LIMIT: usize = 1_000;
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -334,6 +337,12 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("agent_name")
         .and_then(|v| v.as_str())
         .ok_or("Missing agent_name")?;
+    if agent_name.len() > MAX_RECIPIENT_NAME_LEN {
+        return Err(format!(
+            "agent_name exceeds {} byte limit",
+            MAX_RECIPIENT_NAME_LEN
+        ));
+    }
 
     let limit = args
         .get("limit")
@@ -391,11 +400,14 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("Missing query")?;
+    if query_str.len() > MAX_QUERY_LEN {
+        return Err(format!("query exceeds {} byte limit", MAX_QUERY_LEN));
+    }
     let limit = args
         .get("limit")
         .and_then(|v| v.as_i64())
-        .unwrap_or(10)
-        .clamp(1, 1000) as usize;
+        .unwrap_or(DEFAULT_SEARCH_LIMIT as i64)
+        .clamp(1, MAX_SEARCH_LIMIT as i64) as usize;
 
     let index = &state.index;
     let searcher = state.index_reader.searcher();
@@ -3234,19 +3246,23 @@ mod tests {
     // Every other user-facing text input has a MAX_* constant. The query field
     // in search_messages has none — it relies solely on the 1MB Axum body limit.
     #[tokio::test]
-    async fn dr13_h1_search_query_no_length_bound() {
+    async fn dr13_h1_search_query_length_validated() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 100KB query — well within 1MB body limit, no field-level rejection
-        let huge_query = "a".repeat(100_000);
+        // Oversized query must be rejected
+        let huge_query = "a".repeat(super::MAX_QUERY_LEN + 1);
         let result = search_messages(&state, json!({ "query": huge_query }));
 
-        // CONFIRMED: accepted (parse may fail for semantic reasons, but no
-        // explicit length check rejects it before reaching the parser).
-        // A field-level MAX_QUERY_LEN constant should be added.
+        assert!(result.is_err(), "Oversized query must be rejected");
+        assert!(result.unwrap_err().contains("query exceeds"));
+
+        // Boundary test: exactly MAX_QUERY_LEN accepted
+        let ok_query = "a".repeat(super::MAX_QUERY_LEN);
+        let result = search_messages(&state, json!({ "query": ok_query }));
+        // Accepted by length check (may still fail at parse level, which is fine)
         assert!(
             result.is_ok() || result.unwrap_err().starts_with("Query parse error"),
-            "100KB query reaches parser with no length rejection"
+            "Exact boundary must pass length check"
         );
     }
 
@@ -3254,21 +3270,21 @@ mod tests {
     // send_message validates from_agent (MAX_FROM_AGENT_LEN) and recipients
     // (MAX_RECIPIENT_NAME_LEN), but get_inbox does not validate agent_name.
     #[tokio::test]
-    async fn dr13_h2_get_inbox_agent_name_no_length_validation() {
+    async fn dr13_h2_get_inbox_agent_name_length_validated() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 10KB agent_name — no length check
-        let huge_name = "A".repeat(10_000);
+        // Oversized agent_name must be rejected (uses MAX_RECIPIENT_NAME_LEN
+        // because get_inbox reads inboxes keyed by recipient name from send_message)
+        let huge_name = "A".repeat(super::MAX_RECIPIENT_NAME_LEN + 1);
         let result = get_inbox(&state, json!({ "agent_name": huge_name }));
 
-        // CONFIRMED: accepted — returns empty inbox, no length rejection.
-        assert!(
-            result.is_ok(),
-            "10KB agent_name accepted — no explicit bound"
-        );
-        let resp = result.unwrap();
-        let msgs = inbox_messages(&resp);
-        assert!(msgs.is_empty());
+        assert!(result.is_err(), "Oversized agent_name must be rejected");
+        assert!(result.unwrap_err().contains("agent_name exceeds"));
+
+        // Boundary test: exactly MAX_RECIPIENT_NAME_LEN accepted
+        let ok_name = "A".repeat(super::MAX_RECIPIENT_NAME_LEN);
+        let result = get_inbox(&state, json!({ "agent_name": ok_name }));
+        assert!(result.is_ok(), "Exact boundary must be accepted");
     }
 
     // ── H3 (DISPROVED): from_agent with null bytes causes corruption ────────
@@ -3323,10 +3339,10 @@ mod tests {
     // search_messages uses inline 10 and 1000. Behavior is correct but naming
     // is inconsistent. This test documents the current behavior.
     #[tokio::test]
-    async fn dr13_h5_search_limit_magic_numbers_behavior() {
+    async fn dr13_h5_search_limit_uses_named_constants() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Default limit (no param) = 10
+        // Default limit uses DEFAULT_SEARCH_LIMIT
         let result = search_messages(&state, json!({ "query": "hello" })).unwrap();
         assert!(result.as_array().is_some(), "Default limit returns array");
 
@@ -3334,8 +3350,15 @@ mod tests {
         let result = search_messages(&state, json!({ "query": "hello", "limit": -5 })).unwrap();
         assert!(result.as_array().is_some(), "Negative limit clamped to 1");
 
-        // Huge limit clamped to 1000
-        let result = search_messages(&state, json!({ "query": "hello", "limit": 999999 })).unwrap();
-        assert!(result.as_array().is_some(), "Huge limit clamped to 1000");
+        // Huge limit clamped to MAX_SEARCH_LIMIT
+        let result = search_messages(
+            &state,
+            json!({ "query": "hello", "limit": (super::MAX_SEARCH_LIMIT + 999) }),
+        )
+        .unwrap();
+        assert!(
+            result.as_array().is_some(),
+            "Huge limit clamped to MAX_SEARCH_LIMIT"
+        );
     }
 }
