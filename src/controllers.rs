@@ -11,10 +11,12 @@ const MAX_AGENT_NAME_LEN: usize = 128;
 const MAX_FROM_AGENT_LEN: usize = 256;
 const MAX_PROJECT_KEY_LEN: usize = 256;
 const MAX_RECIPIENTS: usize = 100;
+const MAX_RECIPIENT_NAME_LEN: usize = 256;
 const MAX_SUBJECT_LEN: usize = 1_024;
 const MAX_BODY_LEN: usize = 65_536; // 64 KB
 const MAX_PROGRAM_LEN: usize = 4_096; // 4 KB
 const MAX_MODEL_LEN: usize = 256;
+const MAX_PROJECT_ID_LEN: usize = 256;
 const DEFAULT_INBOX_LIMIT: usize = 100;
 const MAX_INBOX_LIMIT: usize = 1_000;
 
@@ -243,6 +245,14 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
             MAX_RECIPIENTS
         ));
     }
+    for recipient in &to_agents {
+        if recipient.len() > MAX_RECIPIENT_NAME_LEN {
+            return Err(format!(
+                "Recipient name exceeds {} byte limit",
+                MAX_RECIPIENT_NAME_LEN
+            ));
+        }
+    }
     if subject.len() > MAX_SUBJECT_LEN {
         return Err(format!(
             "Subject exceeds {} character limit",
@@ -251,6 +261,12 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
     if body.len() > MAX_BODY_LEN {
         return Err(format!("Body exceeds {} byte limit", MAX_BODY_LEN));
+    }
+    if project_id.len() > MAX_PROJECT_ID_LEN {
+        return Err(format!(
+            "project_id exceeds {} byte limit",
+            MAX_PROJECT_ID_LEN
+        ));
     }
 
     let message_id = Uuid::new_v4().to_string();
@@ -2232,9 +2248,12 @@ mod tests {
     async fn dr7_h2_long_recipient_names_dont_amplify() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 1KB recipient names × 10 recipients — names are DashMap keys only
+        // Max-length recipient names × 10 recipients — names are DashMap keys only
         let recipients: Vec<String> = (0..10)
-            .map(|i| format!("{}{}", "R".repeat(1000), i))
+            .map(|i| {
+                let base = "R".repeat(super::MAX_RECIPIENT_NAME_LEN - 2);
+                format!("{}{:02}", base, i)
+            })
             .collect();
 
         let result = send_message(
@@ -2246,7 +2265,7 @@ mod tests {
                 "body": "hello",
             }),
         );
-        assert!(result.is_ok(), "Long recipient names are accepted");
+        assert!(result.is_ok(), "Max-length recipient names are accepted");
 
         // Verify each got exactly one message with normal-sized content
         let inbox = get_inbox(&state, json!({ "agent_name": &recipients[0] })).unwrap();
@@ -3011,5 +3030,199 @@ mod tests {
             !state.inboxes.contains_key("target"),
             "Exact boundary must trigger full drain + DashMap entry removal"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #12 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (FIXED): Recipient names bounded by MAX_RECIPIENT_NAME_LEN ───
+    // Every name-like field now has a MAX_* constant. Individual recipient
+    // names are capped at 256 bytes to prevent oversized DashMap keys.
+    #[tokio::test]
+    async fn dr12_h1_recipient_name_length_validated() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Exceeding MAX_RECIPIENT_NAME_LEN (256) must be rejected
+        let huge_name = "R".repeat(super::MAX_RECIPIENT_NAME_LEN + 1);
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [huge_name],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_err(), "Oversized recipient name must be rejected");
+        assert!(result.unwrap_err().contains("Recipient name exceeds"));
+
+        // No DashMap entry created
+        assert!(
+            !state.inboxes.contains_key(&huge_name),
+            "No DashMap key for rejected recipient"
+        );
+
+        // At the boundary: exactly MAX_RECIPIENT_NAME_LEN accepted
+        let ok_name = "R".repeat(super::MAX_RECIPIENT_NAME_LEN);
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [ok_name],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_ok(), "Exact boundary must be accepted");
+
+        let inbox = get_inbox(&state, json!({ "agent_name": ok_name })).unwrap();
+        assert_eq!(inbox_messages(&inbox).len(), 1);
+    }
+
+    // ── H2 (CONFIRMED): project_id in send_message has no length bound ────
+    // project_id is a freeform string sent to Tantivy via persist channel.
+    // No DashMap impact, but no explicit bound either.
+    #[tokio::test]
+    async fn dr12_h2_send_message_project_id_length_validated() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Oversized project_id must be rejected
+        let huge_project_id = "P".repeat(super::MAX_PROJECT_ID_LEN + 1);
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello",
+                "project_id": huge_project_id,
+            }),
+        );
+
+        assert!(result.is_err(), "Oversized project_id must be rejected");
+        assert!(result.unwrap_err().contains("project_id exceeds"));
+
+        // Boundary test: exactly MAX_PROJECT_ID_LEN accepted
+        let ok_project_id = "P".repeat(super::MAX_PROJECT_ID_LEN);
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello",
+                "project_id": ok_project_id,
+            }),
+        );
+        assert!(result.is_ok(), "Exact boundary must be accepted");
+    }
+
+    // ── H3 (DISPROVED): Default "AnonymousAgent" cross-project collision ──
+    // Multiple create_agent calls without name_hint all default to
+    // "AnonymousAgent". Cross-project collision is correctly rejected.
+    #[tokio::test]
+    async fn dr12_h3_anonymous_agent_cross_project_collision() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // First project registers AnonymousAgent
+        let r1 = create_agent(&state, json!({ "project_key": "proj_a" }));
+        assert!(r1.is_ok());
+        assert_eq!(r1.unwrap()["name"], "AnonymousAgent");
+
+        // Second project tries same default name — must be rejected
+        let r2 = create_agent(&state, json!({ "project_key": "proj_b" }));
+        assert!(
+            r2.is_err(),
+            "Cross-project collision on default AnonymousAgent must be rejected"
+        );
+        assert!(r2.unwrap_err().contains("already registered"));
+
+        // Same project re-registration succeeds (upsert)
+        let r3 = create_agent(&state, json!({ "project_key": "proj_a" }));
+        assert!(
+            r3.is_ok(),
+            "Same-project upsert on AnonymousAgent must succeed"
+        );
+    }
+
+    // ── H4 (DISPROVED): get_inbox limit=1 drains exactly one message ──────
+    // Minimum clamp value drains exactly 1 message and reports correct remaining.
+    #[tokio::test]
+    async fn dr12_h4_get_inbox_limit_one() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send 5 messages
+        for i in 0..5 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": format!("sender_{}", i),
+                    "to": ["target"],
+                    "subject": format!("msg {}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Drain with limit=1
+        let r = get_inbox(&state, json!({ "agent_name": "target", "limit": 1 })).unwrap();
+        assert_eq!(inbox_messages(&r).len(), 1, "Exactly 1 message returned");
+        assert_eq!(r["remaining"], 4, "4 remaining");
+
+        // The one returned should be the first (FIFO)
+        assert_eq!(inbox_messages(&r)[0]["from"], "sender_0");
+
+        // Subsequent calls continue from where we left off
+        let r2 = get_inbox(&state, json!({ "agent_name": "target", "limit": 1 })).unwrap();
+        assert_eq!(inbox_messages(&r2)[0]["from"], "sender_1");
+        assert_eq!(r2["remaining"], 3);
+    }
+
+    // ── H5 (DISPROVED): Max-length fields simultaneously succeeds ─────────
+    // from_agent=256, subject=1024, body=65536, 100 recipients all at once.
+    #[tokio::test]
+    async fn dr12_h5_max_fields_combined() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let max_from = "F".repeat(super::MAX_FROM_AGENT_LEN);
+        let max_subject = "S".repeat(super::MAX_SUBJECT_LEN);
+        let max_body = "B".repeat(super::MAX_BODY_LEN);
+        let recipients: Vec<String> = (0..super::MAX_RECIPIENTS)
+            .map(|i| format!("agent_{}", i))
+            .collect();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": max_from,
+                "to": recipients,
+                "subject": max_subject,
+                "body": max_body,
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "All fields at max length must succeed together"
+        );
+
+        // Verify first and last recipient got correctly-formed messages
+        for idx in [0, 99] {
+            let inbox =
+                get_inbox(&state, json!({ "agent_name": format!("agent_{}", idx) })).unwrap();
+            let msgs = inbox_messages(&inbox);
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(
+                msgs[0]["from"].as_str().unwrap().len(),
+                super::MAX_FROM_AGENT_LEN
+            );
+            assert_eq!(
+                msgs[0]["subject"].as_str().unwrap().len(),
+                super::MAX_SUBJECT_LEN
+            );
+            assert_eq!(msgs[0]["body"].as_str().unwrap().len(), super::MAX_BODY_LEN);
+        }
     }
 }
