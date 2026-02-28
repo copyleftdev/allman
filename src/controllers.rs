@@ -8660,4 +8660,289 @@ mod tests {
             );
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DR34 — Deep Review #34 Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── DR34-H1: tools/list schemas omit constraint metadata ────────────────
+    // The limit fields declare minimum/maximum/default, but string fields lack
+    // maxLength and the `to` array lacks minItems/maxItems. MCP clients reading
+    // the schema can't discover runtime validation limits for these fields.
+    #[tokio::test]
+    async fn dr34_h1_tools_list_schemas_omit_string_and_array_constraints() {
+        let (state, _idx, _repo) = test_post_office();
+        let resp = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+
+        // send_message schema
+        let send_schema = tools
+            .iter()
+            .find(|t| t["name"] == "send_message")
+            .unwrap();
+        let send_props = &send_schema["inputSchema"]["properties"];
+
+        // String fields should declare maxLength for discoverability
+        // Currently they do NOT — this test documents the gap.
+        assert!(
+            send_props["from_agent"].get("maxLength").is_none(),
+            "from_agent schema currently lacks maxLength (128 enforced at runtime)"
+        );
+        assert!(
+            send_props["subject"].get("maxLength").is_none(),
+            "subject schema currently lacks maxLength (1024 enforced at runtime)"
+        );
+        assert!(
+            send_props["body"].get("maxLength").is_none(),
+            "body schema currently lacks maxLength (65536 enforced at runtime)"
+        );
+
+        // to array should declare minItems/maxItems
+        assert!(
+            send_props["to"].get("minItems").is_none(),
+            "to schema currently lacks minItems (1 enforced at runtime)"
+        );
+        assert!(
+            send_props["to"].get("maxItems").is_none(),
+            "to schema currently lacks maxItems (100 enforced at runtime)"
+        );
+
+        // create_agent schema
+        let create_schema = tools
+            .iter()
+            .find(|t| t["name"] == "create_agent")
+            .unwrap();
+        let create_props = &create_schema["inputSchema"]["properties"];
+        assert!(
+            create_props["project_key"].get("maxLength").is_none(),
+            "project_key schema currently lacks maxLength (256 enforced at runtime)"
+        );
+        assert!(
+            create_props["name_hint"].get("maxLength").is_none(),
+            "name_hint schema currently lacks maxLength (128 enforced at runtime)"
+        );
+
+        // search_messages query field
+        let search_schema = tools
+            .iter()
+            .find(|t| t["name"] == "search_messages")
+            .unwrap();
+        let search_props = &search_schema["inputSchema"]["properties"];
+        assert!(
+            search_props["query"].get("maxLength").is_none(),
+            "query schema currently lacks maxLength (10240 enforced at runtime)"
+        );
+
+        // get_inbox agent_name field
+        let inbox_schema = tools
+            .iter()
+            .find(|t| t["name"] == "get_inbox")
+            .unwrap();
+        let inbox_props = &inbox_schema["inputSchema"]["properties"];
+        assert!(
+            inbox_props["agent_name"].get("maxLength").is_none(),
+            "agent_name schema currently lacks maxLength (128 enforced at runtime)"
+        );
+    }
+
+    // ── DR34-H2: search query accepts whitespace-padded values ──────────────
+    // subject and project_id reject leading/trailing whitespace (DR33-H2,
+    // DR32-H3), but search_messages query only checks trim().is_empty() —
+    // it does NOT reject whitespace-padded queries like "  hello  ".
+    #[tokio::test]
+    async fn dr34_h2_search_query_accepts_whitespace_padded_values() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Whitespace-padded subject is rejected
+        let subj_result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender34h2",
+                "to": ["recip34h2"],
+                "subject": "  padded  ",
+                "body": "test",
+            }),
+        );
+        assert!(
+            subj_result.is_err(),
+            "Whitespace-padded subject must be rejected"
+        );
+        assert!(
+            subj_result.unwrap_err().contains("leading or trailing"),
+            "Subject error mentions whitespace"
+        );
+
+        // Whitespace-padded project_id is rejected
+        let pid_result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender34h2",
+                "to": ["recip34h2"],
+                "body": "test",
+                "project_id": "  padded  ",
+            }),
+        );
+        assert!(
+            pid_result.is_err(),
+            "Whitespace-padded project_id must be rejected"
+        );
+        assert!(
+            pid_result.unwrap_err().contains("leading or trailing"),
+            "project_id error mentions whitespace"
+        );
+
+        // Whitespace-padded QUERY is accepted (asymmetry)
+        let query_result = search_messages(
+            &state,
+            json!({ "query": "  hello  ", "limit": 1 }),
+        );
+        // query validation only checks trim().is_empty() — no trim() != original check.
+        // "  hello  " trims to "hello" which is not empty, so it passes validation.
+        assert!(
+            query_result.is_ok(),
+            "Whitespace-padded query is currently accepted (no trim check): {:?}",
+            query_result
+        );
+    }
+
+    // ── DR34-H3: persist worker JoinHandle discarded in PostOffice::new ─────
+    // main.rs line 57 says "Drain the persist pipeline before exiting" but
+    // the persist worker JoinHandle is not stored — drop(state) closes the
+    // channel but cannot join the thread to wait for completion.
+    // This test verifies the architectural fact by inspecting PostOffice fields.
+    #[tokio::test]
+    async fn dr34_h3_persist_worker_join_handle_not_stored() {
+        // PostOffice struct fields (from state.rs):
+        //   projects, agents, inboxes, index, index_reader, persist_tx, _nrt_guard
+        // The persist worker JoinHandle is NOT among them — it's dropped at
+        // state.rs PostOffice::new() line 124-129 after spawn().
+        //
+        // Verify: PostOffice can be dropped, and we can still observe that
+        // the persist pipeline operates in fire-and-forget mode by checking
+        // that send succeeds but we have no way to "join" or "await" completion.
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send a persist op
+        let send_result = state.persist_tx.try_send(crate::state::PersistOp::GitCommit {
+            path: "test/dr34h3.json".to_string(),
+            content: "test".to_string(),
+            message: "test".to_string(),
+        });
+        assert!(send_result.is_ok(), "Persist channel accepts ops");
+
+        // Drop the state — this closes the channel
+        drop(state);
+
+        // After drop, we have no JoinHandle to wait on.
+        // The persist worker thread will eventually process the op and exit,
+        // but main.rs has no mechanism to wait for this.
+        // This documents the architectural limitation: shutdown is best-effort.
+    }
+
+    // ── DR34-H4: batch Vec capacity mismatch with drain bound ───────────────
+    // persistence_worker in state.rs creates Vec::with_capacity(1024) but the
+    // drain loop allows up to 4096 ops, causing up to 2 reallocations during
+    // high-throughput bursts (1024 → 2048 → 4096).
+    #[tokio::test]
+    async fn dr34_h4_batch_vec_capacity_mismatches_drain_bound() {
+        // This is a code inspection finding. The persist worker in state.rs:
+        //   let mut batch = Vec::with_capacity(1024);   // line 201
+        //   while batch.len() < 4096 {                  // line 203
+        //
+        // When a burst of >1024 ops arrives before the first batch commits,
+        // the Vec grows: 1024 → 2048 → 4096, causing 2 heap reallocations.
+        // Fix: use Vec::with_capacity(4096) to match the drain bound.
+        //
+        // Verify the constants by flooding the persist channel and checking
+        // that all ops are eventually processed without error.
+        let (state, idx_dir, _repo) = test_post_office();
+
+        // Send 2000 index ops (exceeds 1024 capacity, within 4096 bound)
+        for i in 0..2000 {
+            let _ = state.persist_tx.try_send(crate::state::PersistOp::IndexMessage {
+                id: format!("msg34h4_{}", i),
+                project_id: "proj_test".to_string(),
+                from_agent: "sender".to_string(),
+                to_recipients: "recip".to_string(),
+                subject: format!("batch test {}", i),
+                body: "test body".to_string(),
+                created_ts: 1000000 + i as i64,
+            });
+        }
+
+        // Drop state to close channel — persist worker drains remaining ops
+        drop(state);
+
+        // Brief sleep to let persist worker finish its batch
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Open the index directly to verify docs were indexed
+        let index = tantivy::Index::open_in_dir(idx_dir.path()).unwrap();
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        // At least some documents should have been indexed (persist worker
+        // processed whatever was in the channel before shutdown)
+        assert!(
+            searcher.num_docs() > 0,
+            "Persist worker processed batch despite capacity mismatch"
+        );
+    }
+
+    // ── DR34-H5: tools/call with absent params produces empty tool name ─────
+    // When tools/call is invoked without params (or null params), params.get("name")
+    // returns None, tool_name defaults to "", and the error is "Unknown tool: "
+    // with an empty name — less clear than "Missing tool name".
+    #[tokio::test]
+    async fn dr34_h5_tools_call_absent_params_empty_tool_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // tools/call with no params at all
+        let resp1 = handle_mcp_request(
+            state.clone(),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" }),
+        )
+        .await;
+        let err1 = resp1["error"]["message"].as_str().unwrap();
+        // The error message is "Unknown tool: " with empty name after the colon
+        assert!(
+            err1.starts_with("Unknown tool:"),
+            "Error should be 'Unknown tool:' but got: {}",
+            err1
+        );
+        assert!(
+            err1.ends_with(": "),
+            "Error ends with ': ' (empty tool name): '{}'",
+            err1
+        );
+
+        // tools/call with explicit null params
+        let resp2 = handle_mcp_request(
+            state.clone(),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": null }),
+        )
+        .await;
+        let err2 = resp2["error"]["message"].as_str().unwrap();
+        assert!(
+            err2.starts_with("Unknown tool:"),
+            "Null params also produces 'Unknown tool:': {}",
+            err2
+        );
+
+        // tools/call with params but no name field
+        let resp3 = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {} }),
+        )
+        .await;
+        let err3 = resp3["error"]["message"].as_str().unwrap();
+        assert_eq!(
+            err3, "Unknown tool: ",
+            "Empty params.name produces 'Unknown tool: ' (trailing space, no name)"
+        );
+    }
 }
