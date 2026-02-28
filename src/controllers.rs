@@ -10,7 +10,6 @@ const MAX_INBOX_SIZE: usize = 10_000;
 const MAX_AGENT_NAME_LEN: usize = 128;
 const MAX_PROJECT_KEY_LEN: usize = 256;
 const MAX_RECIPIENTS: usize = 100;
-const MAX_RECIPIENT_NAME_LEN: usize = 256;
 const MAX_SUBJECT_LEN: usize = 1_024;
 const MAX_BODY_LEN: usize = 65_536; // 64 KB
 const MAX_PROGRAM_LEN: usize = 4_096; // 4 KB
@@ -250,11 +249,30 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let name_hint = args.get("name_hint").and_then(|v| v.as_str());
+    // Validate name_hint type: if present and non-null, MUST be a string.
+    // Silently falling back to "AnonymousAgent" for non-string values (e.g.,
+    // integers, booleans) causes confusing cross-project collisions (DR27-H5).
+    let name_hint = match args.get("name_hint") {
+        Some(v) if v.is_null() => None, // explicit null treated as absent
+        Some(v) => Some(v.as_str().ok_or("name_hint must be a string if provided")?),
+        None => None,
+    };
 
     // Validate all inputs BEFORE mutating any state.
+    if program.contains('\0') {
+        return Err("program must not contain null bytes".to_string());
+    }
+    if program.chars().any(|c| c.is_control()) {
+        return Err("program must not contain control characters".to_string());
+    }
     if program.len() > MAX_PROGRAM_LEN {
         return Err(format!("program exceeds {} byte limit", MAX_PROGRAM_LEN));
+    }
+    if model.contains('\0') {
+        return Err("model must not contain null bytes".to_string());
+    }
+    if model.chars().any(|c| c.is_control()) {
+        return Err("model must not contain control characters".to_string());
     }
     if model.len() > MAX_MODEL_LEN {
         return Err(format!("model exceeds {} byte limit", MAX_MODEL_LEN));
@@ -277,9 +295,10 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
     // across the collision check and the insert/update, eliminating the
     // TOCTOU race that existed with separate get() + insert().
-    let registered_at = Utc::now().timestamp();
+    let now = Utc::now().timestamp();
 
     let agent_id;
+    let registered_at;
 
     match state.agents.entry(name.clone()) {
         dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -290,8 +309,10 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
                 ));
             }
             // Same project — idempotent upsert. Preserve the original agent_id
-            // so external systems caching IDs remain valid (DR26-H2).
+            // and registered_at so the identity is stable across re-registrations
+            // (DR26-H2, DR27-H3).
             agent_id = occ.get().id.clone();
+            registered_at = occ.get().registered_at;
             let record = AgentRecord {
                 id: agent_id.clone(),
                 project_id: project_id.clone(),
@@ -304,6 +325,7 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         }
         dashmap::mapref::entry::Entry::Vacant(vac) => {
             agent_id = Uuid::new_v4().to_string();
+            registered_at = now;
             let record = AgentRecord {
                 id: agent_id.clone(),
                 project_id: project_id.clone(),
@@ -424,10 +446,12 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         ));
     }
     for recipient in &to_agents {
-        if recipient.len() > MAX_RECIPIENT_NAME_LEN {
+        // Aligned with MAX_AGENT_NAME_LEN so recipient names can always be
+        // registered as agents and drained via get_inbox (DR27-H2).
+        if recipient.len() > MAX_AGENT_NAME_LEN {
             return Err(format!(
                 "Recipient name exceeds {} byte limit",
-                MAX_RECIPIENT_NAME_LEN
+                MAX_AGENT_NAME_LEN
             ));
         }
         if recipient.contains('\0') {
@@ -545,19 +569,25 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     // atomic guard to handle concurrent races — if a concurrent send filled
     // an inbox between pre-check and delivery, the entry() block skips the
     // push instead of overshooting MAX_INBOX_SIZE (DR26-H4).
+    // Track delivered count so callers know if any recipients were silently
+    // skipped due to concurrent races (DR27-H4).
+    let mut delivered_count = 0usize;
     for recipient in &to_agents {
-        state
-            .inboxes
-            .entry(recipient.clone())
-            .and_modify(|inbox| {
+        match state.inboxes.entry(recipient.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                let inbox = occ.get_mut();
                 if inbox.len() < MAX_INBOX_SIZE {
                     inbox.push(entry.clone());
+                    delivered_count += 1;
                 }
                 // Else: concurrent race filled this inbox after pre-check.
-                // Silently skip — acceptable since races are rare and the
-                // alternative (overshooting the cap) is worse.
-            })
-            .or_insert_with(|| vec![entry.clone()]);
+                // Silently skip — the delivered_count will reflect the miss.
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                vac.insert(vec![entry.clone()]);
+                delivered_count += 1;
+            }
+        }
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
@@ -577,7 +607,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         );
     }
 
-    Ok(json!({ "id": message_id, "status": "sent" }))
+    Ok(json!({ "id": message_id, "status": "sent", "delivered_count": delivered_count }))
 }
 
 // ── get_inbox ────────────────────────────────────────────────────────────────
@@ -592,10 +622,12 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
     if agent_name.is_empty() {
         return Err("agent_name must not be empty".to_string());
     }
-    if agent_name.len() > MAX_RECIPIENT_NAME_LEN {
+    // Aligned with MAX_AGENT_NAME_LEN for consistency with create_agent
+    // and send_message recipient validation (DR27-H2).
+    if agent_name.len() > MAX_AGENT_NAME_LEN {
         return Err(format!(
             "agent_name exceeds {} byte limit",
-            MAX_RECIPIENT_NAME_LEN
+            MAX_AGENT_NAME_LEN
         ));
     }
     if agent_name.contains('\0') {
@@ -2572,7 +2604,7 @@ mod tests {
         // Max-length recipient names × 10 recipients — names are DashMap keys only
         let recipients: Vec<String> = (0..10)
             .map(|i| {
-                let base = "R".repeat(super::MAX_RECIPIENT_NAME_LEN - 2);
+                let base = "R".repeat(super::MAX_AGENT_NAME_LEN - 2);
                 format!("{}{:02}", base, i)
             })
             .collect();
@@ -3377,15 +3409,15 @@ mod tests {
     // Deep Review #12 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H1 (FIXED): Recipient names bounded by MAX_RECIPIENT_NAME_LEN ───
+    // ── H1 (FIXED): Recipient names bounded by MAX_AGENT_NAME_LEN ───
     // Every name-like field now has a MAX_* constant. Individual recipient
-    // names are capped at 256 bytes to prevent oversized DashMap keys.
+    // names are capped at 128 bytes (aligned with agent name limit, DR27-H2).
     #[tokio::test]
     async fn dr12_h1_recipient_name_length_validated() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Exceeding MAX_RECIPIENT_NAME_LEN (256) must be rejected
-        let huge_name = "R".repeat(super::MAX_RECIPIENT_NAME_LEN + 1);
+        // Exceeding MAX_AGENT_NAME_LEN (128) must be rejected
+        let huge_name = "R".repeat(super::MAX_AGENT_NAME_LEN + 1);
         let result = send_message(
             &state,
             json!({
@@ -3404,8 +3436,8 @@ mod tests {
             "No DashMap key for rejected recipient"
         );
 
-        // At the boundary: exactly MAX_RECIPIENT_NAME_LEN accepted
-        let ok_name = "R".repeat(super::MAX_RECIPIENT_NAME_LEN);
+        // At the boundary: exactly MAX_AGENT_NAME_LEN (128) accepted
+        let ok_name = "R".repeat(super::MAX_AGENT_NAME_LEN);
         let result = send_message(
             &state,
             json!({
@@ -3597,22 +3629,21 @@ mod tests {
     }
 
     // ── H2 (CONFIRMED): get_inbox agent_name has no length validation ───────
-    // send_message validates from_agent (MAX_FROM_AGENT_LEN) and recipients
-    // (MAX_RECIPIENT_NAME_LEN), but get_inbox does not validate agent_name.
+    // All name-like fields now use MAX_AGENT_NAME_LEN (128) for consistency
+    // (DR27-H2). get_inbox agent_name is aligned with create_agent and send_message.
     #[tokio::test]
     async fn dr13_h2_get_inbox_agent_name_length_validated() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Oversized agent_name must be rejected (uses MAX_RECIPIENT_NAME_LEN
-        // because get_inbox reads inboxes keyed by recipient name from send_message)
-        let huge_name = "A".repeat(super::MAX_RECIPIENT_NAME_LEN + 1);
+        // Oversized agent_name must be rejected (MAX_AGENT_NAME_LEN = 128)
+        let huge_name = "A".repeat(super::MAX_AGENT_NAME_LEN + 1);
         let result = get_inbox(&state, json!({ "agent_name": huge_name }));
 
         assert!(result.is_err(), "Oversized agent_name must be rejected");
         assert!(result.unwrap_err().contains("agent_name exceeds"));
 
-        // Boundary test: exactly MAX_RECIPIENT_NAME_LEN accepted
-        let ok_name = "A".repeat(super::MAX_RECIPIENT_NAME_LEN);
+        // Boundary test: exactly MAX_AGENT_NAME_LEN accepted
+        let ok_name = "A".repeat(super::MAX_AGENT_NAME_LEN);
         let result = get_inbox(&state, json!({ "agent_name": ok_name }));
         assert!(result.is_ok(), "Exact boundary must be accepted");
     }
@@ -6599,6 +6630,259 @@ mod tests {
         assert!(
             send_result.unwrap_err().contains("128"),
             "Error references the aligned limit of 128"
+        );
+    }
+
+    // ── DR27 Hypotheses ─────────────────────────────────────────────────────
+
+    // DR27-H1 (FIXED): program and model fields now validate for null bytes
+    // and control characters, consistent with all other string fields.
+    #[tokio::test]
+    async fn dr27_h1_program_model_reject_null_bytes_and_control_chars() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // program with null byte — now rejected
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "Agent1",
+                "program": "v1\u{0000}evil",
+                "model": "clean"
+            }),
+        );
+        assert!(r1.is_err(), "program with null byte must be rejected");
+        assert!(r1
+            .unwrap_err()
+            .contains("program must not contain null bytes"));
+
+        // model with control char — now rejected
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "Agent2",
+                "program": "clean",
+                "model": "gpt\u{0001}bad"
+            }),
+        );
+        assert!(r2.is_err(), "model with control char must be rejected");
+        assert!(r2
+            .unwrap_err()
+            .contains("model must not contain control characters"));
+
+        // project_key with null byte also rejected (consistent)
+        let r3 = create_agent(
+            &state,
+            json!({
+                "project_key": "test\u{0000}bad",
+                "name_hint": "Agent3"
+            }),
+        );
+        assert!(
+            r3.is_err(),
+            "project_key with null byte is correctly rejected"
+        );
+    }
+
+    // DR27-H2 (FIXED): Recipient name limit and get_inbox agent_name limit
+    // are now aligned with MAX_AGENT_NAME_LEN (128). All name-like fields
+    // use the same limit so names that can be sent to can always be registered.
+    #[tokio::test]
+    async fn dr27_h2_recipient_name_limit_aligned_with_agent_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 200-char recipient — now rejected (limit 128, not 256)
+        let long_recipient: String = "R".repeat(200);
+        let send_result = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": [long_recipient],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            send_result.is_err(),
+            "200-char recipient now rejected (limit 128)"
+        );
+        assert!(send_result.unwrap_err().contains("Recipient name exceeds"));
+
+        // Also rejected by create_agent (same limit)
+        let create_result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": long_recipient }),
+        );
+        assert!(
+            create_result.is_err(),
+            "200-char name rejected by create_agent (limit 128)"
+        );
+
+        // Also rejected by get_inbox (same limit now)
+        let inbox_result = get_inbox(&state, json!({ "agent_name": long_recipient }));
+        assert!(
+            inbox_result.is_err(),
+            "200-char agent_name now rejected by get_inbox (limit 128)"
+        );
+
+        // At the boundary: exactly 128 chars works everywhere
+        let ok_name = "R".repeat(128);
+        let send_ok = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": [ok_name],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(send_ok.is_ok(), "128-char recipient accepted");
+        let inbox_ok = get_inbox(&state, json!({ "agent_name": ok_name }));
+        assert!(
+            inbox_ok.is_ok(),
+            "128-char agent_name accepted by get_inbox"
+        );
+    }
+
+    // DR27-H3 (FIXED): create_agent upsert now preserves BOTH agent_id
+    // AND registered_at. The field correctly reflects first registration time.
+    #[tokio::test]
+    async fn dr27_h3_upsert_preserves_registered_at_and_id() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice", "program": "v1" }),
+        )
+        .unwrap();
+
+        let ts1 = r1["registered_at"].as_i64().unwrap();
+
+        // Small delay to ensure different timestamp if it were to change
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice", "program": "v2" }),
+        )
+        .unwrap();
+
+        let ts2 = r2["registered_at"].as_i64().unwrap();
+
+        // agent_id is stable (DR26-H2)
+        assert_eq!(
+            r1["id"], r2["id"],
+            "agent_id preserved across re-registrations"
+        );
+
+        // registered_at is now stable too (DR27-H3)
+        assert_eq!(
+            ts1, ts2,
+            "registered_at preserved on upsert — reflects first registration time"
+        );
+    }
+
+    // DR27-H4 (FIXED): send_message response now includes delivered_count
+    // so callers can detect if any recipients were silently skipped due to
+    // concurrent inbox cap races.
+    #[tokio::test]
+    async fn dr27_h4_send_response_includes_delivered_count() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Normal send to 3 recipients
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": ["A", "B", "C"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(r1["status"].as_str().unwrap(), "sent");
+        assert!(r1.get("id").is_some(), "Has message id");
+
+        // delivered_count now present and equals recipient count
+        assert_eq!(
+            r1["delivered_count"].as_u64().unwrap(),
+            3,
+            "delivered_count matches number of recipients"
+        );
+
+        // Single recipient
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": ["D"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        )
+        .unwrap();
+        assert_eq!(r2["delivered_count"].as_u64().unwrap(), 1);
+    }
+
+    // DR27-H5 (FIXED): Non-string name_hint now returns a clear error
+    // instead of silently falling back to "AnonymousAgent".
+    #[tokio::test]
+    async fn dr27_h5_nonstring_name_hint_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Integer name_hint — now rejected with clear error
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "project_a",
+                "name_hint": 12345
+            }),
+        );
+        assert!(r1.is_err(), "Non-string name_hint must be rejected");
+        assert!(
+            r1.unwrap_err().contains("name_hint must be a string"),
+            "Error message explains the type requirement"
+        );
+
+        // Boolean name_hint — also rejected
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "project_b",
+                "name_hint": true
+            }),
+        );
+        assert!(r2.is_err(), "Boolean name_hint must be rejected");
+
+        // Null name_hint — treated as absent, defaults to AnonymousAgent
+        let r3 = create_agent(
+            &state,
+            json!({
+                "project_key": "project_a",
+                "name_hint": null
+            }),
+        );
+        assert!(r3.is_ok(), "Null name_hint treated as absent");
+        assert_eq!(
+            r3.unwrap()["name"].as_str().unwrap(),
+            "AnonymousAgent",
+            "Null name_hint defaults to AnonymousAgent"
+        );
+
+        // Missing name_hint — also defaults to AnonymousAgent (same project = idempotent)
+        let r4 = create_agent(
+            &state,
+            json!({
+                "project_key": "project_a"
+            }),
+        );
+        assert!(r4.is_ok(), "Missing name_hint defaults to AnonymousAgent");
+        assert_eq!(
+            r4.unwrap()["name"].as_str().unwrap(),
+            "AnonymousAgent",
+            "Missing name_hint defaults to AnonymousAgent"
         );
     }
 }
