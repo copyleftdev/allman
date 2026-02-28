@@ -5484,4 +5484,232 @@ mod tests {
         let result2 = create_agent(&state, json!({ "project_key": "", "name_hint": "Agent2" }));
         assert!(result2.is_ok(), "Empty project_key still accepted");
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #23 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── H1 (CONFIRMED): Whitespace-padded recipients create undrainable inboxes ──
+    // send_message validates recipients for null bytes, control chars, path
+    // separators, and ".." — but does NOT check for whitespace trim.
+    // get_inbox DOES reject whitespace-padded agent_name.
+    // This means sending to " bob " succeeds but get_inbox(" bob ") is rejected.
+    #[tokio::test]
+    async fn dr23_h1_whitespace_padded_recipient_creates_undrainable_inbox() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // send_message: " bob " as recipient — no whitespace check on recipients
+        let send_result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [" bob "],
+                "subject": "trapped message",
+                "body": "this message cannot be drained"
+            }),
+        );
+        // CONFIRMED: send_message accepts whitespace-padded recipient
+        assert!(
+            send_result.is_ok(),
+            "CONFIRMED: send_message accepts whitespace-padded recipient"
+        );
+
+        // Message was delivered to inbox key " bob "
+        assert!(
+            state.inboxes.contains_key(" bob "),
+            "Inbox entry created for ' bob '"
+        );
+
+        // get_inbox: " bob " is rejected by whitespace trim check
+        let inbox_result = get_inbox(&state, json!({ "agent_name": " bob " }));
+        assert!(
+            inbox_result.is_err(),
+            "CONFIRMED: get_inbox rejects whitespace-padded agent_name"
+        );
+        assert!(inbox_result.unwrap_err().contains("whitespace"));
+
+        // The message is permanently trapped — no way to drain it
+        // Clean "bob" inbox is empty (different DashMap key)
+        let clean_inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        assert_eq!(
+            inbox_messages(&clean_inbox).len(),
+            0,
+            "CONFIRMED: 'bob' (clean) inbox is empty — message trapped in ' bob ' inbox"
+        );
+    }
+
+    // ── H2 (CONFIRMED): Recipient deduplication is case-sensitive ──────────────
+    // "Bob" and "bob" are treated as distinct recipients. Both get a copy.
+    // This is consistent with DashMap key semantics but documents behavior.
+    #[tokio::test]
+    async fn dr23_h2_recipient_dedup_is_case_sensitive() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["Bob", "bob", "BOB"],
+                "subject": "case test",
+                "body": "who gets this?"
+            }),
+        );
+        assert!(result.is_ok(), "Case-variant recipients accepted");
+
+        // Each case variant is a distinct DashMap key → separate delivery
+        let inbox_bob = get_inbox(&state, json!({ "agent_name": "Bob" })).unwrap();
+        let inbox_bob_lower = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let inbox_bob_upper = get_inbox(&state, json!({ "agent_name": "BOB" })).unwrap();
+
+        assert_eq!(
+            inbox_messages(&inbox_bob).len(),
+            1,
+            "CONFIRMED: 'Bob' gets one copy"
+        );
+        assert_eq!(
+            inbox_messages(&inbox_bob_lower).len(),
+            1,
+            "CONFIRMED: 'bob' gets one copy"
+        );
+        assert_eq!(
+            inbox_messages(&inbox_bob_upper).len(),
+            1,
+            "CONFIRMED: 'BOB' gets one copy"
+        );
+    }
+
+    // ── H3 (CONFIRMED): Non-integer limit silently falls back to default ────────
+    // get_inbox and search_messages use as_i64() for limit. Boolean, string,
+    // and null all return None → default limit is used silently.
+    #[tokio::test]
+    async fn dr23_h3_non_integer_limit_falls_back_to_default() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send 150 messages
+        for i in 0..150 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender",
+                    "to": ["target"],
+                    "subject": format!("msg {}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Boolean limit → as_i64() returns None → DEFAULT_INBOX_LIMIT (100)
+        let r1 = get_inbox(&state, json!({ "agent_name": "target", "limit": true })).unwrap();
+        assert_eq!(
+            inbox_messages(&r1).len(),
+            100,
+            "CONFIRMED: Boolean limit falls back to default (100)"
+        );
+
+        // String limit → as_i64() returns None → DEFAULT_INBOX_LIMIT (100)
+        // (only 50 remain after draining 100 above)
+        let r2 = get_inbox(&state, json!({ "agent_name": "target", "limit": "999" })).unwrap();
+        assert_eq!(
+            inbox_messages(&r2).len(),
+            50,
+            "CONFIRMED: String limit falls back to default, drains remaining 50"
+        );
+
+        // Same behavior for search_messages
+        let search_result = search_messages(&state, json!({ "query": "hello", "limit": false }));
+        assert!(
+            search_result.is_ok(),
+            "CONFIRMED: Boolean limit in search falls back to default"
+        );
+    }
+
+    // ── H4 (CONFIRMED): Non-string optional fields use defaults silently ────────
+    // program=42, model=true → as_str() returns None → unwrap_or("unknown").
+    // Client sent a value but gets "unknown" back — no error raised.
+    #[tokio::test]
+    async fn dr23_h4_non_string_optional_fields_use_defaults() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "TypeAgent",
+                "program": 42,
+                "model": true,
+            }),
+        );
+
+        assert!(
+            result.is_ok(),
+            "CONFIRMED: Non-string program/model don't cause errors"
+        );
+
+        let profile = result.unwrap();
+        assert_eq!(
+            profile["program"], "unknown",
+            "CONFIRMED: Integer program silently defaults to 'unknown'"
+        );
+        assert_eq!(
+            profile["model"], "unknown",
+            "CONFIRMED: Boolean model silently defaults to 'unknown'"
+        );
+
+        // DashMap record also has defaults
+        let record = state.agents.get("TypeAgent").unwrap();
+        assert_eq!(record.program, "unknown");
+        assert_eq!(record.model, "unknown");
+    }
+
+    // ── H5 (CONFIRMED): Non-array `to` returns misleading error ──────────────
+    // If `to` is a string "bob" instead of ["bob"], as_array() returns None,
+    // producing error "Missing to recipients" — the field IS present, just wrong type.
+    #[tokio::test]
+    async fn dr23_h5_non_array_to_returns_misleading_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // `to` is a string, not an array
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": "bob",
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r1.is_err(), "Non-array `to` returns error");
+        assert_eq!(
+            r1.unwrap_err(),
+            "Missing to recipients",
+            "CONFIRMED: Error says 'Missing' even though field is present (wrong type)"
+        );
+
+        // `to` is an integer
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": 42,
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r2.is_err(), "Integer `to` returns error");
+        assert_eq!(r2.unwrap_err(), "Missing to recipients");
+
+        // `to` as null
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": null,
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r3.is_err(), "Null `to` returns error");
+        assert_eq!(r3.unwrap_err(), "Missing to recipients");
+    }
 }
