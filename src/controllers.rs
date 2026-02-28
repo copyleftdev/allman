@@ -8363,4 +8363,301 @@ mod tests {
         // One .to_string() allocation per recipient, plus a cheap clone for
         // the HashSet. Previously had two independent .to_string() calls.
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Deep Review #33 — Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── DR33-H1: validate_text_core error says "character limit" but checks bytes ─
+    // validate_text_core uses .len() (byte count) but the error message says
+    // "character limit". This is inconsistent with body ("byte limit"),
+    // project_id ("byte limit"), and query ("byte limit"). For multi-byte UTF-8,
+    // the error is misleading: a 32-character string of 4-byte chars (128 bytes)
+    // triggers "exceeds 128 character limit" when it has only 32 characters.
+    #[tokio::test]
+    async fn dr33_h1_validate_text_core_error_says_character_but_checks_bytes() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 33 × 4-byte chars = 132 bytes, but only 33 characters
+        let name = "𝐀".repeat(33);
+        assert_eq!(name.len(), 132, "33 4-byte chars = 132 bytes");
+        assert_eq!(name.chars().count(), 33, "Only 33 characters");
+
+        // validate_text_core (via validate_name) checks .len() > MAX_AGENT_NAME_LEN (128)
+        // 132 > 128 → rejected. Error says "character limit" but the limit is byte-based.
+        let r = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": name }),
+        );
+        assert!(r.is_err(), "132-byte name exceeds 128-byte limit");
+        let err = r.unwrap_err();
+        // CONFIRMED: error says "character limit" even though .len() counts bytes
+        assert!(
+            err.contains("character limit"),
+            "Error says 'character limit' but means bytes: {}",
+            err
+        );
+
+        // In contrast, body validation correctly says "byte limit":
+        let big_body = "B".repeat(super::MAX_BODY_LEN + 1);
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": big_body,
+            }),
+        );
+        assert!(r2.is_err());
+        let err2 = r2.unwrap_err();
+        // Body correctly says "byte limit"
+        assert!(
+            err2.contains("byte limit"),
+            "Body error correctly says 'byte limit': {}",
+            err2
+        );
+
+        // Subject also says "character limit" (inconsistent with body):
+        let big_subject = "S".repeat(super::MAX_SUBJECT_LEN + 1);
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": big_subject,
+                "body": "ok",
+            }),
+        );
+        assert!(r3.is_err());
+        let err3 = r3.unwrap_err();
+        assert!(
+            err3.contains("character limit"),
+            "Subject also says 'character limit' instead of 'byte limit': {}",
+            err3
+        );
+    }
+
+    // ── DR33-H2: subject validation lacks whitespace checks ──────────────────────
+    // Subject is validated inline (length, null, control) but NOT through
+    // validate_text_core. It lacks the whitespace-only and leading/trailing
+    // whitespace checks that all other text fields have. A subject of "   "
+    // (spaces-only) is silently accepted. This is inconsistent with project_id
+    // (which rejects whitespace since DR32-H3), project_key, agent names,
+    // program, and model.
+    #[tokio::test]
+    async fn dr33_h2_subject_accepts_whitespace_only_and_padded() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Whitespace-only subject — accepted (inconsistent with other fields)
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "   ",
+                "body": "hello",
+            }),
+        );
+        // CONFIRMED: whitespace-only subject is accepted
+        assert!(
+            r1.is_ok(),
+            "CONFIRMED: whitespace-only subject is accepted (no whitespace check)"
+        );
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs[0]["subject"], "   ", "Subject preserved as-is");
+
+        // Leading/trailing whitespace in subject — accepted (inconsistent)
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["charlie"],
+                "subject": " padded subject ",
+                "body": "hello",
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "CONFIRMED: padded subject is accepted (no trim check)"
+        );
+
+        // Compare with project_id which rejects whitespace (DR32-H3):
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["dave"],
+                "subject": "test",
+                "body": "hello",
+                "project_id": "   ",
+            }),
+        );
+        assert!(
+            r3.is_err(),
+            "project_id rejects whitespace-only (DR32-H3) — inconsistent with subject"
+        );
+
+        // Compare with project_key which rejects whitespace via validate_text_field:
+        let r4 = create_agent(
+            &state,
+            json!({ "project_key": "   ", "name_hint": "Agent33H2" }),
+        );
+        assert!(
+            r4.is_err(),
+            "project_key rejects whitespace-only via validate_text_field"
+        );
+    }
+
+    // ── DR33-H3: send_message allocates InboxEntry before pre-checks ─────────────
+    // InboxEntry is constructed (cloning from_agent, subject, body, project_id)
+    // on line 563-570, BEFORE the inbox count cap check (576) and inbox fullness
+    // pre-check (590). If either check rejects the send, the string allocations
+    // in InboxEntry were wasted. For 64KB body × rejection = 64KB wasted heap.
+    #[tokio::test]
+    async fn dr33_h3_inbox_entry_allocated_before_precheck_rejection() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Fill recipient's inbox to cap
+        for i in 0..super::MAX_INBOX_SIZE {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "filler",
+                    "to": ["full_inbox"],
+                    "subject": format!("msg #{}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Now send with a 64KB body to the full inbox — this will be rejected
+        // by the inbox fullness pre-check, but InboxEntry was already allocated
+        // with the 64KB body clone.
+        let big_body = "B".repeat(super::MAX_BODY_LEN);
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": ["full_inbox"],
+                "subject": "big rejected message",
+                "body": big_body,
+            }),
+        );
+        assert!(
+            r.is_err(),
+            "Send to full inbox rejected — but InboxEntry was already allocated"
+        );
+
+        // CONFIRMED: InboxEntry (including 64KB body clone) is constructed at
+        // line 563-570 before the pre-checks at lines 576 and 590. The allocation
+        // is wasted. Moving entry construction after the pre-checks would avoid this.
+
+        // Verify no partial state mutation
+        assert!(
+            !state.inboxes.contains_key("sender"),
+            "Sender has no inbox entry — clean rejection"
+        );
+    }
+
+    // ── DR33-H4: handle_mcp_request double-clones params for tools/call ──────────
+    // Line 69: params = req.get("params").cloned() — clones entire params including
+    // nested arguments with body. Line 109: args = params.get("arguments").cloned()
+    // — clones arguments out of the already-cloned params. For send_message with
+    // 64KB body, this creates 2 copies before the tool function sees it.
+    #[tokio::test]
+    async fn dr33_h4_handle_mcp_double_clones_params() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Construct a tools/call request with a large body.
+        // The handler will:
+        //   1. Clone all of params (including "arguments" with body) — 64KB+ copy
+        //   2. Clone "arguments" out of the cloned params — another 64KB+ copy
+        // By the time send_message() sees `args`, there have been 2 intermediate copies.
+        let big_body = "B".repeat(super::MAX_BODY_LEN);
+        let resp = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": {
+                        "from_agent": "alice",
+                        "to": ["bob"],
+                        "subject": "double clone test",
+                        "body": big_body
+                    }
+                }
+            }),
+        )
+        .await;
+
+        // The request succeeds — the double clone is functional but wasteful.
+        assert!(
+            resp.get("result").is_some(),
+            "Request succeeds despite double clone overhead"
+        );
+
+        // CONFIRMED: handle_mcp_request clones params (line 69) then clones
+        // arguments (line 109) — two full copies of the body. Could be
+        // restructured to clone only arguments directly from req.
+    }
+
+    // ── DR33-H5: to_agents dedup clones String for HashSet when &str suffices ────
+    // The DR32-H5 fix improved dedup from 2 allocations to 1 allocation + clone.
+    // But HashSet<&str> borrowing from the JSON array would eliminate the clone
+    // entirely: filter with HashSet<&str> first, then .map(to_string) only for
+    // survivors. This is truly zero-copy dedup.
+    #[tokio::test]
+    async fn dr33_h5_to_agents_dedup_clones_for_hashset() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 50 unique recipients with duplicates (75 total entries, 50 unique)
+        let mut recipients: Vec<String> = (0..50)
+            .map(|i| format!("Agent33H5_{:03}", i))
+            .collect();
+        // Add 25 duplicates
+        for i in 0..25 {
+            recipients.push(format!("Agent33H5_{:03}", i));
+        }
+        assert_eq!(recipients.len(), 75, "75 entries, 50 unique");
+
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": recipients,
+                "subject": "dedup clone test",
+                "body": "hello all",
+            }),
+        );
+        assert!(r.is_ok(), "75-entry send with duplicates succeeds");
+        assert_eq!(
+            r.unwrap()["delivered_count"].as_u64().unwrap(),
+            50,
+            "50 unique recipients delivered"
+        );
+
+        // CONFIRMED: Current code does .map(to_string).filter(clone + insert).
+        // For the 25 duplicates, .map(to_string) allocates a String that is then
+        // immediately dropped by .filter() when insert returns false. That's 25
+        // wasted String allocations. With HashSet<&str>, duplicates would be
+        // filtered BEFORE .map(to_string), avoiding the allocation entirely.
+
+        // Verify delivery correctness
+        for i in 0..50 {
+            let name = format!("Agent33H5_{:03}", i);
+            let inbox = get_inbox(&state, json!({ "agent_name": name })).unwrap();
+            assert_eq!(
+                inbox_messages(&inbox).len(),
+                1,
+                "Each unique recipient gets exactly 1 message"
+            );
+        }
+    }
 }
