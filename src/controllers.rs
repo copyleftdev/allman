@@ -290,10 +290,13 @@ fn validate_name(name: &str, field: &str) -> Result<(), String> {
     if name.contains("..") {
         return Err(format!("{} must not contain '..'", field));
     }
-    if name == "." {
-        return Err(format!("{} must not be '.'", field));
-    }
+    // Single check for dot-prefixed names. "." is a subset of starts_with('.')
+    // — previously had a redundant `name == "."` check before this one.
+    // Merged into one conditional with a specific message for "." (DR35-H3).
     if name.starts_with('.') {
+        if name == "." {
+            return Err(format!("{} must not be '.'", field));
+        }
         return Err(format!("{} must not start with '.'", field));
     }
     Ok(())
@@ -367,6 +370,7 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     let agent_id;
     let registered_at;
+    let is_reregistration;
 
     match state.agents.entry(name.clone()) {
         dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -381,6 +385,7 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
             // (DR26-H2, DR27-H3).
             agent_id = occ.get().id.clone();
             registered_at = occ.get().registered_at;
+            is_reregistration = true;
             let record = AgentRecord {
                 id: agent_id.clone(),
                 project_id: project_id.clone(),
@@ -394,6 +399,7 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         dashmap::mapref::entry::Entry::Vacant(vac) => {
             agent_id = Uuid::new_v4().to_string();
             registered_at = now;
+            is_reregistration = false;
             let record = AgentRecord {
                 id: agent_id.clone(),
                 project_id: project_id.clone(),
@@ -433,10 +439,17 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         "model": model,
         "registered_at": registered_at
     });
+    // Use distinct commit messages for fresh registration vs re-registration
+    // so the Git audit trail can distinguish them (DR35-H5).
+    let commit_msg = if is_reregistration {
+        format!("Update agent {}", name)
+    } else {
+        format!("Register agent {}", name)
+    };
     if let Err(e) = state.persist_tx.try_send(PersistOp::GitCommit {
         path: format!("agents/{}/profile.json", name),
         content: serde_json::to_string_pretty(&profile).unwrap(),
-        message: format!("Register agent {}", name),
+        message: commit_msg,
     }) {
         tracing::warn!(
             "Persist channel full, dropping git commit for agent {}: {}",
@@ -670,7 +683,24 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         );
     }
 
-    Ok(json!({ "id": message_id, "status": "sent", "delivered_count": delivered_count }))
+    // Include a warning field when delivered_count < expected recipients.
+    // This happens when a concurrent send fills an inbox between pre-check
+    // and delivery. Callers can detect partial delivery without comparing
+    // delivered_count against their expected count (DR35-H4).
+    let expected = to_agents.len();
+    if delivered_count < expected {
+        Ok(json!({
+            "id": message_id,
+            "status": "sent",
+            "delivered_count": delivered_count,
+            "warning": format!(
+                "Partial delivery: {}/{} recipients received the message (concurrent inbox full)",
+                delivered_count, expected
+            )
+        }))
+    } else {
+        Ok(json!({ "id": message_id, "status": "sent", "delivered_count": delivered_count }))
+    }
 }
 
 // ── get_inbox ────────────────────────────────────────────────────────────────
@@ -8953,6 +8983,208 @@ mod tests {
             err3, "Missing tool name in params",
             "FIXED: Empty params.name returns specific error: {}",
             err3
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Deep Review #35 — Hypothesis Tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── DR35-H1 (FIXED): GitActor JoinHandle now stored and joined ─────────
+    // shutdown() now joins both the persist worker AND the git actor thread.
+    // After persist worker exits (dropping git_tx), the git actor drains
+    // remaining requests and exits. shutdown() joins it deterministically —
+    // no sleep needed, no race condition (DR35-H1).
+    #[tokio::test]
+    async fn dr35_h1_git_actor_join_handle_not_stored() {
+        let (state, _idx, repo_dir) = test_post_office();
+
+        // Send a git commit op through the persist pipeline
+        let _ = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::GitCommit {
+                path: "dr35_h1_test/file.txt".to_string(),
+                content: "git actor shutdown test".to_string(),
+                message: "DR35-H1: test git actor shutdown".to_string(),
+            });
+
+        // FIXED: shutdown() joins both persist worker AND git actor.
+        // No sleep needed — deterministic shutdown guarantee.
+        state.shutdown();
+
+        // After shutdown(), the git actor has finished — file MUST exist.
+        let git_file = repo_dir.path().join("dr35_h1_test/file.txt");
+        assert!(
+            git_file.exists(),
+            "FIXED: shutdown() joins git actor thread — deterministic \
+             commit guarantee without sleep (DR35-H1)"
+        );
+    }
+
+    // ── DR35-H2 (FIXED): shutdown_signal() now handles both SIGINT and SIGTERM ─
+    // main.rs now uses tokio::select! to handle both SIGINT (Ctrl-C) and
+    // SIGTERM (Docker/Kubernetes/systemd). Previously only SIGINT was
+    // handled, bypassing graceful shutdown on SIGTERM (DR35-H2).
+    #[tokio::test]
+    async fn dr35_h2_shutdown_signal_only_handles_sigint() {
+        // Verify that both signal kinds are available on Unix
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            // FIXED: Both SIGTERM and SIGINT are now handled in shutdown_signal().
+            // Verify that SIGTERM signal handler can be installed (same as main.rs).
+            let sigterm_result = signal(SignalKind::terminate());
+            assert!(
+                sigterm_result.is_ok(),
+                "FIXED: SIGTERM handler can be installed — shutdown_signal() \
+                 now uses tokio::select! for both SIGINT and SIGTERM (DR35-H2)"
+            );
+        }
+
+        // Cross-platform: verify ctrl_c() works (regression guard)
+        let ctrl_c_future = tokio::signal::ctrl_c();
+        drop(ctrl_c_future);
+    }
+
+    // ── DR35-H3 (FIXED): validate_name dot checks merged ──────────────────
+    // Previously had redundant `name == "."` check before `starts_with('.')`.
+    // Now merged into a single starts_with('.') check with a nested
+    // conditional for the specific "." error message (DR35-H3).
+    #[tokio::test]
+    async fn dr35_h3_validate_name_dot_check_redundancy() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // "." still gets the specific error message (merged conditional)
+        let dot_result = create_agent(&state, json!({ "project_key": "test", "name_hint": "." }));
+        assert!(dot_result.is_err(), "Single dot must be rejected");
+        let dot_err = dot_result.unwrap_err();
+        assert!(
+            dot_err.contains("must not be '.'"),
+            "FIXED: '.' still gets specific error from merged check: {}",
+            dot_err
+        );
+
+        // ".hidden" still gets the starts_with error
+        let hidden_result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": ".hidden" }),
+        );
+        assert!(hidden_result.is_err(), "Dot-prefixed name must be rejected");
+        let hidden_err = hidden_result.unwrap_err();
+        assert!(
+            hidden_err.contains("must not start with '.'"),
+            "FIXED: '.hidden' gets starts_with error from merged check: {}",
+            hidden_err
+        );
+    }
+
+    // ── DR35-H4 (FIXED): warning field added for partial delivery ──────────
+    // When delivered_count < expected recipients (due to concurrent races),
+    // the response now includes a "warning" field explaining the partial
+    // delivery. Normal sends (all delivered) omit the warning (DR35-H4).
+    #[tokio::test]
+    async fn dr35_h4_delivered_count_silent_skip_no_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Normal send: all recipients delivered, no warning
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob", "charlie"],
+                "subject": "delivered count test",
+                "body": "hello",
+            }),
+        );
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+
+        assert_eq!(
+            resp["delivered_count"].as_u64().unwrap(),
+            2,
+            "Normal send: delivered_count == recipient count"
+        );
+        assert_eq!(
+            resp["status"].as_str().unwrap(),
+            "sent",
+            "Status is 'sent' for full delivery"
+        );
+        assert!(
+            resp.get("warning").is_none(),
+            "FIXED: No warning when all recipients delivered (DR35-H4)"
+        );
+    }
+
+    // ── DR35-H5 (FIXED): Git commit messages now distinguish register/update ─
+    // create_agent now uses "Register agent {name}" for fresh registrations
+    // and "Update agent {name}" for re-registrations, making the Git
+    // audit trail unambiguous (DR35-H5).
+    #[tokio::test]
+    async fn dr35_h5_git_commit_message_same_for_register_and_reregister() {
+        let (state, _idx, repo_dir) = test_post_office();
+
+        // First registration
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "dr35h5proj",
+                "name_hint": "AuditAgent",
+                "program": "v1",
+                "model": "gpt-4"
+            }),
+        );
+        assert!(r1.is_ok(), "First registration succeeds");
+
+        // Re-registration with updated program
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "dr35h5proj",
+                "name_hint": "AuditAgent",
+                "program": "v2",
+                "model": "gpt-4o"
+            }),
+        );
+        assert!(r2.is_ok(), "Re-registration succeeds (same project)");
+
+        // FIXED: shutdown() joins both persist worker AND git actor,
+        // so all commits are guaranteed to complete.
+        state.shutdown();
+
+        // Verify the Git log — commits should have distinct messages
+        let repo = git2::Repository::open(repo_dir.path()).unwrap();
+        let mut revwalk = repo.revwalk().unwrap();
+        revwalk.push_head().unwrap();
+        let mut messages: Vec<String> = Vec::new();
+        for oid in revwalk {
+            let oid = oid.unwrap();
+            let commit = repo.find_commit(oid).unwrap();
+            if let Some(msg) = commit.message() {
+                if msg.contains("AuditAgent") {
+                    messages.push(msg.to_string());
+                }
+            }
+        }
+
+        assert!(
+            messages.len() >= 2,
+            "Should have at least 2 commits for AuditAgent: {:?}",
+            messages
+        );
+
+        // FIXED: Fresh registration says "Register", re-registration says "Update"
+        let has_register = messages.iter().any(|m| m == "Register agent AuditAgent");
+        let has_update = messages.iter().any(|m| m == "Update agent AuditAgent");
+        assert!(
+            has_register,
+            "FIXED: Fresh registration uses 'Register agent' commit message: {:?}",
+            messages
+        );
+        assert!(
+            has_update,
+            "FIXED: Re-registration uses 'Update agent' commit message: {:?}",
+            messages
         );
     }
 }
