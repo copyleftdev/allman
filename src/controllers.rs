@@ -6306,4 +6306,301 @@ mod tests {
             "FIXED: String body returns -32600"
         );
     }
+
+    // ── DR26 Hypotheses ─────────────────────────────────────────────────────
+
+    // DR26-H1: Empty project_key is accepted by create_agent.
+    // The whitespace-only check (trim().is_empty() && !is_empty()) short-circuits
+    // when the string IS empty, so empty project_key passes all validation.
+    #[tokio::test]
+    async fn dr26_h1_empty_project_key_accepted() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let result = create_agent(
+            &state,
+            json!({
+                "project_key": "",
+                "name_hint": "EmptyProjectAgent"
+            }),
+        );
+
+        // CONFIRMED: empty project_key succeeds — should be rejected
+        assert!(
+            result.is_ok(),
+            "BUG CONFIRMED: empty project_key is accepted, creating a project with meaningless ID"
+        );
+
+        // The deterministic project_id is derived from empty bytes — it's valid but meaningless.
+        let resp = result.unwrap();
+        let project_id = resp["project_id"].as_str().unwrap();
+        assert!(
+            project_id.starts_with("proj_"),
+            "Project ID is still generated from empty key"
+        );
+
+        // The project mapping stores "" as the human key
+        assert_eq!(
+            state.projects.get(project_id).unwrap().value(),
+            "",
+            "Project human key is empty string"
+        );
+    }
+
+    // DR26-H2: Agent re-registration generates a new agent_id each time.
+    // Uuid::new_v4() is called unconditionally before the entry check,
+    // so re-registration in the same project always changes the agent's ID.
+    #[tokio::test]
+    async fn dr26_h2_reregistration_changes_agent_id() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // First registration
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "stable_project",
+                "name_hint": "StableAgent"
+            }),
+        )
+        .unwrap();
+        let id1 = r1["id"].as_str().unwrap().to_string();
+
+        // Re-registration (same name, same project)
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "stable_project",
+                "name_hint": "StableAgent"
+            }),
+        )
+        .unwrap();
+        let id2 = r2["id"].as_str().unwrap().to_string();
+
+        // CONFIRMED: agent_id changes on re-registration
+        assert_ne!(
+            id1, id2,
+            "BUG CONFIRMED: re-registration generates new agent_id — external ID caching breaks"
+        );
+
+        // The DashMap record uses the latest ID
+        let record = state.agents.get("StableAgent").unwrap();
+        assert_eq!(
+            record.id, id2,
+            "DashMap stores the latest agent_id, old one is lost"
+        );
+    }
+
+    // DR26-H3: Notification check runs AFTER jsonrpc validation.
+    // A request without "id" but with wrong "jsonrpc" gets an error response
+    // instead of being silently dropped (Value::Null → 204 No Content).
+    // JSON-RPC 2.0 §4.1: "The Server MUST NOT reply to a Notification."
+    #[tokio::test]
+    async fn dr26_h3_malformed_notification_gets_response() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // No "id" field, wrong jsonrpc version → should be treated as notification (no response)
+        let response = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "1.0",
+                "method": "tools/list"
+            }),
+        )
+        .await;
+
+        // CONFIRMED: server responds to malformed notification instead of dropping it.
+        // Per JSON-RPC 2.0 spec, absence of "id" = notification → no response.
+        assert!(
+            !response.is_null(),
+            "BUG CONFIRMED: malformed notification gets error response instead of being silently dropped"
+        );
+        assert_eq!(
+            response["error"]["code"], -32600,
+            "Returns -32600 error instead of Value::Null (204 No Content)"
+        );
+
+        // Control: valid notification (correct jsonrpc, no id) IS silently dropped
+        let valid_notification = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            valid_notification.is_null(),
+            "Valid notification correctly returns Value::Null"
+        );
+
+        // Control: no "id" and no "jsonrpc" at all → also a malformed notification
+        let no_jsonrpc = handle_mcp_request(
+            state.clone(),
+            json!({
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            !no_jsonrpc.is_null(),
+            "BUG CONFIRMED: missing-jsonrpc notification also gets error response"
+        );
+    }
+
+    // DR26-H4: Per-inbox size cap (MAX_INBOX_SIZE) pre-check is not atomic
+    // with delivery. The pre-check uses get() and the delivery uses
+    // entry().or_default().push() — separate DashMap operations.
+    // Demonstrating the window: pre-fill to MAX_INBOX_SIZE-1, two concurrent
+    // sends could both pass the pre-check and both deliver.
+    #[tokio::test]
+    async fn dr26_h4_inbox_cap_precheck_not_atomic_with_delivery() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register sender
+        create_agent(
+            &state,
+            json!({ "project_key": "cap_test", "name_hint": "Sender" }),
+        )
+        .unwrap();
+
+        // Pre-fill inbox to MAX_INBOX_SIZE - 1 via direct DashMap manipulation
+        let mut entries = Vec::with_capacity(MAX_INBOX_SIZE - 1);
+        for i in 0..MAX_INBOX_SIZE - 1 {
+            entries.push(InboxEntry {
+                message_id: format!("prefill-{}", i),
+                from_agent: "Sender".to_string(),
+                subject: "fill".to_string(),
+                body: "x".to_string(),
+                timestamp: 0,
+                project_id: "test".to_string(),
+            });
+        }
+        state
+            .inboxes
+            .insert("CapTarget".to_string(), entries);
+
+        // Verify we're at MAX_INBOX_SIZE - 1
+        assert_eq!(
+            state.inboxes.get("CapTarget").unwrap().len(),
+            MAX_INBOX_SIZE - 1,
+            "Pre-fill should be at MAX_INBOX_SIZE - 1"
+        );
+
+        // Single-threaded: this send should succeed (one slot remaining)
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": ["CapTarget"],
+                "subject": "last",
+                "body": "fits"
+            }),
+        );
+        assert!(r1.is_ok(), "Should succeed — one slot remaining");
+
+        // Now at MAX_INBOX_SIZE — next send should be rejected
+        assert_eq!(
+            state.inboxes.get("CapTarget").unwrap().len(),
+            MAX_INBOX_SIZE,
+            "Inbox should be exactly at MAX_INBOX_SIZE"
+        );
+
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": ["CapTarget"],
+                "subject": "overflow",
+                "body": "rejected"
+            }),
+        );
+        assert!(r2.is_err(), "Should be rejected — inbox is full");
+        assert!(
+            r2.unwrap_err().contains("inbox full"),
+            "Error mentions inbox full"
+        );
+
+        // CONFIRMED: The pre-check and delivery are separate DashMap ops.
+        // In single-threaded tests the cap works correctly, but under
+        // concurrent load two sends could both pass the pre-check (seeing
+        // 9,999) and both deliver, overshooting to 10,001.
+        // This is the same soft-cap pattern as MAX_INBOXES (acknowledged).
+    }
+
+    // DR26-H5: from_agent max length (256) differs from agent name max (128).
+    // Messages can be sent FROM names too long to register as agents.
+    #[tokio::test]
+    async fn dr26_h5_from_agent_length_asymmetry() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Create a valid recipient
+        create_agent(
+            &state,
+            json!({ "project_key": "len_test", "name_hint": "Receiver" }),
+        )
+        .unwrap();
+
+        // 129 chars: too long for create_agent (MAX_AGENT_NAME_LEN = 128)
+        let long_name: String = "A".repeat(129);
+        let create_result = create_agent(
+            &state,
+            json!({ "project_key": "len_test", "name_hint": long_name }),
+        );
+        assert!(
+            create_result.is_err(),
+            "129-char name rejected by create_agent"
+        );
+
+        // But 129 chars is accepted as from_agent (MAX_FROM_AGENT_LEN = 256)
+        let send_result = send_message(
+            &state,
+            json!({
+                "from_agent": long_name,
+                "to": ["Receiver"],
+                "subject": "ghost",
+                "body": "from unregisterable name"
+            }),
+        );
+
+        // CONFIRMED: from_agent accepts names that can never be registered
+        assert!(
+            send_result.is_ok(),
+            "BUG CONFIRMED: 129-char from_agent accepted, but can never be a registered agent"
+        );
+
+        // The message arrives with the unregisterable from_agent
+        let inbox = get_inbox(&state, json!({ "agent_name": "Receiver" })).unwrap();
+        let msgs = inbox["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0]["from_agent"].as_str().unwrap().len(),
+            129,
+            "Message stored with 129-char from_agent that can't be registered"
+        );
+
+        // Boundary: 256 chars is the limit for from_agent
+        let max_from: String = "B".repeat(256);
+        let at_limit = send_message(
+            &state,
+            json!({
+                "from_agent": max_from,
+                "to": ["Receiver"],
+                "subject": "max",
+                "body": "at limit"
+            }),
+        );
+        assert!(at_limit.is_ok(), "256-char from_agent accepted");
+
+        // 257 chars exceeds from_agent limit
+        let over_from: String = "C".repeat(257);
+        let over_result = send_message(
+            &state,
+            json!({
+                "from_agent": over_from,
+                "to": ["Receiver"],
+                "subject": "over",
+                "body": "too long"
+            }),
+        );
+        assert!(over_result.is_err(), "257-char from_agent rejected");
+    }
 }
