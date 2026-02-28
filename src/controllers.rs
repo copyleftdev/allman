@@ -222,41 +222,54 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
 
 // ── Input validation ─────────────────────────────────────────────────────────
 // Reject names that could cause path traversal or filesystem issues.
-fn validate_agent_name(name: &str) -> Result<(), String> {
+// Used by create_agent (name_hint), send_message (from_agent, recipients),
+// and get_inbox (agent_name). Single source of truth — all name validation
+// goes through this function to prevent rule drift (DR30-H1).
+fn validate_name(name: &str, field: &str) -> Result<(), String> {
     if name.is_empty() {
-        return Err("Invalid agent name: must not be empty".to_string());
+        return Err(format!("{} must not be empty", field));
     }
     if name.len() > MAX_AGENT_NAME_LEN {
         return Err(format!(
-            "Invalid agent name: exceeds {} character limit",
-            MAX_AGENT_NAME_LEN
+            "{} exceeds {} character limit",
+            field, MAX_AGENT_NAME_LEN
         ));
     }
     if name.contains('/') || name.contains('\\') {
-        return Err("Invalid agent name: must not contain path separators".to_string());
+        return Err(format!("{} must not contain path separators", field));
     }
     if name.contains("..") {
-        return Err("Invalid agent name: must not contain '..'".to_string());
+        return Err(format!("{} must not contain '..'", field));
     }
     if name == "." {
-        return Err("Invalid agent name: must not be '.'".to_string());
+        return Err(format!("{} must not be '.'", field));
     }
     if name.starts_with('.') {
-        return Err("Invalid agent name: must not start with '.'".to_string());
+        return Err(format!("{} must not start with '.'", field));
     }
     if name.contains('\0') {
-        return Err("Invalid agent name: must not contain null bytes".to_string());
+        return Err(format!("{} must not contain null bytes", field));
     }
     if name.chars().any(|c| c.is_control()) {
-        return Err("Invalid agent name: must not contain control characters".to_string());
+        return Err(format!("{} must not contain control characters", field));
     }
     if name.trim().is_empty() {
-        return Err("Invalid agent name: must not be whitespace-only".to_string());
+        return Err(format!("{} must not be whitespace-only", field));
     }
     if name != name.trim() {
-        return Err("Invalid agent name: must not have leading or trailing whitespace".to_string());
+        return Err(format!(
+            "{} must not have leading or trailing whitespace",
+            field
+        ));
     }
     Ok(())
+}
+
+// Backward-compatible wrapper for create_agent's name_hint validation.
+// Error messages use "Invalid agent name:" prefix for consistency with
+// existing tests and API responses.
+fn validate_agent_name(name: &str) -> Result<(), String> {
+    validate_name(name, "Invalid agent name:")
 }
 
 // ── create_agent ─────────────────────────────────────────────────────────────
@@ -480,35 +493,8 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         None => "",
     };
 
-    if from_agent.is_empty() {
-        return Err("from_agent must not be empty".to_string());
-    }
-    // Use MAX_AGENT_NAME_LEN (128) instead of MAX_FROM_AGENT_LEN (256) so
-    // from_agent names cannot exceed what create_agent accepts (DR26-H5).
-    if from_agent.len() > MAX_AGENT_NAME_LEN {
-        return Err(format!(
-            "from_agent exceeds {} character limit",
-            MAX_AGENT_NAME_LEN
-        ));
-    }
-    if from_agent.contains('\0') {
-        return Err("from_agent must not contain null bytes".to_string());
-    }
-    if from_agent.chars().any(|c| c.is_control()) {
-        return Err("from_agent must not contain control characters".to_string());
-    }
-    if from_agent.contains('/') || from_agent.contains('\\') {
-        return Err("from_agent must not contain path separators".to_string());
-    }
-    if from_agent.contains("..") {
-        return Err("from_agent must not contain '..'".to_string());
-    }
-    if from_agent.starts_with('.') {
-        return Err("from_agent must not start with '.'".to_string());
-    }
-    if from_agent != from_agent.trim() {
-        return Err("from_agent must not have leading or trailing whitespace".to_string());
-    }
+    // Single source of truth: use validate_name() for from_agent (DR30-H1).
+    validate_name(from_agent, "from_agent")?;
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
     }
@@ -519,51 +505,9 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
             MAX_RECIPIENTS
         ));
     }
+    // Single source of truth: use validate_name() for each recipient (DR30-H1).
     for recipient in &to_agents {
-        // Aligned with MAX_AGENT_NAME_LEN so recipient names can always be
-        // registered as agents and drained via get_inbox (DR27-H2).
-        if recipient.len() > MAX_AGENT_NAME_LEN {
-            return Err(format!(
-                "Recipient name exceeds {} byte limit",
-                MAX_AGENT_NAME_LEN
-            ));
-        }
-        if recipient.contains('\0') {
-            return Err(format!(
-                "Recipient '{}' must not contain null bytes",
-                recipient
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .collect::<String>()
-            ));
-        }
-        if recipient.chars().any(|c| c.is_control()) {
-            return Err(format!(
-                "Recipient '{}' must not contain control characters",
-                recipient
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .collect::<String>()
-            ));
-        }
-        if recipient.contains('/') || recipient.contains('\\') {
-            return Err(format!(
-                "Recipient '{}' must not contain path separators",
-                recipient
-            ));
-        }
-        if recipient.contains("..") {
-            return Err(format!("Recipient '{}' must not contain '..'", recipient));
-        }
-        if recipient.starts_with('.') {
-            return Err(format!("Recipient '{}' must not start with '.'", recipient));
-        }
-        if recipient != recipient.trim() {
-            return Err(format!(
-                "Recipient '{}' must not have leading or trailing whitespace",
-                recipient
-            ));
-        }
+        validate_name(recipient, &format!("Recipient '{}'", recipient))?;
     }
     if subject.len() > MAX_SUBJECT_LEN {
         return Err(format!(
@@ -577,11 +521,25 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     if subject.chars().any(|c| c.is_control()) {
         return Err("Subject must not contain control characters".to_string());
     }
+    // Check length BEFORE content to fail fast on oversized bodies,
+    // matching subject's validation order (DR30-H4).
+    if body.len() > MAX_BODY_LEN {
+        return Err(format!("Body exceeds {} byte limit", MAX_BODY_LEN));
+    }
     if body.contains('\0') {
         return Err("Body must not contain null bytes".to_string());
     }
-    if body.len() > MAX_BODY_LEN {
-        return Err(format!("Body exceeds {} byte limit", MAX_BODY_LEN));
+    // Reject control characters in body, but allow \n, \t, \r which are
+    // legitimate in multi-line message content. Subject rejects ALL control
+    // chars because subjects are single-line (DR30-H2).
+    if body
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r')
+    {
+        return Err(
+            "Body must not contain control characters (except newline, tab, carriage return)"
+                .to_string(),
+        );
     }
     if project_id.contains('\0') {
         return Err("project_id must not contain null bytes".to_string());
@@ -693,44 +651,26 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         Some(v) => v.as_str().ok_or("agent_name must be a string")?,
         None => return Err("Missing agent_name".to_string()),
     };
-    if agent_name.is_empty() {
-        return Err("agent_name must not be empty".to_string());
-    }
-    // Aligned with MAX_AGENT_NAME_LEN for consistency with create_agent
-    // and send_message recipient validation (DR27-H2).
-    if agent_name.len() > MAX_AGENT_NAME_LEN {
-        return Err(format!(
-            "agent_name exceeds {} byte limit",
-            MAX_AGENT_NAME_LEN
-        ));
-    }
-    if agent_name.contains('\0') {
-        return Err("agent_name must not contain null bytes".to_string());
-    }
-    if agent_name.chars().any(|c| c.is_control()) {
-        return Err("agent_name must not contain control characters".to_string());
-    }
-    if agent_name.contains('/') || agent_name.contains('\\') {
-        return Err("agent_name must not contain path separators".to_string());
-    }
-    if agent_name.contains("..") {
-        return Err("agent_name must not contain '..'".to_string());
-    }
-    if agent_name.starts_with('.') {
-        return Err("agent_name must not start with '.'".to_string());
-    }
-    if agent_name != agent_name.trim() {
-        return Err("agent_name must not have leading or trailing whitespace".to_string());
-    }
+    // Single source of truth: use validate_name() for agent_name (DR30-H1).
+    validate_name(agent_name, "agent_name")?;
 
-    // Validate limit type: non-integer types (strings, booleans, objects)
-    // must return a type error, not silently use the default (DR29-H1).
+    // Validate limit type and range. Non-integer types return a type error
+    // (DR29-H1). Out-of-range values (0, negative, >1000) are rejected
+    // instead of silently clamped — the schema declares minimum=1 (DR30-H3).
     let limit = match args.get("limit") {
-        Some(v) if v.is_null() => DEFAULT_INBOX_LIMIT as i64,
-        Some(v) => v.as_i64().ok_or("limit must be an integer if provided")?,
-        None => DEFAULT_INBOX_LIMIT as i64,
-    }
-    .clamp(1, MAX_INBOX_LIMIT as i64) as usize;
+        Some(v) if v.is_null() => DEFAULT_INBOX_LIMIT,
+        Some(v) => {
+            let n = v.as_i64().ok_or("limit must be an integer if provided")?;
+            if n < 1 {
+                return Err(format!("limit must be >= 1 (got {})", n));
+            }
+            if n > MAX_INBOX_LIMIT as i64 {
+                return Err(format!("limit must be <= {} (got {})", MAX_INBOX_LIMIT, n));
+            }
+            n as usize
+        }
+        None => DEFAULT_INBOX_LIMIT,
+    };
 
     // Atomic drain via entry() API. Holds the DashMap shard lock for the
     // entire operation, preventing concurrent send_message from inserting
@@ -821,12 +761,21 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
     // Validate limit type: non-integer types (strings, booleans, floats)
     // must return a type error, not silently use the default (DR29-H2).
+    // Reject out-of-range values explicitly instead of silent clamping (DR30-H3).
     let limit = match args.get("limit") {
-        Some(v) if v.is_null() => DEFAULT_SEARCH_LIMIT as i64,
-        Some(v) => v.as_i64().ok_or("limit must be an integer if provided")?,
-        None => DEFAULT_SEARCH_LIMIT as i64,
-    }
-    .clamp(1, MAX_SEARCH_LIMIT as i64) as usize;
+        Some(v) if v.is_null() => DEFAULT_SEARCH_LIMIT,
+        Some(v) => {
+            let n = v.as_i64().ok_or("limit must be an integer if provided")?;
+            if n < 1 {
+                return Err(format!("limit must be >= 1 (got {})", n));
+            }
+            if n > MAX_SEARCH_LIMIT as i64 {
+                return Err(format!("limit must be <= {} (got {})", MAX_SEARCH_LIMIT, n));
+            }
+            n as usize
+        }
+        None => DEFAULT_SEARCH_LIMIT,
+    };
 
     let index = &state.index;
     let searcher = state.index_reader.searcher();
@@ -1138,31 +1087,35 @@ mod tests {
         assert!(result.is_err(), "All-invalid recipients must return error");
     }
 
-    // ── H18: search_messages limit must be clamped ─────────────────────────
+    // ── H18: search_messages limit out of range is rejected (DR30-H3) ──────
     #[tokio::test]
-    async fn h18_negative_limit_returns_results_not_oom() {
+    async fn h18_negative_limit_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Negative limit must not wrap to usize::MAX — should be clamped.
+        // Negative limit now returns an explicit error (DR30-H3).
         let r = search_messages(&state, json!({ "query": "hello", "limit": -1 }));
-        assert!(r.is_ok(), "Negative limit must not cause panic or OOM");
+        assert!(r.is_err(), "Negative limit must be rejected");
+        assert!(r.unwrap_err().contains("limit must be >= 1"));
     }
 
     #[tokio::test]
-    async fn h18_zero_limit_returns_ok() {
+    async fn h18_zero_limit_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
+        // Zero limit now returns an explicit error (DR30-H3).
         let r = search_messages(&state, json!({ "query": "hello", "limit": 0 }));
-        assert!(r.is_ok(), "Zero limit must not cause error");
+        assert!(r.is_err(), "Zero limit must be rejected");
+        assert!(r.unwrap_err().contains("limit must be >= 1"));
     }
 
     #[tokio::test]
-    async fn h18_huge_limit_is_capped() {
+    async fn h18_huge_limit_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
-        // A limit of 999999999 must not allocate that much — should be capped.
+        // Huge limit now returns an explicit error (DR30-H3).
         let r = search_messages(&state, json!({ "query": "hello", "limit": 999_999_999 }));
-        assert!(r.is_ok(), "Huge limit must be capped, not cause OOM");
+        assert!(r.is_err(), "Huge limit must be rejected");
+        assert!(r.unwrap_err().contains("limit must be <="));
     }
 
     // ── H9: Input validation rejects malicious agent names ──────────────────
@@ -3510,7 +3463,12 @@ mod tests {
             }),
         );
         assert!(result.is_err(), "Oversized recipient name must be rejected");
-        assert!(result.unwrap_err().contains("Recipient name exceeds"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("exceeds") && err.contains("character limit"),
+            "Error should mention exceeds character limit: {}",
+            err
+        );
 
         // No DashMap entry created
         assert!(
@@ -3774,12 +3732,10 @@ mod tests {
         );
     }
 
-    // ── H5 (CONFIRMED): search_messages limit uses magic numbers ────────────
-    // get_inbox uses named constants (DEFAULT_INBOX_LIMIT, MAX_INBOX_LIMIT).
-    // search_messages uses inline 10 and 1000. Behavior is correct but naming
-    // is inconsistent. This test documents the current behavior.
+    // ── H5 (UPDATED DR30-H3): search_messages limit range validated ────────
+    // Out-of-range limits are now rejected instead of silently clamped.
     #[tokio::test]
-    async fn dr13_h5_search_limit_uses_named_constants() {
+    async fn dr13_h5_search_limit_range_validated() {
         let (state, _idx, _repo) = test_post_office();
 
         // Default limit uses DEFAULT_SEARCH_LIMIT
@@ -3789,23 +3745,18 @@ mod tests {
             "Default limit returns array"
         );
 
-        // Negative limit clamped to 1
-        let result = search_messages(&state, json!({ "query": "hello", "limit": -5 })).unwrap();
-        assert!(
-            result["results"].as_array().is_some(),
-            "Negative limit clamped to 1"
-        );
+        // Negative limit rejected (DR30-H3)
+        let result = search_messages(&state, json!({ "query": "hello", "limit": -5 }));
+        assert!(result.is_err(), "Negative limit must be rejected");
+        assert!(result.unwrap_err().contains("limit must be >= 1"));
 
-        // Huge limit clamped to MAX_SEARCH_LIMIT
+        // Huge limit rejected (DR30-H3)
         let result = search_messages(
             &state,
             json!({ "query": "hello", "limit": (super::MAX_SEARCH_LIMIT + 999) }),
-        )
-        .unwrap();
-        assert!(
-            result["results"].as_array().is_some(),
-            "Huge limit clamped to MAX_SEARCH_LIMIT"
         );
+        assert!(result.is_err(), "Huge limit must be rejected");
+        assert!(result.unwrap_err().contains("limit must be <="));
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -3872,15 +3823,15 @@ mod tests {
         );
     }
 
-    // ── H3 (DISPROVED): search_messages limit=0 is safe ────────────────────
-    // clamp(1, MAX_SEARCH_LIMIT) ensures 0 becomes 1 before reaching Tantivy.
+    // ── H3 (UPDATED DR30-H3): search_messages limit=0 now rejected ─────────
+    // Previously clamped to 1 — now returns explicit error (DR30-H3).
     #[tokio::test]
-    async fn dr14_h3_search_limit_zero_clamped_to_one() {
+    async fn dr14_h3_search_limit_zero_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
         let result = search_messages(&state, json!({ "query": "hello", "limit": 0 }));
-        assert!(result.is_ok(), "limit=0 must not panic");
-        assert!(result.unwrap()["results"].as_array().is_some());
+        assert!(result.is_err(), "limit=0 must be rejected");
+        assert!(result.unwrap_err().contains("limit must be >= 1"));
     }
 
     // ── H4 (DISPROVED): empty JSON request returns error, no panic ──────────
@@ -6789,7 +6740,12 @@ mod tests {
             send_result.is_err(),
             "200-char recipient now rejected (limit 128)"
         );
-        assert!(send_result.unwrap_err().contains("Recipient name exceeds"));
+        let err = send_result.unwrap_err();
+        assert!(
+            err.contains("exceeds") && err.contains("character limit"),
+            "Error should mention exceeds character limit: {}",
+            err
+        );
 
         // Also rejected by create_agent (same limit)
         let create_result = create_agent(
@@ -7573,17 +7529,17 @@ mod tests {
             }
         }
 
-        // CONFIRMED: All 4 validators currently agree on all test cases.
-        // But they are separate inline implementations — a new rule added
-        // to validate_agent_name() won't automatically apply to the others.
+        // FIXED (DR30-H1): All validators now call validate_name() — a single
+        // source of truth. New rules added to validate_name() automatically
+        // apply to from_agent, recipients, and agent_name.
     }
 
-    // ── DR30-H2: body allows control chars, subject doesn't ──────────────
-    // Subject validation has chars().any(|c| c.is_control()) check, but
-    // body only checks for null bytes. This asymmetry means \x01 in body
-    // succeeds while \x01 in subject fails.
+    // ── DR30-H2: body rejects control chars (like subject does) ──────────
+    // FIXED: Body now rejects control characters (except \n, \t, \r which
+    // are legitimate in multi-line message content). Subject rejects ALL
+    // control chars because subjects are single-line.
     #[tokio::test]
-    async fn dr30_h2_body_allows_control_chars_subject_doesnt() {
+    async fn dr30_h2_body_rejects_control_chars_like_subject() {
         let (state, _idx, _repo) = test_post_office();
 
         // Subject with SOH control char → rejected
@@ -7602,7 +7558,7 @@ mod tests {
             "Error should mention control characters"
         );
 
-        // Body with SOH control char → accepted (no control char check)
+        // Body with SOH control char → now also rejected
         let r2 = send_message(
             &state,
             json!({
@@ -7613,27 +7569,35 @@ mod tests {
             }),
         );
         assert!(
-            r2.is_ok(),
-            "BUG CONFIRMED: body with \\x01 control char is silently accepted"
+            r2.is_err(),
+            "FIXED: body with \\x01 control char is now rejected"
+        );
+        assert!(
+            r2.unwrap_err().contains("control character"),
+            "Error should mention control characters"
         );
 
-        // Verify the control char made it into the inbox
-        let inbox = get_inbox(&state, json!({ "agent_name": "Recip30H2" })).unwrap();
-        let msgs = inbox_messages(&inbox);
-        assert_eq!(msgs.len(), 1);
-        let body_text = msgs[0]["body"].as_str().unwrap();
+        // But \n, \t, \r in body are allowed (legitimate in multi-line content)
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender30H2",
+                "to": ["Recip30H2"],
+                "subject": "normal subject",
+                "body": "line1\nline2\ttab\rcarriage"
+            }),
+        );
         assert!(
-            body_text.contains('\x01'),
-            "BUG CONFIRMED: control char preserved in body: {:?}",
-            body_text
+            r3.is_ok(),
+            "Body with newline, tab, carriage return must be accepted"
         );
     }
 
-    // ── DR30-H3: Zero/negative limit silently clamped to 1 ───────────────
-    // The tools/list schema declares "minimum": 1 for limit, but the server
-    // uses clamp(1, MAX) instead of rejecting out-of-range values.
+    // ── DR30-H3: Zero/negative limit now rejected with explicit error ─────
+    // FIXED: Out-of-range limits return explicit errors instead of being
+    // silently clamped. Schema declares minimum=1, server now enforces it.
     #[tokio::test]
-    async fn dr30_h3_zero_and_negative_limit_silently_clamped() {
+    async fn dr30_h3_zero_and_negative_limit_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
         // Send 3 messages
@@ -7650,54 +7614,48 @@ mod tests {
             .unwrap();
         }
 
-        // limit=0 → clamped to 1, drains 1 message silently
+        // limit=0 → rejected
         let r1 = get_inbox(&state, json!({ "agent_name": "target30h3", "limit": 0 }));
+        assert!(r1.is_err(), "FIXED: limit=0 now rejected");
         assert!(
-            r1.is_ok(),
-            "BUG CONFIRMED: limit=0 silently accepted (clamped to 1)"
-        );
-        let r1_val = r1.unwrap();
-        let msgs1 = inbox_messages(&r1_val);
-        assert_eq!(
-            msgs1.len(),
-            1,
-            "BUG CONFIRMED: limit=0 drained 1 message instead of 0"
+            r1.unwrap_err().contains("limit must be >= 1"),
+            "Error should mention minimum"
         );
 
-        // limit=-5 → clamped to 1, drains 1 message silently
+        // limit=-5 → rejected
         let r2 = get_inbox(&state, json!({ "agent_name": "target30h3", "limit": -5 }));
+        assert!(r2.is_err(), "FIXED: limit=-5 now rejected");
         assert!(
-            r2.is_ok(),
-            "BUG CONFIRMED: limit=-5 silently accepted (clamped to 1)"
+            r2.unwrap_err().contains("limit must be >= 1"),
+            "Error should mention minimum"
         );
-        let r2_val = r2.unwrap();
-        let msgs2 = inbox_messages(&r2_val);
+
+        // Messages should still be in inbox (nothing drained by failed calls)
+        let r3 = get_inbox(&state, json!({ "agent_name": "target30h3", "limit": 3 }));
+        assert!(r3.is_ok());
+        let r3_val = r3.unwrap();
+        let msgs3 = inbox_messages(&r3_val);
         assert_eq!(
-            msgs2.len(),
-            1,
-            "BUG CONFIRMED: limit=-5 drained 1 message instead of 0"
+            msgs3.len(),
+            3,
+            "All 3 messages preserved after rejected limit calls"
         );
 
         // Same for search_messages
-        let r3 = search_messages(&state, json!({ "query": "hello", "limit": 0 }));
-        assert!(
-            r3.is_ok(),
-            "BUG CONFIRMED: search limit=0 silently accepted"
-        );
+        let r4 = search_messages(&state, json!({ "query": "hello", "limit": 0 }));
+        assert!(r4.is_err(), "FIXED: search limit=0 now rejected");
+        assert!(r4.unwrap_err().contains("limit must be >= 1"));
 
-        let r4 = search_messages(&state, json!({ "query": "hello", "limit": -10 }));
-        assert!(
-            r4.is_ok(),
-            "BUG CONFIRMED: search limit=-10 silently accepted"
-        );
+        let r5 = search_messages(&state, json!({ "query": "hello", "limit": -10 }));
+        assert!(r5.is_err(), "FIXED: search limit=-10 now rejected");
+        assert!(r5.unwrap_err().contains("limit must be >= 1"));
     }
 
-    // ── DR30-H4: body null check before length check → misleading error ──
-    // A body that exceeds MAX_BODY_LEN AND contains a null byte is rejected
-    // for "null bytes" instead of "exceeds limit". Length should be checked
-    // first (like subject does) to fail fast on oversized inputs.
+    // ── DR30-H4: body length checked before null bytes (like subject) ─────
+    // FIXED: Body now checks length BEFORE null bytes, matching subject's
+    // fail-fast validation order. Oversized bodies report the length error.
     #[tokio::test]
-    async fn dr30_h4_body_null_check_before_length_misleading_error() {
+    async fn dr30_h4_body_length_checked_before_null_bytes() {
         let (state, _idx, _repo) = test_post_office();
 
         // Subject checks length BEFORE null bytes (correct order)
@@ -7717,7 +7675,7 @@ mod tests {
             "Subject correctly reports length error first"
         );
 
-        // Body checks null BEFORE length (wrong order)
+        // Body now also checks length BEFORE null bytes (fixed order)
         let mut long_body_with_null = "x".repeat(MAX_BODY_LEN + 100);
         long_body_with_null.push('\0');
         let r2 = send_message(
@@ -7732,9 +7690,9 @@ mod tests {
         assert!(r2.is_err());
         let err = r2.unwrap_err();
         assert!(
-            err.contains("null bytes"),
-            "BUG CONFIRMED: oversized body with null byte reports 'null bytes' error \
-             instead of 'exceeds limit': {}",
+            err.contains("exceeds"),
+            "FIXED: oversized body with null byte now reports 'exceeds' error \
+             (length checked first): {}",
             err
         );
     }
