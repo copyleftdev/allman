@@ -58,6 +58,20 @@ pub struct AgentRecord {
     pub registered_at: i64,
 }
 
+// ── Pre-resolved Tantivy Field Handles ───────────────────────────────────────
+// Resolved once at startup. Avoids 7 HashMap lookups per search_messages
+// request via schema.get_field() (DR37-H3).
+#[derive(Clone, Copy)]
+pub struct SearchFields {
+    pub id: Field,
+    pub project_id: Field,
+    pub from_agent: Field,
+    pub to_recipients: Field,
+    pub subject: Field,
+    pub body: Field,
+    pub created_ts: Field,
+}
+
 // ── Core State ───────────────────────────────────────────────────────────────
 // All hot-path reads and writes go through lock-free DashMap operations.
 // Persistence (Tantivy indexing, Git commits) is async via crossbeam channel.
@@ -77,6 +91,7 @@ pub struct PostOffice {
     // Tantivy search (read path only — writes go through persist pipeline)
     pub index: Arc<Index>,
     pub index_reader: IndexReader,
+    pub search_fields: SearchFields, // resolved once at startup (DR37-H3)
 
     // Async persistence pipeline (fire-and-forget from hot path)
     pub persist_tx: CbSender<PersistOp>,
@@ -111,6 +126,17 @@ impl PostOffice {
         schema_builder.add_i64_field("created_ts", INDEXED | STORED);
         schema_builder.add_text_field("id", STRING | STORED);
         let schema = schema_builder.build();
+
+        // Resolve field handles once at startup (DR37-H3).
+        let search_fields = SearchFields {
+            id: schema.get_field("id").unwrap(),
+            project_id: schema.get_field("project_id").unwrap(),
+            from_agent: schema.get_field("from_agent").unwrap(),
+            to_recipients: schema.get_field("to_recipients").unwrap(),
+            subject: schema.get_field("subject").unwrap(),
+            body: schema.get_field("body").unwrap(),
+            created_ts: schema.get_field("created_ts").unwrap(),
+        };
 
         std::fs::create_dir_all(index_path).context("Failed to create index directory")?;
 
@@ -177,6 +203,7 @@ impl PostOffice {
             projects: Arc::new(DashMap::new()),
             agents: Arc::new(DashMap::new()),
             inboxes: Arc::new(DashMap::new()),
+            search_fields,
             index: Arc::new(index),
             index_reader,
             persist_tx,
