@@ -6601,4 +6601,229 @@ mod tests {
             "Error references the aligned limit of 128"
         );
     }
+
+    // ── DR27 Hypotheses ─────────────────────────────────────────────────────
+
+    // DR27-H1: program and model fields don't validate for null bytes or
+    // control characters. All other string fields do.
+    #[tokio::test]
+    async fn dr27_h1_program_model_accept_null_bytes_and_control_chars() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // program with null byte — accepted (should be rejected)
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "Agent1",
+                "program": "v1\u{0000}evil",
+                "model": "clean"
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "BUG CONFIRMED: program with null byte is accepted"
+        );
+
+        // model with control char — accepted (should be rejected)
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "Agent2",
+                "program": "clean",
+                "model": "gpt\u{0001}bad"
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "BUG CONFIRMED: model with control char is accepted"
+        );
+
+        // For comparison: project_key with null byte IS rejected
+        let r3 = create_agent(
+            &state,
+            json!({
+                "project_key": "test\u{0000}bad",
+                "name_hint": "Agent3"
+            }),
+        );
+        assert!(
+            r3.is_err(),
+            "project_key with null byte is correctly rejected"
+        );
+    }
+
+    // DR27-H2: Recipient name limit (256) is asymmetric with agent name
+    // limit (128). You can send to names too long to register.
+    #[tokio::test]
+    async fn dr27_h2_recipient_name_limit_asymmetric_with_agent_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 200-char recipient — passes MAX_RECIPIENT_NAME_LEN (256)
+        let long_recipient: String = "R".repeat(200);
+        let send_result = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": [long_recipient],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            send_result.is_ok(),
+            "BUG CONFIRMED: 200-char recipient accepted (limit 256)"
+        );
+
+        // But that name can't be registered as an agent (MAX_AGENT_NAME_LEN = 128)
+        let create_result = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": long_recipient }),
+        );
+        assert!(
+            create_result.is_err(),
+            "200-char name rejected by create_agent (limit 128)"
+        );
+
+        // The inbox can also be drained with the long name (get_inbox uses 256)
+        let inbox_result = get_inbox(&state, json!({ "agent_name": long_recipient }));
+        assert!(
+            inbox_result.is_ok(),
+            "BUG CONFIRMED: 200-char agent_name accepted by get_inbox (limit 256)"
+        );
+        let msgs = inbox_result.unwrap()["messages"].as_array().unwrap().clone();
+        assert_eq!(msgs.len(), 1, "Message delivered to unregisterable recipient");
+    }
+
+    // DR27-H3: create_agent upsert preserves agent_id but updates
+    // registered_at. The field name implies first registration time but
+    // actually means last re-registration time.
+    #[tokio::test]
+    async fn dr27_h3_upsert_updates_registered_at_but_preserves_id() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice", "program": "v1" }),
+        )
+        .unwrap();
+
+        let ts1 = r1["registered_at"].as_i64().unwrap();
+
+        // Small delay to ensure different timestamp
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "proj", "name_hint": "Alice", "program": "v2" }),
+        )
+        .unwrap();
+
+        let ts2 = r2["registered_at"].as_i64().unwrap();
+
+        // CONFIRMED: agent_id is stable (DR26-H2 fix)
+        assert_eq!(
+            r1["id"], r2["id"],
+            "agent_id preserved across re-registrations"
+        );
+
+        // CONFIRMED: registered_at changes — semantically it's "last_seen_at"
+        assert!(
+            ts2 > ts1,
+            "BUG CONFIRMED: registered_at updates on upsert ({} > {}), \
+             but field name implies first registration time",
+            ts2,
+            ts1
+        );
+    }
+
+    // DR27-H4: send_message's atomic inbox guard silently skips delivery
+    // on concurrent race but still returns "status": "sent".
+    // We can't easily simulate a concurrent race in a unit test, but we CAN
+    // verify the response format and confirm there's no "partial" indicator.
+    #[tokio::test]
+    async fn dr27_h4_send_response_has_no_partial_delivery_indicator() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Normal send
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": ["A", "B", "C"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        )
+        .unwrap();
+
+        // CONFIRMED: response only contains "id" and "status"
+        assert_eq!(
+            r1["status"].as_str().unwrap(),
+            "sent",
+            "Status is always 'sent'"
+        );
+        assert!(r1.get("id").is_some(), "Has message id");
+
+        // No field for delivery count, skipped recipients, or partial status
+        assert!(
+            r1.get("delivered_to").is_none(),
+            "BUG CONFIRMED: No delivery count in response — if atomic guard \
+             silently skips a recipient, caller has no way to know"
+        );
+        assert!(
+            r1.get("skipped").is_none(),
+            "No skipped-recipients field exists"
+        );
+    }
+
+    // DR27-H5: Non-string name_hint silently falls back to "AnonymousAgent",
+    // causing confusing cross-project collision errors.
+    #[tokio::test]
+    async fn dr27_h5_nonstring_name_hint_causes_confusing_collision() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Integer name_hint — silently becomes "AnonymousAgent"
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "project_a",
+                "name_hint": 12345
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "BUG CONFIRMED: Non-string name_hint silently falls back to AnonymousAgent"
+        );
+        assert_eq!(
+            r1.unwrap()["name"].as_str().unwrap(),
+            "AnonymousAgent",
+            "Agent named AnonymousAgent instead of the intended name"
+        );
+
+        // Second registration in different project with same non-string name_hint
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "project_b",
+                "name_hint": true  // boolean, also not a string
+            }),
+        );
+
+        // CONFIRMED: confusing cross-project collision
+        assert!(
+            r2.is_err(),
+            "BUG CONFIRMED: Cross-project collision with 'AnonymousAgent' from non-string name_hint"
+        );
+        let err = r2.unwrap_err();
+        assert!(
+            err.contains("AnonymousAgent"),
+            "Error mentions AnonymousAgent — but client never intended this name"
+        );
+        assert!(
+            err.contains("different project"),
+            "Error says different project — confusing since client didn't choose the name"
+        );
+    }
 }
