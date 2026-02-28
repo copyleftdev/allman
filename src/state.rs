@@ -165,12 +165,12 @@ impl PostOffice {
         // JoinHandle stored so shutdown() can wait for pending batches (DR34-H3).
         let (persist_tx, persist_rx) = bounded::<PersistOp>(100_000);
         let persist_handle = {
-            let schema = schema.clone();
             let git_tx = git_tx.clone();
+            let sf = search_fields;
             std::thread::Builder::new()
                 .name("persist-worker".into())
                 .spawn(move || {
-                    persistence_worker(persist_rx, index_writer, schema, git_tx);
+                    persistence_worker(persist_rx, index_writer, sf, git_tx);
                 })
                 .context("Failed to spawn persistence worker")?
         };
@@ -227,24 +227,28 @@ impl PostOffice {
         // Join the persist worker thread so pending batches are committed.
         // When the persist worker exits, it drops its git_tx clone (the last
         // sender), which closes the Git channel.
-        if let Ok(mut guard) = self.persist_handle.lock() {
-            if let Some(handle) = guard.take() {
-                if let Err(e) = handle.join() {
-                    tracing::error!("Persist worker thread panicked: {:?}", e);
-                }
+        // Recover from poisoned mutex to avoid silently skipping the join
+        // and losing pending data (DR38-H1).
+        let mut guard = self
+            .persist_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = guard.take() {
+            if let Err(e) = handle.join() {
+                tracing::error!("Persist worker thread panicked: {:?}", e);
             }
         }
+        drop(guard);
 
         // Join the git actor thread so pending git commits complete.
         // The Git channel is now closed (persist worker dropped the last
         // sender above), so the git actor drains remaining requests and
         // exits. Joining ensures all commits finish before process exit
-        // (DR35-H1).
-        if let Ok(mut guard) = self.git_handle.lock() {
-            if let Some(handle) = guard.take() {
-                if let Err(e) = handle.join() {
-                    tracing::error!("Git actor thread panicked: {:?}", e);
-                }
+        // (DR35-H1, DR38-H1).
+        let mut guard = self.git_handle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = guard.take() {
+            if let Err(e) = handle.join() {
+                tracing::error!("Git actor thread panicked: {:?}", e);
             }
         }
     }
@@ -259,18 +263,21 @@ impl PostOffice {
 fn persistence_worker(
     rx: crossbeam_channel::Receiver<PersistOp>,
     mut index_writer: tantivy::IndexWriter,
-    schema: Schema,
+    sf: SearchFields,
     git_tx: CbSender<GitRequest>,
 ) {
     tracing::info!("Persistence worker started");
 
-    let f_id = schema.get_field("id").unwrap();
-    let f_project = schema.get_field("project_id").unwrap();
-    let f_from = schema.get_field("from_agent").unwrap();
-    let f_to = schema.get_field("to_recipients").unwrap();
-    let f_subject = schema.get_field("subject").unwrap();
-    let f_body = schema.get_field("body").unwrap();
-    let f_ts = schema.get_field("created_ts").unwrap();
+    // Use the same pre-resolved field handles as search_messages,
+    // eliminating the fragile coupling-by-convention where both sides
+    // independently resolved handles from separate schema clones (DR38-H2).
+    let f_id = sf.id;
+    let f_project = sf.project_id;
+    let f_from = sf.from_agent;
+    let f_to = sf.to_recipients;
+    let f_subject = sf.subject;
+    let f_body = sf.body;
+    let f_ts = sf.created_ts;
 
     loop {
         // Block until the first operation arrives

@@ -2,7 +2,7 @@ use crate::models::InboxEntry;
 use crate::state::{AgentRecord, PersistOp, PostOffice};
 use chrono::Utc;
 use serde_json::{json, Value};
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
 use uuid::Uuid;
 
@@ -430,15 +430,29 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
             .or_insert_with(|| project_key.to_string());
     }
 
-    // Fire-and-forget: persist agent profile to Git
-    let profile = json!({
-        "id": agent_id,
-        "project_id": project_id,
-        "name": name,
-        "program": program,
-        "model": model,
-        "registered_at": registered_at
-    });
+    // Fire-and-forget: persist agent profile to Git.
+    // Include updated_at on re-registration so the file content alone
+    // can distinguish fresh registrations from updates (DR38-H4).
+    let profile = if is_reregistration {
+        json!({
+            "id": agent_id,
+            "project_id": project_id,
+            "name": name,
+            "program": program,
+            "model": model,
+            "registered_at": registered_at,
+            "updated_at": now
+        })
+    } else {
+        json!({
+            "id": agent_id,
+            "project_id": project_id,
+            "name": name,
+            "program": program,
+            "model": model,
+            "registered_at": registered_at
+        })
+    };
     // Use distinct commit messages for fresh registration vs re-registration
     // so the Git audit trail can distinguish them (DR35-H5).
     let commit_msg = if is_reregistration {
@@ -649,7 +663,22 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     // skipped due to concurrent races (DR27-H4).
     let mut delivered_count = 0usize;
     // Deliver to a single recipient's inbox. Returns true if delivered.
+    // Try get_mut() first to avoid a String allocation for the key when
+    // the inbox already exists (the common case). Only fall back to
+    // entry() (which requires an owned key) for new inboxes (DR38-H5).
     let deliver = |recipient: &str, inbox_entry: InboxEntry| -> bool {
+        // Fast path: existing inbox — borrows &str, no heap allocation.
+        if let Some(mut inbox) = state.inboxes.get_mut(recipient) {
+            if inbox.len() < MAX_INBOX_SIZE {
+                inbox.push(inbox_entry);
+                return true;
+            }
+            // Concurrent race filled this inbox after pre-check.
+            return false;
+        }
+        // Slow path: new inbox — allocates String for the DashMap key.
+        // Re-check via entry() in case another thread created it between
+        // the get_mut miss and this call.
         match state.inboxes.entry(recipient.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                 let inbox = occ.get_mut();
@@ -657,7 +686,6 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
                     inbox.push(inbox_entry);
                     true
                 } else {
-                    // Concurrent race filled this inbox after pre-check.
                     false
                 }
             }
@@ -874,8 +902,11 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         .parse_query(query_str)
         .map_err(|e| format!("Query parse error: {}", e))?;
 
-    let top_docs = searcher
-        .search(&query, &TopDocs::with_limit(limit))
+    // Multi-collector: TopDocs for results + Count for total matching
+    // documents. Previously `count` was always results.len() which is
+    // redundant — now it reports total hits for pagination (DR38-H3).
+    let (top_docs, total_hits) = searcher
+        .search(&query, &(TopDocs::with_limit(limit), Count))
         .map_err(|e| format!("Search error: {}", e))?;
 
     // Build JSON directly from Tantivy document fields — avoids the
@@ -900,7 +931,8 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     Ok(json!({
         "results": results,
-        "count": results.len()
+        "count": results.len(),
+        "total_hits": total_hits
     }))
 }
 
@@ -9606,6 +9638,240 @@ mod tests {
                 "dr37h3_msg",
                 "Search #{} returns same doc",
                 i
+            );
+        }
+    }
+
+    // ── DR38-H1: shutdown() silently skips poisoned mutexes ──────────────
+    // The shutdown() method uses `if let Ok(...)` to lock persist_handle and
+    // git_handle. If either Mutex is poisoned, the join is silently skipped,
+    // potentially losing pending data. This test documents the pattern.
+    #[tokio::test]
+    async fn dr38_h1_shutdown_mutex_pattern_uses_if_let_ok() {
+        // Verify that PostOffice has persist_handle and git_handle fields
+        // that are Arc<Mutex<Option<JoinHandle<()>>>>. We can't trigger a
+        // poison in a unit test without unsafe, so this characterization test
+        // verifies shutdown() completes successfully under normal conditions.
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send a message to create some persist pipeline activity
+        let _ = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::IndexMessage {
+                id: "dr38h1_msg".to_string(),
+                project_id: "proj_dr38".to_string(),
+                from_agent: "alice".to_string(),
+                to_recipients: "bob".to_string(),
+                subject: "shutdown test".to_string(),
+                body: "testing graceful shutdown".to_string(),
+                created_ts: 9000000,
+            });
+
+        // shutdown() should complete without panic or hang
+        state.shutdown();
+        // If we get here, shutdown succeeded (mutexes were not poisoned).
+    }
+
+    // ── DR38-H2: persistence_worker resolves fields independently ────────
+    // The persistence_worker resolves its own field handles from a cloned
+    // schema. These MUST match the SearchFields resolved at startup.
+    // This test verifies they produce identical results by indexing a doc
+    // via the persist pipeline and reading it back via search with SearchFields.
+    #[tokio::test]
+    async fn dr38_h2_persist_worker_and_search_fields_are_consistent() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Index via persist pipeline (uses worker's own field handles)
+        let _ = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::IndexMessage {
+                id: "dr38h2_msg".to_string(),
+                project_id: "proj_dr38h2".to_string(),
+                from_agent: "writer_agent".to_string(),
+                to_recipients: "reader_agent".to_string(),
+                subject: "consistency38h2 check".to_string(),
+                body: "worker vs search fields".to_string(),
+                created_ts: 8000000,
+            });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Read back via search_messages (uses SearchFields from PostOffice)
+        let result = search_messages(&state, json!({ "query": "consistency38h2", "limit": 10 }));
+        assert!(result.is_ok(), "Search should succeed");
+
+        let resp = result.unwrap();
+        let results = resp["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "Should find exactly 1 result");
+
+        let doc = &results[0];
+        // Every field written by the worker must be readable by SearchFields
+        assert_eq!(doc["id"].as_str().unwrap(), "dr38h2_msg");
+        assert_eq!(doc["project_id"].as_str().unwrap(), "proj_dr38h2");
+        assert_eq!(doc["from_agent"].as_str().unwrap(), "writer_agent");
+        assert_eq!(doc["to_recipients"].as_str().unwrap(), "reader_agent");
+        assert_eq!(doc["subject"].as_str().unwrap(), "consistency38h2 check");
+        assert_eq!(doc["body"].as_str().unwrap(), "worker vs search fields");
+        assert_eq!(doc["created_ts"].as_i64().unwrap(), 8000000);
+    }
+
+    // ── DR38-H3: search_messages count is redundant with results.len() ──
+    // The `count` field in search_messages response always equals the length
+    // of the results array. It does NOT represent total matching documents.
+    #[tokio::test]
+    async fn dr38_h3_search_count_equals_results_array_length() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Index 5 messages with the same keyword
+        for i in 0..5 {
+            let _ = state
+                .persist_tx
+                .try_send(crate::state::PersistOp::IndexMessage {
+                    id: format!("dr38h3_msg_{}", i),
+                    project_id: "proj_dr38h3".to_string(),
+                    from_agent: "alice".to_string(),
+                    to_recipients: "bob".to_string(),
+                    subject: format!("counttest38h3 item {}", i),
+                    body: "search count test".to_string(),
+                    created_ts: 7000000 + i,
+                });
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Search with limit=2 — should return 2 results, total_hits=5
+        let result = search_messages(&state, json!({ "query": "counttest38h3", "limit": 2 }));
+        assert!(result.is_ok());
+
+        let resp = result.unwrap();
+        let results = resp["results"].as_array().unwrap();
+        let count = resp["count"].as_u64().unwrap();
+        let total_hits = resp["total_hits"].as_u64().unwrap();
+
+        assert_eq!(results.len(), 2, "Should return exactly 2 results");
+        assert_eq!(
+            count,
+            results.len() as u64,
+            "count equals results array length"
+        );
+        // total_hits reports ALL matching docs, not just the returned subset (DR38-H3)
+        assert_eq!(total_hits, 5, "total_hits reports all matching documents");
+        assert!(
+            total_hits > count,
+            "total_hits > count when limit < total matches"
+        );
+    }
+
+    // ── DR38-H4: re-registration profile lacks updated_at ───────────────
+    // When an agent re-registers with different program/model, the returned
+    // profile JSON preserves the original registered_at. There is no
+    // updated_at field to indicate when the re-registration occurred.
+    #[tokio::test]
+    async fn dr38_h4_reregistration_profile_lacks_updated_at() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // First registration
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "proj_dr38h4",
+                "name_hint": "AgentH4",
+                "program": "v1",
+                "model": "gpt-4"
+            }),
+        );
+        assert!(r1.is_ok());
+        let profile1 = r1.unwrap();
+        let registered_at_1 = profile1["registered_at"].as_i64().unwrap();
+
+        // Small delay to ensure timestamps differ
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        // Re-registration with different program/model
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "proj_dr38h4",
+                "name_hint": "AgentH4",
+                "program": "v2",
+                "model": "gpt-5"
+            }),
+        );
+        assert!(r2.is_ok());
+        let profile2 = r2.unwrap();
+
+        // registered_at is preserved from first registration (DR26-H2, DR27-H3)
+        assert_eq!(
+            profile2["registered_at"].as_i64().unwrap(),
+            registered_at_1,
+            "registered_at must be preserved on re-registration"
+        );
+
+        // program and model are updated
+        assert_eq!(profile2["program"].as_str().unwrap(), "v2");
+        assert_eq!(profile2["model"].as_str().unwrap(), "gpt-5");
+
+        // updated_at is present on re-registration so the profile JSON
+        // alone can distinguish fresh registrations from updates (DR38-H4).
+        let updated_at = profile2["updated_at"].as_i64();
+        assert!(updated_at.is_some(), "updated_at exists on re-registration");
+        assert!(
+            updated_at.unwrap() >= registered_at_1,
+            "updated_at >= registered_at"
+        );
+
+        // First registration should NOT have updated_at
+        assert!(
+            profile1.get("updated_at").is_none(),
+            "Fresh registration has no updated_at"
+        );
+    }
+
+    // ── DR38-H5: deliver closure allocates String per entry() call ───────
+    // DashMap::entry() requires an owned key. The deliver closure calls
+    // recipient.to_string() for every recipient, even when the inbox exists.
+    // This test verifies the allocation is correct (messages are delivered)
+    // and documents the per-recipient String allocation overhead.
+    #[tokio::test]
+    async fn dr38_h5_deliver_allocates_string_per_recipient() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Pre-create inboxes by sending an initial message
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "setup38h5",
+                "to": ["inbox_a", "inbox_b", "inbox_c"],
+                "subject": "setup",
+                "body": "pre-create inboxes"
+            }),
+        );
+        assert!(r1.is_ok());
+
+        // Drain to clear but keep inboxes existing in DashMap
+        // (get_inbox removes the entry on full drain, so we need to
+        // send again to have occupied entries)
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "sender38h5",
+                "to": ["inbox_a", "inbox_b", "inbox_c"],
+                "subject": "test38h5",
+                "body": "deliver to existing inboxes"
+            }),
+        );
+        assert!(r2.is_ok());
+        assert_eq!(r2.unwrap()["delivered_count"].as_u64().unwrap(), 3);
+
+        // Verify all 3 recipients have 2 messages (setup + test)
+        for name in &["inbox_a", "inbox_b", "inbox_c"] {
+            let inbox = get_inbox(&state, json!({ "agent_name": name })).unwrap();
+            let msgs = inbox_messages(&inbox);
+            assert_eq!(
+                msgs.len(),
+                2,
+                "{} should have 2 messages (entry() works for existing inboxes)",
+                name
             );
         }
     }
