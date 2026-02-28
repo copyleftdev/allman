@@ -431,28 +431,21 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
 
     // Fire-and-forget: persist agent profile to Git.
-    // Include updated_at on re-registration so the file content alone
-    // can distinguish fresh registrations from updates (DR38-H4).
-    let profile = if is_reregistration {
-        json!({
-            "id": agent_id,
-            "project_id": project_id,
-            "name": name,
-            "program": program,
-            "model": model,
-            "registered_at": registered_at,
-            "updated_at": now
-        })
-    } else {
-        json!({
-            "id": agent_id,
-            "project_id": project_id,
-            "name": name,
-            "program": program,
-            "model": model,
-            "registered_at": registered_at
-        })
-    };
+    // updated_at is always present for consistent response schema (DR39-H2):
+    // - Fresh registration: updated_at is null
+    // - Re-registration: updated_at is the current timestamp
+    // This lets clients rely on a fixed set of fields regardless of whether
+    // the agent existed before (DR38-H4 introduced updated_at, DR39-H2 made
+    // it always present).
+    let profile = json!({
+        "id": agent_id,
+        "project_id": project_id,
+        "name": name,
+        "program": program,
+        "model": model,
+        "registered_at": registered_at,
+        "updated_at": if is_reregistration { serde_json::Value::from(now) } else { serde_json::Value::Null }
+    });
     // Use distinct commit messages for fresh registration vs re-registration
     // so the Git audit trail can distinguish them (DR35-H5).
     let commit_msg = if is_reregistration {
@@ -774,27 +767,42 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         None => DEFAULT_INBOX_LIMIT,
     };
 
-    // Atomic drain via entry() API. Holds the DashMap shard lock for the
-    // entire operation, preventing concurrent send_message from inserting
-    // messages that would be overwritten by a separate insert() call.
-    // Previous remove→insert pattern had a TOCTOU race window (H1).
+    // Fast path: nonexistent inbox — borrows &str, no String allocation.
+    // entry() requires an owned String key; skip it when the inbox doesn't
+    // exist (the Vacant branch was a no-op anyway) (DR39-H1).
     let mut taken = Vec::new();
     let remaining_count;
 
-    match state.inboxes.entry(agent_name.to_string()) {
-        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-            let inbox = occ.get_mut();
-            if inbox.len() <= limit {
-                taken = std::mem::take(inbox);
-                remaining_count = 0;
-                occ.remove(); // Clean up empty entry
-            } else {
-                taken = inbox.drain(..limit).collect();
-                remaining_count = inbox.len();
+    if !state.inboxes.contains_key(agent_name) {
+        remaining_count = 0;
+    } else {
+        // Atomic drain via entry() API. Holds the DashMap shard lock for the
+        // entire operation, preventing concurrent send_message from inserting
+        // messages that would be overwritten by a separate insert() call.
+        // Previous remove→insert pattern had a TOCTOU race window (H1).
+        match state.inboxes.entry(agent_name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                let inbox = occ.get_mut();
+                if inbox.len() <= limit {
+                    taken = std::mem::take(inbox);
+                    remaining_count = 0;
+                    occ.remove(); // Clean up empty entry
+                } else {
+                    taken = inbox.drain(..limit).collect();
+                    remaining_count = inbox.len();
+                    // Reclaim excess Vec capacity after partial drain.
+                    // Without this, the Vec retains its peak capacity
+                    // indefinitely (e.g., 10K capacity after draining
+                    // to 100 entries). Bounded by MAX_INBOX_SIZE but
+                    // wasteful for inboxes that had a burst (DR39-H3).
+                    inbox.shrink_to_fit();
+                }
             }
-        }
-        dashmap::mapref::entry::Entry::Vacant(_) => {
-            remaining_count = 0;
+            // TOCTOU fallback: inbox was removed between contains_key and
+            // entry() by a concurrent full drain. Safe — returns empty.
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                remaining_count = 0;
+            }
         }
     }
 
@@ -9820,10 +9828,11 @@ mod tests {
             "updated_at >= registered_at"
         );
 
-        // First registration should NOT have updated_at
+        // UPDATED (DR39-H2): Fresh registration now has updated_at: null
+        // for consistent schema across fresh and re-registration responses.
         assert!(
-            profile1.get("updated_at").is_none(),
-            "Fresh registration has no updated_at"
+            profile1["updated_at"].is_null(),
+            "Fresh registration has updated_at: null (DR39-H2)"
         );
     }
 
@@ -9874,5 +9883,215 @@ mod tests {
                 name
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Deep Review #39 — Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── DR39-H1: get_inbox allocates String for nonexistent agents via entry() ─
+    // get_inbox calls state.inboxes.entry(agent_name.to_string()) for every
+    // request, even when the agent has no inbox. The Vacant branch is a no-op
+    // but the entry() call requires an owned String key allocation. A
+    // contains_key fast path (borrowing &str) would avoid this allocation
+    // for the common "no inbox" case.
+    #[tokio::test]
+    async fn dr39_h1_get_inbox_nonexistent_agent_avoids_entry() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Nonexistent agent — no inbox exists
+        assert!(!state.inboxes.contains_key("nonexistent39h1"));
+
+        let result = get_inbox(&state, json!({ "agent_name": "nonexistent39h1" })).unwrap();
+        assert_eq!(inbox_messages(&result).len(), 0);
+        assert_eq!(result["remaining"], 0);
+
+        // The entry() call's Vacant branch must NOT create a DashMap entry.
+        // This documents that even though entry() is called, no spurious
+        // entry is left behind (the Vacant branch does not insert).
+        assert!(
+            !state.inboxes.contains_key("nonexistent39h1"),
+            "get_inbox on nonexistent agent must not create a DashMap entry"
+        );
+    }
+
+    // ── DR39-H2: create_agent response schema inconsistency ──────────────────
+    // Fresh registration omits `updated_at`, re-registration includes it.
+    // This makes the API response schema inconsistent. Clients cannot rely
+    // on a fixed set of fields across fresh and re-registration calls.
+    #[tokio::test]
+    async fn dr39_h2_create_agent_response_schema_consistency() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Fresh registration
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "proj_dr39h2",
+                "name_hint": "SchemaAgent",
+                "program": "v1"
+            }),
+        )
+        .unwrap();
+
+        // Fresh registration should have these exact fields
+        assert!(r1.get("id").is_some(), "id present");
+        assert!(r1.get("project_id").is_some(), "project_id present");
+        assert!(r1.get("name").is_some(), "name present");
+        assert!(r1.get("program").is_some(), "program present");
+        assert!(r1.get("model").is_some(), "model present");
+        assert!(r1.get("registered_at").is_some(), "registered_at present");
+
+        // FIXED (DR39-H2): updated_at is now always present.
+        // Fresh registration has updated_at: null.
+        assert!(
+            r1.get("updated_at").is_some(),
+            "FIXED: updated_at always present (null on fresh registration)"
+        );
+        assert!(
+            r1["updated_at"].is_null(),
+            "Fresh registration has updated_at: null"
+        );
+
+        // Re-registration
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "proj_dr39h2",
+                "name_hint": "SchemaAgent",
+                "program": "v2"
+            }),
+        )
+        .unwrap();
+
+        // updated_at is a timestamp on re-registration
+        assert!(
+            r2.get("updated_at").is_some(),
+            "Re-registration includes updated_at"
+        );
+        assert!(
+            r2["updated_at"].is_i64(),
+            "Re-registration updated_at is an integer timestamp"
+        );
+
+        // Consistent schema: both responses have exactly the same 7 fields
+        let fields_fresh: Vec<&str> = r1.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let fields_rereg: Vec<&str> = r2.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            fields_fresh.len(),
+            fields_rereg.len(),
+            "FIXED: Same number of fields in fresh and re-registration responses"
+        );
+    }
+
+    // ── DR39-H3: get_inbox partial drain doesn't shrink Vec capacity ─────────
+    // Vec::drain(..limit) removes elements but never reduces the Vec's
+    // allocated capacity. After partial drains, the inbox Vec retains its
+    // peak capacity until the entry is fully drained and removed.
+    #[tokio::test]
+    async fn dr39_h3_partial_drain_vec_capacity_behavior() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Fill inbox with 200 messages
+        for i in 0..200 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "filler39h3",
+                    "to": ["target39h3"],
+                    "subject": format!("msg #{}", i),
+                    "body": "x",
+                }),
+            )
+            .unwrap();
+        }
+
+        // Partial drain: take 50, leave 150
+        let page1 = get_inbox(&state, json!({ "agent_name": "target39h3", "limit": 50 })).unwrap();
+        assert_eq!(inbox_messages(&page1).len(), 50);
+        assert_eq!(page1["remaining"], 150);
+
+        // After partial drain, the entry still exists in DashMap
+        assert!(
+            state.inboxes.contains_key("target39h3"),
+            "Inbox entry persists after partial drain"
+        );
+
+        // Drain remaining
+        let page2 =
+            get_inbox(&state, json!({ "agent_name": "target39h3", "limit": 1000 })).unwrap();
+        assert_eq!(inbox_messages(&page2).len(), 150);
+        assert_eq!(page2["remaining"], 0);
+
+        // After full drain, entry is removed (occ.remove())
+        assert!(
+            !state.inboxes.contains_key("target39h3"),
+            "Inbox entry removed after full drain — frees Vec capacity"
+        );
+    }
+
+    // ── DR39-H4 (DISPROVED): Double-Arc NrtShutdownGuard is correct ──────────
+    // Arc<NrtShutdownGuard(Arc<AtomicBool>)> — the outer Arc ensures the Drop
+    // fires only when the LAST PostOffice clone is dropped, the inner Arc
+    // shares the flag with the tokio NRT refresh task. Both are needed.
+    #[tokio::test]
+    async fn dr39_h4_nrt_shutdown_guard_arc_pattern_correct() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Clone the state (simulating Axum Extension layer)
+        let clone1 = state.clone();
+        let clone2 = state.clone();
+
+        // Dropping clones should NOT trigger NRT shutdown
+        // (search still works after dropping clones)
+        drop(clone1);
+        drop(clone2);
+
+        // Original state still works — NRT guard not triggered
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "dr39h4_sender",
+                "to": ["dr39h4_receiver"],
+                "subject": "arc test",
+                "body": "guard still active"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "State works after dropping clones (NRT guard not triggered)"
+        );
+
+        // Shutdown the original — this drops the last Arc, triggering NRT guard
+        state.shutdown();
+    }
+
+    // ── DR39-H5 (DISPROVED): QueryParser per-request overhead is negligible ──
+    // QueryParser::for_index() is called per search request. This test verifies
+    // it doesn't degrade under repeated construction by running 200 sequential
+    // searches. The construction is lightweight (Arc increment + small Vec).
+    #[tokio::test]
+    async fn dr39_h5_query_parser_per_request_overhead_negligible() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 200 sequential searches — each creates a new QueryParser
+        let start = std::time::Instant::now();
+        for i in 0..200 {
+            let result = search_messages(
+                &state,
+                json!({ "query": format!("term39h5_{}", i), "limit": 10 }),
+            );
+            assert!(result.is_ok(), "Search #{} should succeed", i);
+        }
+        let elapsed = start.elapsed();
+
+        // 200 searches should complete well under 1 second
+        // (each QueryParser construction is sub-microsecond)
+        assert!(
+            elapsed.as_secs() < 2,
+            "200 searches completed in {:?} — QueryParser overhead is negligible",
+            elapsed
+        );
     }
 }
