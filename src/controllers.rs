@@ -45,7 +45,27 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
         return Value::Null;
     }
 
-    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // JSON-RPC 2.0 §4: "method" MUST be a String. Missing or non-string
+    // method is a structurally invalid request → -32600 (DR28-H3).
+    let method = match req.get("method") {
+        Some(v) => match v.as_str() {
+            Some(s) => s,
+            None => {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32600, "message": "Invalid Request: method must be a string" }
+                });
+            }
+        },
+        None => {
+            return json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32600, "message": "Invalid Request: missing method field" }
+            });
+        }
+    };
     let params = req.get("params").cloned().unwrap_or(json!({}));
 
     // JSON-RPC 2.0 §4: "jsonrpc" MUST be exactly "2.0" (DR25-H3).
@@ -72,6 +92,17 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
         "tools/call" => {
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+            // Validate arguments is an object (or absent → defaulted to {}).
+            // Non-object arguments (string, array, number) would produce
+            // misleading tool-level errors like "Missing project_key" (DR28-H4).
+            if !args.is_object() {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": "Invalid arguments: must be an object" }
+                });
+            }
 
             let result = match tool_name {
                 "create_agent" => create_agent(&state, args),
@@ -216,10 +247,10 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
 // ── create_agent ─────────────────────────────────────────────────────────────
 // Hot path: DashMap insert + crossbeam send. No disk I/O.
 fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
-    let project_key = args
-        .get("project_key")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing project_key")?;
+    let project_key = match args.get("project_key") {
+        Some(v) => v.as_str().ok_or("project_key must be a string")?,
+        None => return Err("Missing project_key".to_string()),
+    };
     if project_key.is_empty() {
         return Err("project_key must not be empty".to_string());
     }
@@ -241,14 +272,19 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     if project_key != project_key.trim() {
         return Err("project_key must not have leading or trailing whitespace".to_string());
     }
-    let program = args
-        .get("program")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let model = args
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    // Validate program/model types: if present and non-null, MUST be strings.
+    // Silently defaulting to "unknown" for non-string values (e.g., integers)
+    // is confusing — the same class of bug fixed for name_hint in DR27-H5 (DR28-H1).
+    let program = match args.get("program") {
+        Some(v) if v.is_null() => "unknown",
+        Some(v) => v.as_str().ok_or("program must be a string if provided")?,
+        None => "unknown",
+    };
+    let model = match args.get("model") {
+        Some(v) if v.is_null() => "unknown",
+        Some(v) => v.as_str().ok_or("model must be a string if provided")?,
+        None => "unknown",
+    };
     // Validate name_hint type: if present and non-null, MUST be a string.
     // Silently falling back to "AnonymousAgent" for non-string values (e.g.,
     // integers, booleans) causes confusing cross-project collisions (DR27-H5).
@@ -383,15 +419,20 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
 // ── send_message ─────────────────────────────────────────────────────────────
 // Hot path: DashMap inbox append + crossbeam persist send. No disk I/O.
 fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
-    let from_agent = args
-        .get("from_agent")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing from_agent")?;
+    let from_agent = match args.get("from_agent") {
+        Some(v) => v.as_str().ok_or("from_agent must be a string")?,
+        None => return Err("Missing from_agent".to_string()),
+    };
+    let to_array = match args.get("to") {
+        Some(v) => v.as_array().ok_or("to must be a JSON array")?,
+        None => return Err("Missing to recipients".to_string()),
+    };
+    // Check for non-string elements BEFORE filtering, so the error message
+    // explains why recipients were rejected instead of "No recipients specified" (DR28-H2).
+    let has_nonstring = to_array.iter().any(|v| !v.is_string() && !v.is_null());
     let to_agents: Vec<String> = {
         let mut seen = std::collections::HashSet::new();
-        args.get("to")
-            .and_then(|v| v.as_array())
-            .ok_or("Missing to recipients")?
+        to_array
             .iter()
             .filter_map(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -399,6 +440,11 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
             .map(|s| s.to_string())
             .collect()
     };
+    if to_agents.is_empty() && has_nonstring {
+        return Err(
+            "to array contains non-string elements — all recipients must be strings".to_string(),
+        );
+    }
     let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
     let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let project_id = args
@@ -615,10 +661,10 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
 // Supports optional `limit` parameter (default 100, max 1000) to bound
 // response size. Returns `remaining` count so callers know to fetch more.
 fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
-    let agent_name = args
-        .get("agent_name")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing agent_name")?;
+    let agent_name = match args.get("agent_name") {
+        Some(v) => v.as_str().ok_or("agent_name must be a string")?,
+        None => return Err("Missing agent_name".to_string()),
+    };
     if agent_name.is_empty() {
         return Err("agent_name must not be empty".to_string());
     }
@@ -726,10 +772,10 @@ fn unwrap_tantivy_arrays(doc: Value) -> Value {
 // ── search_messages ──────────────────────────────────────────────────────────
 // Tantivy NRT search — unchanged, already fast.
 fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
-    let query_str = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing query")?;
+    let query_str = match args.get("query") {
+        Some(v) => v.as_str().ok_or("query must be a string")?,
+        None => return Err("Missing query".to_string()),
+    };
     if query_str.trim().is_empty() {
         return Err("query must not be empty or whitespace-only".to_string());
     }
@@ -3302,22 +3348,22 @@ mod tests {
         assert_eq!(state.projects.len(), 0);
     }
 
-    // ── H3 (DISPROVED): Non-string method returns error, no panic ────────
-    // handle_mcp_request uses .as_str() which returns None for non-strings,
-    // falling through to "" → _ arm → -32601 Method not found.
+    // ── H3 (UPDATED): Non-string method now returns -32600 Invalid Request ──
+    // Non-string method is a structurally invalid request per JSON-RPC 2.0 §4.
+    // Fixed in DR28-H3: returns -32600 instead of -32601.
     #[tokio::test]
     async fn dr11_h3_nonstring_method_returns_error() {
         let (state, _idx, _repo) = test_post_office();
 
-        // method is an integer, not a string
+        // method is an integer, not a string → -32600 Invalid Request
         let resp = handle_mcp_request(
             state.clone(),
             json!({ "jsonrpc": "2.0", "id": 1, "method": 42 }),
         )
         .await;
         assert_eq!(
-            resp["error"]["code"], -32601,
-            "Non-string method should return Method not found"
+            resp["error"]["code"], -32600,
+            "Non-string method returns -32600 Invalid Request (DR28-H3)"
         );
 
         // method is a boolean
@@ -3326,7 +3372,7 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": 2, "method": true }),
         )
         .await;
-        assert_eq!(resp["error"]["code"], -32601);
+        assert_eq!(resp["error"]["code"], -32600);
 
         // method is an array
         let resp = handle_mcp_request(
@@ -3334,7 +3380,7 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": 3, "method": ["tools/call"] }),
         )
         .await;
-        assert_eq!(resp["error"]["code"], -32601);
+        assert_eq!(resp["error"]["code"], -32600);
     }
 
     // ── H4 (DISPROVED): Body with null bytes is correctly handled ────────
@@ -3814,13 +3860,16 @@ mod tests {
             "UPDATED: Empty JSON (no id) is a notification — silently dropped (DR26)"
         );
 
-        // With "id" and "jsonrpc" present, returns Method not found
+        // With "id" and "jsonrpc" present but no method → -32600 Invalid Request (DR28-H3)
         let response2 =
             handle_mcp_request(test_post_office().0, json!({ "jsonrpc": "2.0", "id": 1 })).await;
         assert_eq!(response2["jsonrpc"], "2.0");
         assert!(response2.get("error").is_some(), "Must return error");
-        assert_eq!(response2["error"]["code"], -32601);
-        assert_eq!(response2["error"]["message"], "Method not found");
+        assert_eq!(response2["error"]["code"], -32600);
+        assert!(response2["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing method"));
     }
 
     // ── H5 (CONFIRMED): dot-prefixed agent names create hidden dirs ─────────
@@ -5777,52 +5826,63 @@ mod tests {
         );
     }
 
-    // ── H4 (CONFIRMED): Non-string optional fields use defaults silently ────────
-    // program=42, model=true → as_str() returns None → unwrap_or("unknown").
-    // Client sent a value but gets "unknown" back — no error raised.
+    // ── H4 (FIXED): Non-string optional fields now rejected with clear error ──
+    // program=42, model=true now return type errors (DR28-H1).
+    // Null values still default to "unknown" (same as absent).
     #[tokio::test]
     async fn dr23_h4_non_string_optional_fields_use_defaults() {
         let (state, _idx, _repo) = test_post_office();
 
-        let result = create_agent(
+        // Integer program → error
+        let r1 = create_agent(
             &state,
             json!({
                 "project_key": "test",
                 "name_hint": "TypeAgent",
                 "program": 42,
+                "model": "valid",
+            }),
+        );
+        assert!(r1.is_err(), "FIXED: Non-string program now rejected");
+        assert!(r1.unwrap_err().contains("program must be a string"));
+
+        // Boolean model → error
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "TypeAgent2",
+                "program": "valid",
                 "model": true,
             }),
         );
+        assert!(r2.is_err(), "FIXED: Non-string model now rejected");
+        assert!(r2.unwrap_err().contains("model must be a string"));
 
-        assert!(
-            result.is_ok(),
-            "CONFIRMED: Non-string program/model don't cause errors"
+        // Null program/model → defaults to "unknown" (like absent)
+        let r3 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "TypeAgent3",
+                "program": null,
+                "model": null,
+            }),
         );
-
-        let profile = result.unwrap();
-        assert_eq!(
-            profile["program"], "unknown",
-            "CONFIRMED: Integer program silently defaults to 'unknown'"
-        );
-        assert_eq!(
-            profile["model"], "unknown",
-            "CONFIRMED: Boolean model silently defaults to 'unknown'"
-        );
-
-        // DashMap record also has defaults
-        let record = state.agents.get("TypeAgent").unwrap();
-        assert_eq!(record.program, "unknown");
-        assert_eq!(record.model, "unknown");
+        assert!(r3.is_ok(), "Null program/model treated as absent");
+        let profile = r3.unwrap();
+        assert_eq!(profile["program"], "unknown");
+        assert_eq!(profile["model"], "unknown");
     }
 
-    // ── H5 (CONFIRMED): Non-array `to` returns misleading error ──────────────
-    // If `to` is a string "bob" instead of ["bob"], as_array() returns None,
-    // producing error "Missing to recipients" — the field IS present, just wrong type.
+    // ── H5 (FIXED): Non-array `to` now returns type-specific error ──────────
+    // Fixed in DR28-H2/H5: wrong-type fields now say what's wrong instead
+    // of "Missing". String/integer `to` says "must be a JSON array".
     #[tokio::test]
-    async fn dr23_h5_non_array_to_returns_misleading_error() {
+    async fn dr23_h5_non_array_to_returns_type_error() {
         let (state, _idx, _repo) = test_post_office();
 
-        // `to` is a string, not an array
+        // `to` is a string, not an array → type error
         let r1 = send_message(
             &state,
             json!({
@@ -5835,11 +5895,11 @@ mod tests {
         assert!(r1.is_err(), "Non-array `to` returns error");
         assert_eq!(
             r1.unwrap_err(),
-            "Missing to recipients",
-            "CONFIRMED: Error says 'Missing' even though field is present (wrong type)"
+            "to must be a JSON array",
+            "FIXED: Error explains the type requirement (DR28)"
         );
 
-        // `to` is an integer
+        // `to` is an integer → same type error
         let r2 = send_message(
             &state,
             json!({
@@ -5850,9 +5910,9 @@ mod tests {
             }),
         );
         assert!(r2.is_err(), "Integer `to` returns error");
-        assert_eq!(r2.unwrap_err(), "Missing to recipients");
+        assert_eq!(r2.unwrap_err(), "to must be a JSON array");
 
-        // `to` as null
+        // `to` as null → treated as missing
         let r3 = send_message(
             &state,
             json!({
@@ -5863,7 +5923,7 @@ mod tests {
             }),
         );
         assert!(r3.is_err(), "Null `to` returns error");
-        assert_eq!(r3.unwrap_err(), "Missing to recipients");
+        assert_eq!(r3.unwrap_err(), "to must be a JSON array");
     }
 
     // ── DR24: Validation Asymmetries II ─────────────────────────────────────
@@ -6884,5 +6944,245 @@ mod tests {
             "AnonymousAgent",
             "Missing name_hint defaults to AnonymousAgent"
         );
+    }
+
+    // ── DR28 Hypotheses ─────────────────────────────────────────────────────
+
+    // DR28-H1 (FIXED): Non-string program/model now rejected with clear error.
+    // Null values still default to "unknown" (same as absent).
+    #[tokio::test]
+    async fn dr28_h1_nonstring_program_model_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Integer program — now rejected
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "Agent1",
+                "program": 42,
+                "model": "valid_model"
+            }),
+        );
+        assert!(r1.is_err(), "Non-string program must be rejected");
+        assert!(r1.unwrap_err().contains("program must be a string"));
+
+        // Boolean model — now rejected
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "Agent2",
+                "program": "valid",
+                "model": true
+            }),
+        );
+        assert!(r2.is_err(), "Non-string model must be rejected");
+        assert!(r2.unwrap_err().contains("model must be a string"));
+
+        // Null program/model — defaults to "unknown" (like absent)
+        let r3 = create_agent(
+            &state,
+            json!({
+                "project_key": "test",
+                "name_hint": "Agent3",
+                "program": null,
+                "model": null
+            }),
+        );
+        assert!(r3.is_ok(), "Null program/model treated as absent");
+        let p = r3.unwrap();
+        assert_eq!(p["program"], "unknown");
+        assert_eq!(p["model"], "unknown");
+    }
+
+    // DR28-H2 (FIXED): to array with non-string elements now gives
+    // a clear error explaining the type requirement.
+    #[tokio::test]
+    async fn dr28_h2_nonstring_to_elements_rejected_with_clear_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Array with only non-string elements → clear type error
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": [42, true, null],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+
+        assert!(result.is_err(), "Should fail with non-string recipients");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-string"),
+            "FIXED: Error explains that recipients must be strings, got: {}",
+            err
+        );
+
+        // Mixed array: valid strings + non-strings → strings are accepted
+        let result2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": ["Alice", 42, "Bob"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            result2.is_ok(),
+            "Mixed array with valid strings succeeds (non-strings filtered)"
+        );
+    }
+
+    // DR28-H3 (FIXED): Missing/non-string method now returns -32600
+    // "Invalid Request" per JSON-RPC 2.0 §4.
+    #[tokio::test]
+    async fn dr28_h3_missing_method_returns_invalid_request() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Missing method → -32600 Invalid Request
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1
+            }),
+        )
+        .await;
+
+        let code = resp["error"]["code"].as_i64().unwrap();
+        assert_eq!(
+            code, -32600,
+            "Missing method returns -32600 Invalid Request"
+        );
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing method"));
+
+        // Non-string method → -32600 Invalid Request
+        let resp2 = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": 42
+            }),
+        )
+        .await;
+
+        let code2 = resp2["error"]["code"].as_i64().unwrap();
+        assert_eq!(
+            code2, -32600,
+            "Non-string method returns -32600 Invalid Request"
+        );
+        assert!(resp2["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("method must be a string"));
+    }
+
+    // DR28-H4 (FIXED): Non-object arguments now returns clear "Invalid arguments"
+    // error before reaching tool dispatch.
+    #[tokio::test]
+    async fn dr28_h4_nonobject_arguments_rejected_early() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // String arguments → caught before tool dispatch
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_agent",
+                    "arguments": "not an object"
+                }
+            }),
+        )
+        .await;
+
+        let err_msg = resp["error"]["message"].as_str().unwrap();
+        assert_eq!(
+            err_msg, "Invalid arguments: must be an object",
+            "FIXED: Non-object arguments caught before tool dispatch"
+        );
+        assert_eq!(resp["error"]["code"], -32602);
+
+        // Array arguments → same early rejection
+        let resp2 = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": [1, 2, 3]
+                }
+            }),
+        )
+        .await;
+
+        let err_msg2 = resp2["error"]["message"].as_str().unwrap();
+        assert_eq!(
+            err_msg2, "Invalid arguments: must be an object",
+            "FIXED: Array arguments caught before tool dispatch"
+        );
+    }
+
+    // DR28-H5 (FIXED): Non-string required fields now return type-specific
+    // errors instead of misleading "Missing X".
+    #[tokio::test]
+    async fn dr28_h5_nonstring_required_fields_return_type_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Integer from_agent → "from_agent must be a string"
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": 42,
+                "to": ["Bob"],
+                "subject": "test"
+            }),
+        );
+        assert!(r1.is_err());
+        assert!(
+            r1.unwrap_err().contains("from_agent must be a string"),
+            "FIXED: Integer from_agent says 'must be a string'"
+        );
+
+        // Boolean agent_name → "agent_name must be a string"
+        let r2 = get_inbox(&state, json!({ "agent_name": true }));
+        assert!(r2.is_err());
+        assert!(
+            r2.unwrap_err().contains("agent_name must be a string"),
+            "FIXED: Boolean agent_name says 'must be a string'"
+        );
+
+        // Array query → "query must be a string"
+        let r3 = search_messages(&state, json!({ "query": [1, 2, 3] }));
+        assert!(r3.is_err());
+        assert!(
+            r3.unwrap_err().contains("query must be a string"),
+            "FIXED: Array query says 'must be a string'"
+        );
+
+        // Integer project_key → "project_key must be a string"
+        let r4 = create_agent(&state, json!({ "project_key": 999 }));
+        assert!(r4.is_err());
+        assert!(
+            r4.unwrap_err().contains("project_key must be a string"),
+            "FIXED: Integer project_key says 'must be a string'"
+        );
+
+        // Truly missing fields still say "Missing"
+        let r5 = send_message(&state, json!({ "to": ["Bob"] }));
+        assert!(r5.is_err());
+        assert_eq!(r5.unwrap_err(), "Missing from_agent");
     }
 }
