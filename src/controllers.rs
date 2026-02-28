@@ -7491,4 +7491,251 @@ mod tests {
         assert!(r3.is_ok(), "Nulls are filtered, not rejected");
         assert!(state.inboxes.contains_key("Recip29H5"));
     }
+
+    // ── DR30-H1: Inline name validation duplicates validate_agent_name() ──
+    // from_agent, recipients, and agent_name all validate names inline
+    // instead of calling validate_agent_name(). If validate_agent_name()
+    // gains a new rule, the inline copies won't get it.
+    #[tokio::test]
+    async fn dr30_h1_inline_validation_duplicates_validate_agent_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Build a list of invalid names that validate_agent_name rejects
+        let bad_names = vec![
+            ("", "empty"),
+            ("a/b", "path separator /"),
+            ("a\\b", "path separator \\"),
+            ("a..b", "double dot"),
+            (".hidden", "dot prefix"),
+            ("has\0null", "null byte"),
+            ("has\x01ctrl", "control char"),
+            ("   ", "whitespace only"),
+            (" leading", "leading whitespace"),
+            ("trailing ", "trailing whitespace"),
+        ];
+
+        for (name, reason) in &bad_names {
+            // validate_agent_name should reject all of these
+            let vr = validate_agent_name(name);
+            assert!(
+                vr.is_err(),
+                "validate_agent_name must reject '{}' ({})",
+                name.escape_debug(),
+                reason
+            );
+
+            // from_agent should also reject all of these
+            let fr = send_message(
+                &state,
+                json!({
+                    "from_agent": name,
+                    "to": ["SomeRecip"],
+                    "subject": "test",
+                    "body": "hello"
+                }),
+            );
+            assert!(
+                fr.is_err(),
+                "from_agent must reject '{}' ({}) but got Ok",
+                name.escape_debug(),
+                reason
+            );
+
+            // recipient should also reject all of these
+            // (skip empty string — it's filtered by to_agents builder, not validator)
+            if !name.is_empty() {
+                let rr = send_message(
+                    &state,
+                    json!({
+                        "from_agent": "ValidSender",
+                        "to": [name],
+                        "subject": "test",
+                        "body": "hello"
+                    }),
+                );
+                assert!(
+                    rr.is_err(),
+                    "recipient must reject '{}' ({}) but got Ok",
+                    name.escape_debug(),
+                    reason
+                );
+            }
+
+            // agent_name in get_inbox should also reject all of these
+            if !name.is_empty() {
+                let gr = get_inbox(&state, json!({ "agent_name": name }));
+                assert!(
+                    gr.is_err(),
+                    "agent_name must reject '{}' ({}) but got Ok",
+                    name.escape_debug(),
+                    reason
+                );
+            }
+        }
+
+        // CONFIRMED: All 4 validators currently agree on all test cases.
+        // But they are separate inline implementations — a new rule added
+        // to validate_agent_name() won't automatically apply to the others.
+    }
+
+    // ── DR30-H2: body allows control chars, subject doesn't ──────────────
+    // Subject validation has chars().any(|c| c.is_control()) check, but
+    // body only checks for null bytes. This asymmetry means \x01 in body
+    // succeeds while \x01 in subject fails.
+    #[tokio::test]
+    async fn dr30_h2_body_allows_control_chars_subject_doesnt() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Subject with SOH control char → rejected
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender30H2",
+                "to": ["Recip30H2"],
+                "subject": "hello\x01world",
+                "body": "normal body"
+            }),
+        );
+        assert!(r1.is_err(), "Subject with control char must be rejected");
+        assert!(
+            r1.unwrap_err().contains("control character"),
+            "Error should mention control characters"
+        );
+
+        // Body with SOH control char → accepted (no control char check)
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender30H2",
+                "to": ["Recip30H2"],
+                "subject": "normal subject",
+                "body": "hello\x01world"
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "BUG CONFIRMED: body with \\x01 control char is silently accepted"
+        );
+
+        // Verify the control char made it into the inbox
+        let inbox = get_inbox(&state, json!({ "agent_name": "Recip30H2" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        let body_text = msgs[0]["body"].as_str().unwrap();
+        assert!(
+            body_text.contains('\x01'),
+            "BUG CONFIRMED: control char preserved in body: {:?}",
+            body_text
+        );
+    }
+
+    // ── DR30-H3: Zero/negative limit silently clamped to 1 ───────────────
+    // The tools/list schema declares "minimum": 1 for limit, but the server
+    // uses clamp(1, MAX) instead of rejecting out-of-range values.
+    #[tokio::test]
+    async fn dr30_h3_zero_and_negative_limit_silently_clamped() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send 3 messages
+        for i in 0..3 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender",
+                    "to": ["target30h3"],
+                    "subject": format!("msg {}", i),
+                    "body": "x"
+                }),
+            )
+            .unwrap();
+        }
+
+        // limit=0 → clamped to 1, drains 1 message silently
+        let r1 = get_inbox(&state, json!({ "agent_name": "target30h3", "limit": 0 }));
+        assert!(
+            r1.is_ok(),
+            "BUG CONFIRMED: limit=0 silently accepted (clamped to 1)"
+        );
+        let r1_val = r1.unwrap();
+        let msgs1 = inbox_messages(&r1_val);
+        assert_eq!(
+            msgs1.len(),
+            1,
+            "BUG CONFIRMED: limit=0 drained 1 message instead of 0"
+        );
+
+        // limit=-5 → clamped to 1, drains 1 message silently
+        let r2 = get_inbox(&state, json!({ "agent_name": "target30h3", "limit": -5 }));
+        assert!(
+            r2.is_ok(),
+            "BUG CONFIRMED: limit=-5 silently accepted (clamped to 1)"
+        );
+        let r2_val = r2.unwrap();
+        let msgs2 = inbox_messages(&r2_val);
+        assert_eq!(
+            msgs2.len(),
+            1,
+            "BUG CONFIRMED: limit=-5 drained 1 message instead of 0"
+        );
+
+        // Same for search_messages
+        let r3 = search_messages(&state, json!({ "query": "hello", "limit": 0 }));
+        assert!(
+            r3.is_ok(),
+            "BUG CONFIRMED: search limit=0 silently accepted"
+        );
+
+        let r4 = search_messages(&state, json!({ "query": "hello", "limit": -10 }));
+        assert!(
+            r4.is_ok(),
+            "BUG CONFIRMED: search limit=-10 silently accepted"
+        );
+    }
+
+    // ── DR30-H4: body null check before length check → misleading error ──
+    // A body that exceeds MAX_BODY_LEN AND contains a null byte is rejected
+    // for "null bytes" instead of "exceeds limit". Length should be checked
+    // first (like subject does) to fail fast on oversized inputs.
+    #[tokio::test]
+    async fn dr30_h4_body_null_check_before_length_misleading_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Subject checks length BEFORE null bytes (correct order)
+        let long_subject = "x".repeat(MAX_SUBJECT_LEN + 1);
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender30H4",
+                "to": ["Recip30H4"],
+                "subject": long_subject,
+                "body": "ok"
+            }),
+        );
+        assert!(r1.is_err());
+        assert!(
+            r1.unwrap_err().contains("exceeds"),
+            "Subject correctly reports length error first"
+        );
+
+        // Body checks null BEFORE length (wrong order)
+        let mut long_body_with_null = "x".repeat(MAX_BODY_LEN + 100);
+        long_body_with_null.push('\0');
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender30H4",
+                "to": ["Recip30H4"],
+                "subject": "ok",
+                "body": long_body_with_null
+            }),
+        );
+        assert!(r2.is_err());
+        let err = r2.unwrap_err();
+        assert!(
+            err.contains("null bytes"),
+            "BUG CONFIRMED: oversized body with null byte reports 'null bytes' error \
+             instead of 'exceeds limit': {}",
+            err
+        );
+    }
 }
