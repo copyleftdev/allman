@@ -648,22 +648,35 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     // Track delivered count so callers know if any recipients were silently
     // skipped due to concurrent races (DR27-H4).
     let mut delivered_count = 0usize;
-    for recipient in &to_agents {
-        match state.inboxes.entry(recipient.clone()) {
+    // Deliver to a single recipient's inbox. Returns true if delivered.
+    let deliver = |recipient: &str, inbox_entry: InboxEntry| -> bool {
+        match state.inboxes.entry(recipient.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                 let inbox = occ.get_mut();
                 if inbox.len() < MAX_INBOX_SIZE {
-                    inbox.push(entry.clone());
-                    delivered_count += 1;
+                    inbox.push(inbox_entry);
+                    true
+                } else {
+                    // Concurrent race filled this inbox after pre-check.
+                    false
                 }
-                // Else: concurrent race filled this inbox after pre-check.
-                // Silently skip — the delivered_count will reflect the miss.
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
-                vac.insert(vec![entry.clone()]);
-                delivered_count += 1;
+                vac.insert(vec![inbox_entry]);
+                true
             }
         }
+    };
+    // Clone entry for all-but-last recipients. Move entry into the last
+    // recipient's inbox to avoid one unnecessary heap allocation of
+    // InboxEntry's 6 String fields (DR37-H5).
+    for recipient in &to_agents[..to_agents.len() - 1] {
+        if deliver(recipient, entry.clone()) {
+            delivered_count += 1;
+        }
+    }
+    if deliver(to_agents.last().unwrap(), entry) {
+        delivered_count += 1;
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
@@ -852,16 +865,11 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     let index = &state.index;
     let searcher = state.index_reader.searcher();
 
-    let schema = index.schema();
-    let f_id = schema.get_field("id").unwrap();
-    let f_project = schema.get_field("project_id").unwrap();
-    let f_from = schema.get_field("from_agent").unwrap();
-    let f_to = schema.get_field("to_recipients").unwrap();
-    let f_subject = schema.get_field("subject").unwrap();
-    let f_body = schema.get_field("body").unwrap();
-    let f_ts = schema.get_field("created_ts").unwrap();
+    // Use pre-resolved field handles from startup — avoids 7 HashMap
+    // lookups via schema.get_field() per request (DR37-H3).
+    let sf = &state.search_fields;
 
-    let query_parser = QueryParser::for_index(index, vec![f_subject, f_body]);
+    let query_parser = QueryParser::for_index(index, vec![sf.subject, sf.body]);
     let query = query_parser
         .parse_query(query_str)
         .map_err(|e| format!("Query parse error: {}", e))?;
@@ -873,17 +881,19 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     // Build JSON directly from Tantivy document fields — avoids the
     // schema.to_json() → serde_json::from_str() serialize-deserialize
     // round-trip that created unnecessary string allocations (DR36-H3).
+    // Missing fields serialize as null instead of empty string/zero,
+    // letting clients distinguish "absent" from "empty" (DR37-H1).
     let mut results = Vec::new();
     for (_score, doc_address) in top_docs {
         let retrieved_doc = searcher.doc(doc_address).map_err(|e| e.to_string())?;
         let doc_val = json!({
-            "id": retrieved_doc.get_first(f_id).and_then(|v| v.as_text()).unwrap_or(""),
-            "project_id": retrieved_doc.get_first(f_project).and_then(|v| v.as_text()).unwrap_or(""),
-            "from_agent": retrieved_doc.get_first(f_from).and_then(|v| v.as_text()).unwrap_or(""),
-            "to_recipients": retrieved_doc.get_first(f_to).and_then(|v| v.as_text()).unwrap_or(""),
-            "subject": retrieved_doc.get_first(f_subject).and_then(|v| v.as_text()).unwrap_or(""),
-            "body": retrieved_doc.get_first(f_body).and_then(|v| v.as_text()).unwrap_or(""),
-            "created_ts": retrieved_doc.get_first(f_ts).and_then(|v| v.as_i64()).unwrap_or(0),
+            "id": retrieved_doc.get_first(sf.id).and_then(|v| v.as_text()),
+            "project_id": retrieved_doc.get_first(sf.project_id).and_then(|v| v.as_text()),
+            "from_agent": retrieved_doc.get_first(sf.from_agent).and_then(|v| v.as_text()),
+            "to_recipients": retrieved_doc.get_first(sf.to_recipients).and_then(|v| v.as_text()),
+            "subject": retrieved_doc.get_first(sf.subject).and_then(|v| v.as_text()),
+            "body": retrieved_doc.get_first(sf.body).and_then(|v| v.as_text()),
+            "created_ts": retrieved_doc.get_first(sf.created_ts).and_then(|v| v.as_i64()),
         });
         results.push(doc_val);
     }
@@ -9427,5 +9437,176 @@ mod tests {
             3000000,
             "Timestamp preserved"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Deep Review #37 — Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── DR37-H1: search_messages direct extraction returns empty/zero for missing fields ─
+    // After DR36-H3, direct field extraction uses unwrap_or("") and unwrap_or(0).
+    // If a field is genuinely missing from a Tantivy document, the result now
+    // contains empty strings/zeros instead of omitting the field. This test
+    // documents and verifies the current behavior.
+    #[tokio::test]
+    async fn dr37_h1_search_direct_extraction_returns_defaults_for_all_fields() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Index a message with all fields populated
+        let _ = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::IndexMessage {
+                id: "dr37h1_msg".to_string(),
+                project_id: "proj_dr37".to_string(),
+                from_agent: "alice".to_string(),
+                to_recipients: "bob".to_string(),
+                subject: "dr37h1 subject".to_string(),
+                body: "dr37h1 body content".to_string(),
+                created_ts: 4000000,
+            });
+
+        // Wait for NRT refresh
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let result = search_messages(&state, json!({ "query": "dr37h1", "limit": 10 }));
+        assert!(result.is_ok(), "Search should succeed");
+
+        let resp = result.unwrap();
+        let results = resp["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "Should find 1 result");
+
+        let doc = &results[0];
+
+        // All fields must be present as scalar values (not arrays, not null)
+        assert!(doc["id"].is_string(), "id is a string");
+        assert!(doc["project_id"].is_string(), "project_id is a string");
+        assert!(doc["from_agent"].is_string(), "from_agent is a string");
+        assert!(
+            doc["to_recipients"].is_string(),
+            "to_recipients is a string"
+        );
+        assert!(doc["subject"].is_string(), "subject is a string");
+        assert!(doc["body"].is_string(), "body is a string");
+        assert!(
+            doc["created_ts"].is_i64(),
+            "created_ts is an integer (direct extraction)"
+        );
+
+        // With all fields populated, values are scalars (not null).
+        // Missing fields would serialize as null instead of empty string/zero (DR37-H1).
+        assert!(!doc["id"].is_null(), "present id is never null");
+        assert!(
+            !doc["created_ts"].is_null(),
+            "present created_ts is never null"
+        );
+    }
+
+    // ── DR37-H2 (DISPROVED): mcp_handler borrow-then-move is safe ───────────
+    // Regression guard: the tracing::debug! line uses borrowed &str from
+    // payload, then payload is moved into handle_mcp_request. This is safe
+    // because &str is Copy and the borrows end before the move.
+    #[tokio::test]
+    async fn dr37_h2_mcp_handler_borrow_order_is_safe() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // This exercises the full mcp_handler path (borrow method/tool, then move payload)
+        let resp = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_inbox",
+                    "arguments": { "agent_name": "test37h2" }
+                }
+            }),
+        )
+        .await;
+
+        assert!(
+            resp.get("result").is_some(),
+            "Full request path works (borrows resolved before move)"
+        );
+    }
+
+    // ── DR37-H5: last recipient clone is unnecessary ─────────────────────────
+    // For N recipients, entry.clone() is called N times. The Nth clone is
+    // wasteful — the original entry could be moved into the last recipient's
+    // inbox. This test documents the current behavior and verifies all
+    // recipients get identical messages regardless.
+    #[tokio::test]
+    async fn dr37_h5_all_recipients_get_identical_messages() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let big_body = "DR37H5 ".repeat(1000); // ~7KB body
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender37h5",
+                "to": ["recip_a", "recip_b", "recip_c"],
+                "subject": "clone test",
+                "body": big_body,
+            }),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["delivered_count"].as_u64().unwrap(), 3);
+
+        // Verify all 3 recipients have identical message content
+        let mut bodies = Vec::new();
+        for name in &["recip_a", "recip_b", "recip_c"] {
+            let inbox = get_inbox(&state, json!({ "agent_name": name })).unwrap();
+            let msgs = inbox_messages(&inbox);
+            assert_eq!(msgs.len(), 1, "{} should have 1 message", name);
+            assert_eq!(msgs[0]["from_agent"], "sender37h5");
+            assert_eq!(msgs[0]["subject"], "clone test");
+            bodies.push(msgs[0]["body"].as_str().unwrap().to_string());
+        }
+
+        // All bodies must be identical (clones are correct)
+        assert_eq!(bodies[0], bodies[1], "recip_a and recip_b have same body");
+        assert_eq!(bodies[1], bodies[2], "recip_b and recip_c have same body");
+        assert_eq!(bodies[0], big_body, "Body content preserved");
+    }
+
+    // ── DR37-H3: schema.get_field() called per request ──────────────────────
+    // search_messages performs 7 schema.get_field() lookups per call. These
+    // are cheap (small schema) but wasteful under high throughput. This test
+    // verifies search works correctly and documents the per-request overhead.
+    #[tokio::test]
+    async fn dr37_h3_search_repeated_calls_consistent_field_resolution() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Index a message
+        let _ = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::IndexMessage {
+                id: "dr37h3_msg".to_string(),
+                project_id: "proj_consistency".to_string(),
+                from_agent: "alice".to_string(),
+                to_recipients: "bob".to_string(),
+                subject: "consistency37h3 test".to_string(),
+                body: "repeated search test".to_string(),
+                created_ts: 5000000,
+            });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Search multiple times — field resolution must be consistent
+        for i in 0..5 {
+            let result =
+                search_messages(&state, json!({ "query": "consistency37h3", "limit": 10 }));
+            assert!(result.is_ok(), "Search #{} should succeed", i);
+            let resp = result.unwrap();
+            let results = resp["results"].as_array().unwrap();
+            assert_eq!(results.len(), 1, "Search #{} finds 1 result", i);
+            assert_eq!(
+                results[0]["id"].as_str().unwrap(),
+                "dr37h3_msg",
+                "Search #{} returns same doc",
+                i
+            );
+        }
     }
 }
