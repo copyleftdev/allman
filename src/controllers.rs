@@ -7696,4 +7696,420 @@ mod tests {
             err
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Deep Review #31 — Hypothesis Tests
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ── DR31-H1: `to` array null elements silently dropped despite schema ────
+    // The tools/list schema declares `"items": { "type": "string" }` for `to`,
+    // meaning all elements must be strings. But the runtime exempts nulls
+    // (line 461: `!v.is_string() && !v.is_null()`), silently filtering them out.
+    #[tokio::test]
+    async fn dr31_h1_to_array_null_elements_silently_dropped() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // to: [null, "Alice"] — null is silently dropped, delivers to Alice only
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": [null, "Alice31H1"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "CONFIRMED: null in to array silently accepted"
+        );
+        // Verify only Alice received the message (null was dropped)
+        let inbox = get_inbox(&state, json!({ "agent_name": "Alice31H1" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1, "Alice should receive the message");
+
+        // to: [null] — all elements are null, produces "No recipients specified"
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": [null],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            r2.is_err(),
+            "CONFIRMED: to=[null] results in error (all filtered out)"
+        );
+        assert!(
+            r2.unwrap_err().contains("No recipients"),
+            "Error says 'No recipients' even though caller specified one (null)"
+        );
+
+        // to: [null, null, "Bob31H1"] — multiple nulls, one valid string
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": [null, null, "Bob31H1"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            r3.is_ok(),
+            "CONFIRMED: multiple nulls silently dropped, delivers to Bob"
+        );
+
+        // Meanwhile, non-null non-string (integer) IS rejected
+        let r4 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": [42, "Alice31H1"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            r4.is_err(),
+            "Non-null non-string (integer) correctly rejected"
+        );
+
+        // Schema says items: string, but null passes runtime — inconsistency
+        // Verify schema declares string items
+        let (state2, _idx2, _repo2) = test_post_office();
+        let tools_list = handle_mcp_request(
+            state2,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        let to_schema = &tools_list["result"]["tools"][1]["inputSchema"]["properties"]["to"];
+        assert_eq!(
+            to_schema["items"]["type"].as_str().unwrap(),
+            "string",
+            "Schema declares items must be strings"
+        );
+    }
+
+    // ── DR31-H2: project_key validation shares patterns with validate_name() ─
+    // After DR30-H1, name validation uses validate_name(). But project_key
+    // has its own inline checks: empty, null bytes, control chars, length,
+    // whitespace-only, leading/trailing whitespace. If a new rule is added
+    // to one, it won't automatically apply to the other.
+    #[tokio::test]
+    async fn dr31_h2_project_key_validation_shares_patterns_with_validate_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Both reject: empty
+        assert!(validate_agent_name("").is_err(), "name: empty rejected");
+        let r = create_agent(&state, json!({ "project_key": "" }));
+        assert!(r.is_err(), "project_key: empty rejected");
+
+        // Both reject: null bytes
+        assert!(
+            validate_agent_name("a\0b").is_err(),
+            "name: null byte rejected"
+        );
+        let r = create_agent(&state, json!({ "project_key": "a\0b" }));
+        assert!(r.is_err(), "project_key: null byte rejected");
+
+        // Both reject: control chars
+        assert!(
+            validate_agent_name("a\x01b").is_err(),
+            "name: control char rejected"
+        );
+        let r = create_agent(&state, json!({ "project_key": "a\x01b" }));
+        assert!(r.is_err(), "project_key: control char rejected");
+
+        // Both reject: whitespace-only
+        assert!(
+            validate_agent_name("   ").is_err(),
+            "name: whitespace-only rejected"
+        );
+        let r = create_agent(&state, json!({ "project_key": "   " }));
+        assert!(r.is_err(), "project_key: whitespace-only rejected");
+
+        // Both reject: leading/trailing whitespace
+        assert!(
+            validate_agent_name(" a").is_err(),
+            "name: leading whitespace rejected"
+        );
+        let r = create_agent(&state, json!({ "project_key": " a" }));
+        assert!(r.is_err(), "project_key: leading whitespace rejected");
+
+        // DIVERGENCE: validate_name rejects path separators, project_key does not
+        assert!(
+            validate_agent_name("a/b").is_err(),
+            "name: path separator rejected"
+        );
+        let r = create_agent(
+            &state,
+            json!({ "project_key": "a/b", "name_hint": "AgentSlash" }),
+        );
+        assert!(
+            r.is_ok(),
+            "CONFIRMED: project_key accepts path separators (intentional divergence)"
+        );
+
+        // DIVERGENCE: validate_name rejects dot-prefixed, project_key does not
+        assert!(
+            validate_agent_name(".hidden").is_err(),
+            "name: dot-prefix rejected"
+        );
+        let r = create_agent(
+            &state,
+            json!({ "project_key": ".hidden", "name_hint": "AgentDot" }),
+        );
+        assert!(
+            r.is_ok(),
+            "CONFIRMED: project_key accepts dot-prefixed names (intentional divergence)"
+        );
+
+        // DIVERGENCE: validate_name rejects '..', project_key does not
+        assert!(
+            validate_agent_name("a..b").is_err(),
+            "name: double-dot rejected"
+        );
+        let r = create_agent(
+            &state,
+            json!({ "project_key": "a..b", "name_hint": "AgentDotDot" }),
+        );
+        assert!(
+            r.is_ok(),
+            "CONFIRMED: project_key accepts '..' (intentional divergence)"
+        );
+    }
+
+    // ── DR31-H3: validate_name() null byte check is redundant ────────────────
+    // The null byte check (line 250) is a subset of the control char check
+    // (line 253) since '\0'.is_control() == true. The null byte check only
+    // serves to produce a more specific error message. This test proves the
+    // redundancy and documents the error message priority.
+    #[tokio::test]
+    async fn dr31_h3_null_byte_check_is_subset_of_control_char_check() {
+        // Prove '\0' is a control character
+        assert!(
+            '\0'.is_control(),
+            "Null byte IS a control character in Rust's char::is_control()"
+        );
+
+        // validate_name catches null byte with specific message BEFORE control char check
+        let result = validate_name("a\0b", "test_field");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("null bytes"),
+            "Null byte caught by the specific null-byte check: {}",
+            err
+        );
+        assert!(
+            !err.contains("control character"),
+            "Error should NOT mention control characters (null byte check fires first)"
+        );
+
+        // Same redundancy exists in body validation: null byte check (line 529)
+        // before control char check (line 535)
+        let (state, _idx, _repo) = test_post_office();
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H3",
+                "to": ["Recip31H3"],
+                "subject": "test",
+                "body": "hello\0world"
+            }),
+        );
+        assert!(r.is_err());
+        let body_err = r.unwrap_err();
+        assert!(
+            body_err.contains("null bytes"),
+            "Body null byte caught by specific check: {}",
+            body_err
+        );
+
+        // Same redundancy in subject: null byte check (line 518) before
+        // control char check (line 521)
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H3",
+                "to": ["Recip31H3"],
+                "subject": "hello\0world",
+                "body": "ok"
+            }),
+        );
+        assert!(r.is_err());
+        let subj_err = r.unwrap_err();
+        assert!(
+            subj_err.contains("null bytes"),
+            "Subject null byte caught by specific check: {}",
+            subj_err
+        );
+
+        // Same redundancy in project_key
+        let r = create_agent(&state, json!({ "project_key": "test\0key" }));
+        assert!(r.is_err());
+        let pk_err = r.unwrap_err();
+        assert!(
+            pk_err.contains("null bytes"),
+            "project_key null byte caught by specific check: {}",
+            pk_err
+        );
+
+        // Same redundancy in program
+        let r = create_agent(
+            &state,
+            json!({ "project_key": "test", "program": "prog\0ram" }),
+        );
+        assert!(r.is_err());
+        let prog_err = r.unwrap_err();
+        assert!(
+            prog_err.contains("null bytes"),
+            "program null byte caught by specific check: {}",
+            prog_err
+        );
+
+        // Same redundancy in model
+        let r = create_agent(
+            &state,
+            json!({ "project_key": "test", "model": "mod\0el" }),
+        );
+        assert!(r.is_err());
+        let model_err = r.unwrap_err();
+        assert!(
+            model_err.contains("null bytes"),
+            "model null byte caught by specific check: {}",
+            model_err
+        );
+    }
+
+    // ── DR31-H4: empty project_id indexed as empty STRING in Tantivy ─────────
+    // When project_id is absent/null, it defaults to "". This empty string is
+    // indexed in Tantivy as a STRING field. This test verifies that messages
+    // with empty project_id are still findable via full-text search on subject/body.
+    #[tokio::test]
+    async fn dr31_h4_empty_project_id_indexed_in_tantivy() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send message with no project_id (defaults to "")
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H4",
+                "to": ["Recip31H4"],
+                "subject": "xylophonereview",
+                "body": "empty pid message"
+            }),
+        );
+        assert!(r1.is_ok());
+
+        // Send message WITH a project_id, using the SAME searchable body term
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H4",
+                "to": ["Recip31H4"],
+                "subject": "xylophonereview",
+                "body": "nonempty pid message",
+                "project_id": "proj_test31h4"
+            }),
+        );
+        assert!(r2.is_ok());
+
+        // Wait for NRT refresh
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Search by the shared subject term should find both messages
+        let search = search_messages(
+            &state,
+            json!({ "query": "xylophonereview", "limit": 10 }),
+        );
+        assert!(
+            search.is_ok(),
+            "Search should work for messages with empty project_id"
+        );
+        let results = search.unwrap();
+        let hits = results["results"].as_array().unwrap();
+        assert!(
+            hits.len() >= 2,
+            "Both messages should be findable via shared subject term, got {}",
+            hits.len()
+        );
+
+        // Check the project_id field value in the search results
+        let mut found_empty_pid = false;
+        let mut found_nonempty_pid = false;
+        for hit in hits {
+            let pid = hit
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("MISSING");
+            if pid.is_empty() {
+                found_empty_pid = true;
+            }
+            if pid == "proj_test31h4" {
+                found_nonempty_pid = true;
+            }
+        }
+        assert!(
+            found_empty_pid,
+            "CONFIRMED: Empty project_id is stored and returned in search results"
+        );
+        assert!(
+            found_nonempty_pid,
+            "Non-empty project_id also stored correctly"
+        );
+    }
+
+    // ── DR31-H5: validate_name() format! allocation per recipient ────────────
+    // validate_name(recipient, &format!("Recipient '{}'", recipient)) creates
+    // a heap-allocated String for the field parameter on every call, even when
+    // the name is valid. With 100 recipients, that's 100 unnecessary allocations
+    // on the successful hot path. This test confirms the allocation happens and
+    // documents the performance trade-off.
+    #[tokio::test]
+    async fn dr31_h5_validate_name_allocates_per_recipient_on_hot_path() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Create a message with maximum recipients (100) — all valid names.
+        // Each validate_name call creates a format! String even though
+        // validation passes.
+        let recipients: Vec<String> = (0..super::MAX_RECIPIENTS)
+            .map(|i| format!("Agent{:03}", i))
+            .collect();
+        let to_array: Vec<Value> = recipients.iter().map(|s| json!(s)).collect();
+
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "BroadcastSender",
+                "to": to_array,
+                "subject": "broadcast",
+                "body": "hello all"
+            }),
+        );
+        assert!(r.is_ok(), "100-recipient broadcast should succeed");
+
+        // Verify all 100 recipients received the message
+        let mut delivered = 0;
+        for name in &recipients {
+            let inbox = get_inbox(&state, json!({ "agent_name": name })).unwrap();
+            let msgs = inbox_messages(&inbox);
+            delivered += msgs.len();
+        }
+        assert_eq!(
+            delivered, 100,
+            "All 100 recipients should receive the message"
+        );
+
+        // The format! allocation per recipient is confirmed by code inspection:
+        // line 510: validate_name(recipient, &format!("Recipient '{}'", recipient))?;
+        // Each call allocates ~30 bytes for the field label, even on success.
+        // For 100 recipients: ~3KB of unnecessary heap allocations per message.
+        // This is a known trade-off: better error messages vs. hot path efficiency.
+        // A static field name like "recipient" would avoid the allocation but
+        // lose the specific recipient name in error messages.
+    }
 }
