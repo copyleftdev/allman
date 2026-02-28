@@ -7185,4 +7185,254 @@ mod tests {
         assert!(r5.is_err());
         assert_eq!(r5.unwrap_err(), "Missing from_agent");
     }
+
+    // ── DR29-H1: get_inbox limit non-integer type silently defaults ──────
+    // Passing "limit": "50" (string) should return a type error, not silently
+    // use the default of 100.
+    #[tokio::test]
+    async fn dr29_h1_get_inbox_limit_noninteger_silently_defaults() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register agent and send a message so inbox isn't empty
+        create_agent(
+            &state,
+            json!({ "project_key": "proj_dr29h1", "name_hint": "Agent29H1" }),
+        )
+        .unwrap();
+        send_message(
+            &state,
+            json!({ "from_agent": "Sender29H1", "to": ["Agent29H1"], "subject": "test", "body": "hello" }),
+        )
+        .unwrap();
+
+        // String "50" — should error with type info, not silently use default 100
+        let r1 = get_inbox(&state, json!({ "agent_name": "Agent29H1", "limit": "50" }));
+        assert!(
+            r1.is_ok(),
+            "BUG CONFIRMED: string limit is silently accepted (defaults to 100)"
+        );
+
+        // Boolean true — should error with type info
+        // Re-send a message since inbox was drained
+        send_message(
+            &state,
+            json!({ "from_agent": "Sender29H1", "to": ["Agent29H1"], "subject": "test2", "body": "hi" }),
+        )
+        .unwrap();
+        let r2 = get_inbox(&state, json!({ "agent_name": "Agent29H1", "limit": true }));
+        assert!(
+            r2.is_ok(),
+            "BUG CONFIRMED: boolean limit is silently accepted"
+        );
+
+        // Object — should error with type info
+        send_message(
+            &state,
+            json!({ "from_agent": "Sender29H1", "to": ["Agent29H1"], "subject": "test3", "body": "hey" }),
+        )
+        .unwrap();
+        let r3 = get_inbox(&state, json!({ "agent_name": "Agent29H1", "limit": {"value": 5} }));
+        assert!(
+            r3.is_ok(),
+            "BUG CONFIRMED: object limit is silently accepted"
+        );
+    }
+
+    // ── DR29-H2: search_messages limit non-integer type silently defaults ─
+    // Passing "limit": "10" (string) should return a type error, not silently
+    // use the default of 10.
+    #[tokio::test]
+    async fn dr29_h2_search_messages_limit_noninteger_silently_defaults() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // String "5" — should error, not silently use default 10
+        let r1 = search_messages(&state, json!({ "query": "hello", "limit": "5" }));
+        // The search itself may return 0 results (empty index) but should not error
+        // on the limit type. The bug is that it silently uses 10 instead of erroring.
+        assert!(
+            r1.is_ok(),
+            "BUG CONFIRMED: string limit is silently accepted (defaults to 10)"
+        );
+
+        // Boolean — should error
+        let r2 = search_messages(&state, json!({ "query": "hello", "limit": false }));
+        assert!(
+            r2.is_ok(),
+            "BUG CONFIRMED: boolean limit is silently accepted"
+        );
+
+        // Float — serde_json as_i64() returns None for 3.7
+        let r3 = search_messages(&state, json!({ "query": "hello", "limit": 3.7 }));
+        assert!(
+            r3.is_ok(),
+            "BUG CONFIRMED: float limit is silently accepted (defaults to 10)"
+        );
+    }
+
+    // ── DR29-H3: send_message optional string fields silently default ─────
+    // Non-string subject, body, or project_id should return type errors,
+    // not silently default to empty string.
+    #[tokio::test]
+    async fn dr29_h3_send_message_optional_fields_nonstring_silently_default() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Integer subject — should error, not silently become ""
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H3",
+                "to": ["Recip29H3"],
+                "subject": 42,
+                "body": "hello"
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "BUG CONFIRMED: integer subject is silently accepted as empty string"
+        );
+
+        // Boolean body — should error, not silently become ""
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H3",
+                "to": ["Recip29H3"],
+                "subject": "test",
+                "body": true
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "BUG CONFIRMED: boolean body is silently accepted as empty string"
+        );
+
+        // Array project_id — should error, not silently become ""
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H3",
+                "to": ["Recip29H3"],
+                "subject": "test",
+                "body": "hello",
+                "project_id": [1, 2, 3]
+            }),
+        );
+        assert!(
+            r3.is_ok(),
+            "BUG CONFIRMED: array project_id is silently accepted as empty string"
+        );
+    }
+
+    // ── DR29-H4: tools/call non-string name → misleading "Unknown tool" ──
+    // Passing "name": 42 should return "name must be a string", not "Unknown tool: ".
+    #[tokio::test]
+    async fn dr29_h4_tools_call_nonstring_name_misleading_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Non-string name: integer
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": 42, "arguments": {} }
+            }),
+        )
+        .await;
+
+        let err_msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            err_msg.contains("Unknown tool"),
+            "BUG CONFIRMED: non-string name produces misleading 'Unknown tool' error: {}",
+            err_msg
+        );
+
+        // Non-string name: boolean
+        let resp2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": true, "arguments": {} }
+            }),
+        )
+        .await;
+        let err_msg2 = resp2["error"]["message"].as_str().unwrap();
+        assert!(
+            err_msg2.contains("Unknown tool"),
+            "BUG CONFIRMED: boolean name produces misleading error: {}",
+            err_msg2
+        );
+
+        // Null name
+        let resp3 = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": null, "arguments": {} }
+            }),
+        )
+        .await;
+        let err_msg3 = resp3["error"]["message"].as_str().unwrap();
+        assert!(
+            err_msg3.contains("Unknown tool"),
+            "BUG CONFIRMED: null name produces misleading error: {}",
+            err_msg3
+        );
+    }
+
+    // ── DR29-H5: send_message mixed-type to array silently drops non-strings ─
+    // Passing "to": [42, "Alice"] should reject the entire request, not silently
+    // drop the 42 and deliver only to Alice.
+    #[tokio::test]
+    async fn dr29_h5_send_message_mixed_to_array_silently_drops() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Mixed to array: integer + valid string
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H5",
+                "to": [42, "Recip29H5"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "BUG CONFIRMED: mixed to array is silently accepted, non-string elements dropped"
+        );
+
+        // Verify Alice got the message (the 42 was silently dropped)
+        let inbox = get_inbox(&state, json!({ "agent_name": "Recip29H5" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "BUG CONFIRMED: message delivered to string recipient, non-string silently dropped"
+        );
+
+        // The DR28-H2 fix only catches the all-non-string case:
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H5",
+                "to": [42, true, null],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            r2.is_err(),
+            "All-non-string case IS caught by DR28-H2 fix"
+        );
+        assert!(
+            r2.unwrap_err().contains("non-string elements"),
+            "Error message correctly identifies non-string elements"
+        );
+    }
 }
