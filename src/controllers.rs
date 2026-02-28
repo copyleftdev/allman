@@ -24,11 +24,31 @@ const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 1_000;
 const MAX_AGENTS: usize = 100_000;
 const MAX_PROJECTS: usize = 100_000;
+const MAX_INBOXES: usize = 100_000;
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
+    // JSON-RPC 2.0 §4: request MUST be a JSON Object.
+    // Arrays are batch requests (unsupported); scalars are invalid (DR25-H5).
+    if !req.is_object() {
+        return json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32600, "message": "Invalid Request: must be a JSON object" }
+        });
+    }
+
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id");
     let params = req.get("params").cloned().unwrap_or(json!({}));
+
+    // JSON-RPC 2.0 §4: "jsonrpc" MUST be exactly "2.0" (DR25-H3).
+    if req.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32600, "message": "Invalid Request: jsonrpc field must be exactly \"2.0\"" }
+        });
+    }
 
     // JSON-RPC 2.0: requests without "id" are notifications.
     // The spec says "The Server MUST NOT reply to a Notification."
@@ -59,10 +79,13 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                 "send_message" => send_message(&state, args),
                 "get_inbox" => get_inbox(&state, args),
                 _ => {
+                    // The method "tools/call" IS found — only the tool name
+                    // parameter is invalid. Use -32602 (Invalid params), not
+                    // -32601 (Method not found) (DR25-H4).
                     return json!({
                         "jsonrpc": "2.0",
                         "id": id,
-                        "error": { "code": -32601, "message": format!("Unknown tool: {}", tool_name) }
+                        "error": { "code": -32602, "message": format!("Unknown tool: {}", tool_name) }
                     });
                 }
             };
@@ -367,6 +390,9 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     if from_agent.contains("..") {
         return Err("from_agent must not contain '..'".to_string());
     }
+    if from_agent.starts_with('.') {
+        return Err("from_agent must not start with '.'".to_string());
+    }
     if from_agent != from_agent.trim() {
         return Err("from_agent must not have leading or trailing whitespace".to_string());
     }
@@ -467,6 +493,21 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         timestamp: now,
         project_id: project_id.to_string(),
     };
+
+    // Soft cap on total inbox count. Prevents unbounded DashMap growth
+    // from phantom recipients that are never drained (DR25-H1).
+    // Checked BEFORE delivery to avoid creating entries past the cap.
+    // Count of new inboxes that would be created by this message:
+    let new_inbox_count = to_agents
+        .iter()
+        .filter(|r| !state.inboxes.contains_key(*r))
+        .count();
+    if new_inbox_count > 0 && state.inboxes.len() + new_inbox_count > MAX_INBOXES {
+        return Err(format!(
+            "Inbox limit reached ({} max) — cannot create new inboxes",
+            MAX_INBOXES
+        ));
+    }
 
     // Pre-check all recipient inboxes BEFORE any delivery.
     // This prevents partial delivery where some recipients get the message
@@ -3705,21 +3746,21 @@ mod tests {
     }
 
     // ── H4 (DISPROVED): empty JSON request returns error, no panic ──────────
-    // handle_mcp_request with {} defaults method to "" which hits the
-    // catch-all "Method not found" branch.
+    // UPDATED (DR25): empty JSON now fails jsonrpc version validation first.
     #[tokio::test]
     async fn dr14_h4_empty_json_request_returns_error() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Empty JSON object has no "id" — treated as notification (DR21 H4 fix)
+        // Empty JSON object has no "jsonrpc" — now returns -32600 (DR25 fix)
         let response = handle_mcp_request(state, json!({})).await;
-        assert!(
-            response.is_null(),
-            "Empty JSON has no id — notification returns Value::Null"
+        assert_eq!(
+            response["error"]["code"], -32600,
+            "UPDATED: Empty JSON now fails jsonrpc validation (DR25)"
         );
 
-        // With "id" present, it still returns Method not found
-        let response2 = handle_mcp_request(test_post_office().0, json!({ "id": 1 })).await;
+        // With "id" and "jsonrpc" present, returns Method not found
+        let response2 =
+            handle_mcp_request(test_post_office().0, json!({ "jsonrpc": "2.0", "id": 1 })).await;
         assert_eq!(response2["jsonrpc"], "2.0");
         assert!(response2.get("error").is_some(), "Must return error");
         assert_eq!(response2["error"]["code"], -32601);
@@ -3817,8 +3858,8 @@ mod tests {
     }
 
     // ── H2 (FIXED): Tool errors now use correct JSON-RPC error codes ──────────
-    // -32601 for unknown tool (Method not found), -32602 for param/validation
-    // errors (Invalid params), -32601 for unknown method.
+    // -32602 for unknown tool (Invalid params — DR25 fix), -32602 for
+    // param/validation errors, -32601 for unknown method.
     #[tokio::test]
     async fn dr15_h2_tool_errors_use_correct_codes() {
         let (state, _idx, _repo) = test_post_office();
@@ -3855,7 +3896,7 @@ mod tests {
             "FIXED: Validation failure returns -32602"
         );
 
-        // 3. Unknown tool → -32601 (Method not found)
+        // 3. Unknown tool → -32602 (Invalid params — DR25 fix)
         let resp = handle_mcp_request(
             state.clone(),
             json!({
@@ -3865,8 +3906,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp["error"]["code"], -32601,
-            "FIXED: Unknown tool returns -32601 (Method not found)"
+            resp["error"]["code"], -32602,
+            "UPDATED: Unknown tool now returns -32602 (Invalid params, DR25)"
         );
 
         // 4. Unknown method → -32601 (Method not found)
@@ -3995,10 +4036,10 @@ mod tests {
     // protocol version. This is common practice for simple JSON-RPC servers.
     // Regression guard: verify this behavior is stable.
     #[tokio::test]
-    async fn dr15_h5_missing_jsonrpc_field_still_works() {
+    async fn dr15_h5_missing_jsonrpc_field_now_rejected() {
         let (state, _idx, _repo) = test_post_office();
 
-        // No jsonrpc field at all
+        // UPDATED (DR25): Missing jsonrpc field now returns -32600
         let resp = handle_mcp_request(
             state.clone(),
             json!({
@@ -4006,16 +4047,12 @@ mod tests {
             }),
         )
         .await;
-        assert!(
-            resp.get("result").is_some(),
-            "Missing jsonrpc field does not prevent processing"
-        );
         assert_eq!(
-            resp["jsonrpc"], "2.0",
-            "Response still includes jsonrpc: 2.0"
+            resp["error"]["code"], -32600,
+            "UPDATED: Missing jsonrpc now returns -32600 (DR25)"
         );
 
-        // Wrong version
+        // Wrong version also returns -32600
         let resp = handle_mcp_request(
             state.clone(),
             json!({
@@ -4023,12 +4060,12 @@ mod tests {
             }),
         )
         .await;
-        assert!(
-            resp.get("result").is_some(),
-            "Wrong jsonrpc version does not prevent processing"
+        assert_eq!(
+            resp["error"]["code"], -32600,
+            "UPDATED: Wrong jsonrpc version now returns -32600 (DR25)"
         );
 
-        // Non-string jsonrpc
+        // Non-string jsonrpc also returns -32600
         let resp = handle_mcp_request(
             state,
             json!({
@@ -4036,9 +4073,9 @@ mod tests {
             }),
         )
         .await;
-        assert!(
-            resp.get("result").is_some(),
-            "Non-string jsonrpc does not prevent processing"
+        assert_eq!(
+            resp["error"]["code"], -32600,
+            "UPDATED: Non-string jsonrpc now returns -32600 (DR25)"
         );
     }
 
@@ -4935,28 +4972,28 @@ mod tests {
     async fn dr19_h3_non_object_payload_handled() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Non-object payloads have no "id" field — treated as notifications (DR21 H4)
-        // All return Value::Null (no response per JSON-RPC 2.0 spec)
+        // UPDATED (DR25): Non-object payloads now return -32600 Invalid Request
+        // instead of being treated as notifications.
 
         // String payload
         let r1 = handle_mcp_request(state.clone(), json!("not an object")).await;
-        assert!(
-            r1.is_null(),
-            "String payload has no id — notification returns null"
+        assert_eq!(
+            r1["error"]["code"], -32600,
+            "UPDATED: String payload returns -32600 (DR25)"
         );
 
         // Array payload
         let r2 = handle_mcp_request(state.clone(), json!([1, 2, 3])).await;
-        assert!(
-            r2.is_null(),
-            "Array payload has no id — notification returns null"
+        assert_eq!(
+            r2["error"]["code"], -32600,
+            "UPDATED: Array payload returns -32600 (DR25)"
         );
 
         // Null payload
         let r3 = handle_mcp_request(state, json!(null)).await;
-        assert!(
-            r3.is_null(),
-            "Null payload has no id — notification returns null"
+        assert_eq!(
+            r3["error"]["code"], -32600,
+            "UPDATED: Null payload returns -32600 (DR25)"
         );
     }
 
@@ -6018,6 +6055,255 @@ mod tests {
         assert_eq!(
             r3["error"]["code"], -32602,
             "FIXED: Null params returns -32602"
+        );
+    }
+
+    // ── DR25: Cross-Cutting Concerns & Spec Compliance ──────────────────────
+
+    // H1: No cap on total inbox count — unlimited DashMap entries via unique recipients
+    #[tokio::test]
+    async fn dr25_h1_inbox_dashmap_capped_at_max_inboxes() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // FIXED: inboxes DashMap now has MAX_INBOXES cap.
+        // Pre-fill the DashMap to just under the cap to test the boundary
+        // without creating 100K entries via send_message (which would be slow).
+        for i in 0..(MAX_INBOXES - 1) {
+            state
+                .inboxes
+                .entry(format!("phantom_{}", i))
+                .or_default()
+                .push(InboxEntry {
+                    message_id: format!("msg_{}", i),
+                    from_agent: "setup".to_string(),
+                    subject: "pre-fill".to_string(),
+                    body: "x".to_string(),
+                    timestamp: 0,
+                    project_id: "".to_string(),
+                });
+        }
+        assert_eq!(state.inboxes.len(), MAX_INBOXES - 1);
+
+        // One more NEW inbox should succeed (reaching cap exactly)
+        let at_cap = send_message(
+            &state,
+            json!({
+                "from_agent": "spammer",
+                "to": ["last_one"],
+                "subject": "test",
+                "body": "x"
+            }),
+        );
+        assert!(at_cap.is_ok(), "Should succeed at exactly MAX_INBOXES");
+        assert_eq!(state.inboxes.len(), MAX_INBOXES);
+
+        // Next send to a NEW recipient should fail
+        let overflow = send_message(
+            &state,
+            json!({
+                "from_agent": "spammer",
+                "to": ["one_more"],
+                "subject": "test",
+                "body": "x"
+            }),
+        );
+        assert!(overflow.is_err(), "FIXED: Inbox cap enforced");
+        assert!(overflow.unwrap_err().contains("Inbox limit reached"));
+
+        // Sending to an EXISTING inbox should still succeed
+        let existing = send_message(
+            &state,
+            json!({
+                "from_agent": "spammer",
+                "to": ["phantom_0"],
+                "subject": "another",
+                "body": "x"
+            }),
+        );
+        assert!(
+            existing.is_ok(),
+            "Sending to existing inbox still works at cap"
+        );
+    }
+
+    // H2: from_agent missing starts_with('.') check — asymmetry with recipients and get_inbox
+    #[tokio::test]
+    async fn dr25_h2_from_agent_rejects_dot_prefixed_names() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // FIXED: from_agent now rejects dot-prefixed names
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": ".evil",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(result.is_err(), "FIXED: from_agent rejects '.evil'");
+        assert!(result.unwrap_err().contains("must not start with '.'"));
+
+        // Consistency: recipients also block it
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [".evil"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(r2.is_err(), "Recipients correctly reject '.evil'");
+        assert!(r2.unwrap_err().contains("must not start with '.'"));
+
+        // Consistency: get_inbox also blocks it
+        let r3 = get_inbox(&state, json!({ "agent_name": ".evil" }));
+        assert!(r3.is_err(), "get_inbox correctly rejects '.evil'");
+        assert!(r3.unwrap_err().contains("must not start with '.'"));
+    }
+
+    // H3: Missing jsonrpc version field validation — server accepts any version or missing field
+    #[tokio::test]
+    async fn dr25_h3_jsonrpc_version_validated() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // FIXED: Wrong version "1.0" now returns -32600
+        let r1 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "1.0",
+                "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert_eq!(
+            r1["error"]["code"], -32600,
+            "FIXED: jsonrpc '1.0' returns -32600 Invalid Request"
+        );
+
+        // FIXED: Missing jsonrpc field returns -32600
+        let r2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "id": 2,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert_eq!(
+            r2["error"]["code"], -32600,
+            "FIXED: Missing jsonrpc returns -32600"
+        );
+
+        // FIXED: Non-string jsonrpc returns -32600
+        let r3 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": 2,
+                "id": 3,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert_eq!(
+            r3["error"]["code"], -32600,
+            "FIXED: Integer jsonrpc returns -32600"
+        );
+
+        // Correct version still works
+        let r4 = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(r4.get("result").is_some(), "Correct jsonrpc '2.0' succeeds");
+    }
+
+    // H4: Unknown tool uses -32601 (Method not found) instead of -32602 (Invalid params)
+    #[tokio::test]
+    async fn dr25_h4_unknown_tool_returns_correct_error_code() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // FIXED: Unknown tool now returns -32602 (Invalid params)
+        let response = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "nonexistent_tool",
+                    "arguments": {}
+                }
+            }),
+        )
+        .await;
+
+        let code = response["error"]["code"].as_i64().unwrap();
+        assert_eq!(
+            code, -32602,
+            "FIXED: Unknown tool now returns -32602 (Invalid params)"
+        );
+
+        // Method not found still returns -32601 — codes are now distinct
+        let (state2, _idx2, _repo2) = test_post_office();
+        let r2 = handle_mcp_request(
+            state2,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "nonexistent/method"
+            }),
+        )
+        .await;
+        let code2 = r2["error"]["code"].as_i64().unwrap();
+        assert_eq!(
+            code2, -32601,
+            "Method not found correctly returns -32601 — distinguishable from unknown tool"
+        );
+    }
+
+    // H5: JSON array body treated as notification (204) instead of error
+    #[tokio::test]
+    async fn dr25_h5_non_object_body_returns_invalid_request() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // FIXED: Array body now returns -32600 Invalid Request
+        let response = handle_mcp_request(
+            state.clone(),
+            json!([
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+            ]),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32600,
+            "FIXED: Array body returns -32600 Invalid Request"
+        );
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must be a JSON object"));
+
+        // FIXED: Integer body returns -32600
+        let r2 = handle_mcp_request(state.clone(), json!(42)).await;
+        assert_eq!(
+            r2["error"]["code"], -32600,
+            "FIXED: Integer body returns -32600"
+        );
+
+        // FIXED: String body returns -32600
+        let r3 = handle_mcp_request(state.clone(), json!("hello")).await;
+        assert_eq!(
+            r3["error"]["code"], -32600,
+            "FIXED: String body returns -32600"
         );
     }
 }
