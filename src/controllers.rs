@@ -10339,4 +10339,285 @@ mod tests {
 
         state.shutdown();
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DR41 HYPOTHESIS TESTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── DR41-H1 (CONFIRMED): body accepts whitespace-only values ─────────────
+    // Subject and project_id reject whitespace-only via validate_optional_text,
+    // but body has no whitespace check — whitespace-only bodies are accepted.
+    // This is arguably intentional (bodies are multi-line content) but the
+    // asymmetry is undocumented and could surprise callers.
+    #[tokio::test]
+    async fn dr41_h1_body_accepts_whitespace_only_unlike_subject() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "dr41h1", "name_hint": "sender41h1" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr41h1", "name_hint": "rcv41h1" }),
+        )
+        .unwrap();
+
+        // Whitespace-only subject is rejected (via validate_optional_text)
+        let subj_result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender41h1",
+                "to": ["rcv41h1"],
+                "subject": "   ",
+                "body": "ok"
+            }),
+        );
+        assert!(
+            subj_result.is_err(),
+            "Whitespace-only subject should be rejected"
+        );
+
+        // Whitespace-only body is ACCEPTED (no whitespace check on body)
+        let body_result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender41h1",
+                "to": ["rcv41h1"],
+                "subject": "ok",
+                "body": "   "
+            }),
+        );
+        assert!(
+            body_result.is_ok(),
+            "Whitespace-only body is accepted (intentional — bodies are multi-line content)"
+        );
+
+        // Whitespace-padded body is also ACCEPTED
+        let padded_result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender41h1",
+                "to": ["rcv41h1"],
+                "subject": "ok",
+                "body": "  hello  "
+            }),
+        );
+        assert!(
+            padded_result.is_ok(),
+            "Whitespace-padded body is accepted (bodies allow leading/trailing whitespace)"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR41-H2 (CONFIRMED): search_messages count field is redundant ────────
+    // The `count` field in search_messages response is always equal to the
+    // length of the `results` array. The useful pagination field is
+    // `total_hits` which reports ALL matching documents, not just returned.
+    #[tokio::test]
+    async fn dr41_h2_search_count_always_equals_results_length() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "dr41h2", "name_hint": "sender41h2" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr41h2", "name_hint": "rcv41h2" }),
+        )
+        .unwrap();
+
+        // Send 5 messages
+        for i in 0..5 {
+            send_message(
+                &state,
+                json!({
+                    "from_agent": "sender41h2",
+                    "to": ["rcv41h2"],
+                    "subject": format!("countredundant41h2_{}", i),
+                    "body": "test"
+                }),
+            )
+            .unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Search with limit=3 — returns 3 results, total_hits=5
+        let result =
+            search_messages(&state, json!({ "query": "countredundant41h2", "limit": 3 }));
+        let resp = result.unwrap();
+        let results = resp["results"].as_array().unwrap();
+        let count = resp["count"].as_u64().unwrap();
+        let total_hits = resp["total_hits"].as_u64().unwrap();
+
+        // count is ALWAYS equal to results.len() — redundant
+        assert_eq!(
+            count,
+            results.len() as u64,
+            "count is always results.len() — redundant with array length"
+        );
+        // total_hits provides the actual pagination information
+        assert!(
+            total_hits >= 5,
+            "total_hits reports all matching docs ({}), not just returned ({})",
+            total_hits,
+            results.len()
+        );
+        assert!(
+            total_hits > count || results.len() == 5,
+            "total_hits differs from count when results are limited"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR41-H3 (CONFIRMED): query validation is inline, not shared ──────────
+    // query validation duplicates the same checks as validate_text_core but
+    // with a different order (empty+whitespace-only combined first, then
+    // length). This test documents that query rejects the same inputs as
+    // validate_text_core, confirming functional equivalence despite the
+    // structural duplication.
+    #[tokio::test]
+    async fn dr41_h3_query_validation_mirrors_validate_text_core() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // All of these are rejected by both validate_text_core and query validation
+        let bad_inputs: Vec<(&str, &str)> = vec![
+            ("", "empty"),
+            ("   ", "whitespace-only"),
+            ("\0evil", "null bytes"),
+            ("\x01control", "control characters"),
+            ("  padded  ", "leading/trailing whitespace"),
+        ];
+
+        for (bad_val, desc) in &bad_inputs {
+            let result = search_messages(&state, json!({ "query": bad_val, "limit": 10 }));
+            assert!(
+                result.is_err(),
+                "query should reject {} input: {:?}",
+                desc,
+                bad_val
+            );
+        }
+
+        state.shutdown();
+    }
+
+    // ── DR41-H4 (DISPROVED): created_ts naming is consistent ─────────────────
+    // Both get_inbox and search_messages serialize the timestamp as
+    // `created_ts`. InboxEntry stores it internally as `timestamp` but the
+    // response uses `created_ts` in both reading paths.
+    #[tokio::test]
+    async fn dr41_h4_created_ts_naming_consistent_across_responses() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "dr41h4", "name_hint": "sender41h4" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr41h4", "name_hint": "rcv41h4" }),
+        )
+        .unwrap();
+
+        send_message(
+            &state,
+            json!({
+                "from_agent": "sender41h4",
+                "to": ["rcv41h4"],
+                "subject": "tsname41h4",
+                "body": "timestamp naming test"
+            }),
+        )
+        .unwrap();
+
+        // get_inbox response uses created_ts
+        let inbox_result = get_inbox(&state, json!({ "agent_name": "rcv41h4" })).unwrap();
+        let inbox_msgs = inbox_result["messages"].as_array().unwrap();
+        assert!(!inbox_msgs.is_empty());
+        assert!(
+            inbox_msgs[0].get("created_ts").is_some(),
+            "get_inbox response uses 'created_ts' field name"
+        );
+        assert!(
+            inbox_msgs[0]["created_ts"].is_number(),
+            "created_ts is a numeric timestamp"
+        );
+
+        // search_messages response also uses created_ts
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let search_result =
+            search_messages(&state, json!({ "query": "tsname41h4", "limit": 5 })).unwrap();
+        let search_docs = search_result["results"].as_array().unwrap();
+        assert!(!search_docs.is_empty());
+        assert!(
+            search_docs[0].get("created_ts").is_some(),
+            "search_messages response uses 'created_ts' field name"
+        );
+        assert!(
+            search_docs[0]["created_ts"].is_number(),
+            "search created_ts is a numeric timestamp"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR41-H5 (DISPROVED): validate_text_field wrapper has semantic value ──
+    // validate_text_field is a trivial passthrough to validate_text_core, but
+    // it provides semantic clarity: it's used for non-path text fields
+    // (project_key, program, model) while validate_name adds path-safety
+    // rules. This test confirms both share the same core behavior.
+    #[tokio::test]
+    async fn dr41_h5_validate_text_field_shares_behavior_with_validate_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // validate_text_field is used by create_agent for project_key, program, model.
+        // validate_name is used for agent names, from_agent, recipients.
+        // Both reject the same core inputs via validate_text_core.
+        let bad_inputs: Vec<(&str, &str)> = vec![
+            ("\0evil", "null bytes"),
+            ("\x01control", "control characters"),
+            ("  padded  ", "leading/trailing whitespace"),
+            ("   ", "whitespace-only"),
+        ];
+
+        for (bad_val, desc) in &bad_inputs {
+            // project_key uses validate_text_field
+            let pkey_result = create_agent(
+                &state,
+                json!({ "project_key": bad_val, "name_hint": "test" }),
+            );
+            assert!(
+                pkey_result.is_err(),
+                "project_key (via validate_text_field) should reject {}: {:?}",
+                desc,
+                bad_val
+            );
+
+            // from_agent uses validate_name
+            let from_result = send_message(
+                &state,
+                json!({
+                    "from_agent": bad_val,
+                    "to": ["someone"],
+                    "body": "test"
+                }),
+            );
+            assert!(
+                from_result.is_err(),
+                "from_agent (via validate_name) should reject {}: {:?}",
+                desc,
+                bad_val
+            );
+        }
+
+        state.shutdown();
+    }
 }
