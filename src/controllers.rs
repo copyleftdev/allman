@@ -431,28 +431,21 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
 
     // Fire-and-forget: persist agent profile to Git.
-    // Include updated_at on re-registration so the file content alone
-    // can distinguish fresh registrations from updates (DR38-H4).
-    let profile = if is_reregistration {
-        json!({
-            "id": agent_id,
-            "project_id": project_id,
-            "name": name,
-            "program": program,
-            "model": model,
-            "registered_at": registered_at,
-            "updated_at": now
-        })
-    } else {
-        json!({
-            "id": agent_id,
-            "project_id": project_id,
-            "name": name,
-            "program": program,
-            "model": model,
-            "registered_at": registered_at
-        })
-    };
+    // updated_at is always present for consistent response schema (DR39-H2):
+    // - Fresh registration: updated_at is null
+    // - Re-registration: updated_at is the current timestamp
+    // This lets clients rely on a fixed set of fields regardless of whether
+    // the agent existed before (DR38-H4 introduced updated_at, DR39-H2 made
+    // it always present).
+    let profile = json!({
+        "id": agent_id,
+        "project_id": project_id,
+        "name": name,
+        "program": program,
+        "model": model,
+        "registered_at": registered_at,
+        "updated_at": if is_reregistration { serde_json::Value::from(now) } else { serde_json::Value::Null }
+    });
     // Use distinct commit messages for fresh registration vs re-registration
     // so the Git audit trail can distinguish them (DR35-H5).
     let commit_msg = if is_reregistration {
@@ -774,27 +767,42 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         None => DEFAULT_INBOX_LIMIT,
     };
 
-    // Atomic drain via entry() API. Holds the DashMap shard lock for the
-    // entire operation, preventing concurrent send_message from inserting
-    // messages that would be overwritten by a separate insert() call.
-    // Previous remove→insert pattern had a TOCTOU race window (H1).
+    // Fast path: nonexistent inbox — borrows &str, no String allocation.
+    // entry() requires an owned String key; skip it when the inbox doesn't
+    // exist (the Vacant branch was a no-op anyway) (DR39-H1).
     let mut taken = Vec::new();
     let remaining_count;
 
-    match state.inboxes.entry(agent_name.to_string()) {
-        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-            let inbox = occ.get_mut();
-            if inbox.len() <= limit {
-                taken = std::mem::take(inbox);
-                remaining_count = 0;
-                occ.remove(); // Clean up empty entry
-            } else {
-                taken = inbox.drain(..limit).collect();
-                remaining_count = inbox.len();
+    if !state.inboxes.contains_key(agent_name) {
+        remaining_count = 0;
+    } else {
+        // Atomic drain via entry() API. Holds the DashMap shard lock for the
+        // entire operation, preventing concurrent send_message from inserting
+        // messages that would be overwritten by a separate insert() call.
+        // Previous remove→insert pattern had a TOCTOU race window (H1).
+        match state.inboxes.entry(agent_name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                let inbox = occ.get_mut();
+                if inbox.len() <= limit {
+                    taken = std::mem::take(inbox);
+                    remaining_count = 0;
+                    occ.remove(); // Clean up empty entry
+                } else {
+                    taken = inbox.drain(..limit).collect();
+                    remaining_count = inbox.len();
+                    // Reclaim excess Vec capacity after partial drain.
+                    // Without this, the Vec retains its peak capacity
+                    // indefinitely (e.g., 10K capacity after draining
+                    // to 100 entries). Bounded by MAX_INBOX_SIZE but
+                    // wasteful for inboxes that had a burst (DR39-H3).
+                    inbox.shrink_to_fit();
+                }
             }
-        }
-        dashmap::mapref::entry::Entry::Vacant(_) => {
-            remaining_count = 0;
+            // TOCTOU fallback: inbox was removed between contains_key and
+            // entry() by a concurrent full drain. Safe — returns empty.
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                remaining_count = 0;
+            }
         }
     }
 
@@ -9820,10 +9828,11 @@ mod tests {
             "updated_at >= registered_at"
         );
 
-        // First registration should NOT have updated_at
+        // UPDATED (DR39-H2): Fresh registration now has updated_at: null
+        // for consistent schema across fresh and re-registration responses.
         assert!(
-            profile1.get("updated_at").is_none(),
-            "Fresh registration has no updated_at"
+            profile1["updated_at"].is_null(),
+            "Fresh registration has updated_at: null (DR39-H2)"
         );
     }
 
@@ -9933,8 +9942,16 @@ mod tests {
         assert!(r1.get("model").is_some(), "model present");
         assert!(r1.get("registered_at").is_some(), "registered_at present");
 
-        // updated_at is ABSENT on fresh registration (schema inconsistency)
-        let has_updated_at_fresh = r1.get("updated_at").is_some();
+        // FIXED (DR39-H2): updated_at is now always present.
+        // Fresh registration has updated_at: null.
+        assert!(
+            r1.get("updated_at").is_some(),
+            "FIXED: updated_at always present (null on fresh registration)"
+        );
+        assert!(
+            r1["updated_at"].is_null(),
+            "Fresh registration has updated_at: null"
+        );
 
         // Re-registration
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -9948,17 +9965,23 @@ mod tests {
         )
         .unwrap();
 
-        // updated_at IS present on re-registration
-        let has_updated_at_rereg = r2.get("updated_at").is_some();
-
-        // Document the inconsistency: different field sets for same endpoint
+        // updated_at is a timestamp on re-registration
         assert!(
-            has_updated_at_rereg,
+            r2.get("updated_at").is_some(),
             "Re-registration includes updated_at"
         );
         assert!(
-            !has_updated_at_fresh,
-            "Fresh registration omits updated_at (schema inconsistency — DR39-H2)"
+            r2["updated_at"].is_i64(),
+            "Re-registration updated_at is an integer timestamp"
+        );
+
+        // Consistent schema: both responses have exactly the same 7 fields
+        let fields_fresh: Vec<&str> = r1.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let fields_rereg: Vec<&str> = r2.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            fields_fresh.len(),
+            fields_rereg.len(),
+            "FIXED: Same number of fields in fresh and re-registration responses"
         );
     }
 
