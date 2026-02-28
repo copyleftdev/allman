@@ -8,7 +8,6 @@ use uuid::Uuid;
 
 const MAX_INBOX_SIZE: usize = 10_000;
 const MAX_AGENT_NAME_LEN: usize = 128;
-const MAX_FROM_AGENT_LEN: usize = 256;
 const MAX_PROJECT_KEY_LEN: usize = 256;
 const MAX_RECIPIENTS: usize = 100;
 const MAX_RECIPIENT_NAME_LEN: usize = 256;
@@ -37,8 +36,17 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
         });
     }
 
-    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id");
+
+    // JSON-RPC 2.0 §4.1: "A Notification is a Request object without an 'id' member."
+    // "The Server MUST NOT reply to a Notification" — even if malformed.
+    // This check MUST come before jsonrpc validation so that malformed
+    // notifications (wrong/missing jsonrpc) are silently dropped (DR26-H3).
+    if id.is_none() {
+        return Value::Null;
+    }
+
+    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(json!({}));
 
     // JSON-RPC 2.0 §4: "jsonrpc" MUST be exactly "2.0" (DR25-H3).
@@ -48,13 +56,6 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
             "id": id,
             "error": { "code": -32600, "message": "Invalid Request: jsonrpc field must be exactly \"2.0\"" }
         });
-    }
-
-    // JSON-RPC 2.0: requests without "id" are notifications.
-    // The spec says "The Server MUST NOT reply to a Notification."
-    // Return Value::Null to signal no response should be sent.
-    if id.is_none() {
-        return Value::Null;
     }
 
     // JSON-RPC 2.0: params MUST be an object or array (§4.2).
@@ -220,6 +221,9 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         .get("project_key")
         .and_then(|v| v.as_str())
         .ok_or("Missing project_key")?;
+    if project_key.is_empty() {
+        return Err("project_key must not be empty".to_string());
+    }
     if project_key.contains('\0') {
         return Err("project_key must not contain null bytes".to_string());
     }
@@ -273,17 +277,9 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     // Atomic check-and-insert via DashMap::entry(). Holds the shard lock
     // across the collision check and the insert/update, eliminating the
     // TOCTOU race that existed with separate get() + insert().
-    let agent_id = Uuid::new_v4().to_string();
     let registered_at = Utc::now().timestamp();
 
-    let record = AgentRecord {
-        id: agent_id.clone(),
-        project_id: project_id.clone(),
-        name: name.clone(),
-        program: program.to_string(),
-        model: model.to_string(),
-        registered_at,
-    };
+    let agent_id;
 
     match state.agents.entry(name.clone()) {
         dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -293,10 +289,29 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
                     name
                 ));
             }
-            // Same project — idempotent upsert
+            // Same project — idempotent upsert. Preserve the original agent_id
+            // so external systems caching IDs remain valid (DR26-H2).
+            agent_id = occ.get().id.clone();
+            let record = AgentRecord {
+                id: agent_id.clone(),
+                project_id: project_id.clone(),
+                name: name.clone(),
+                program: program.to_string(),
+                model: model.to_string(),
+                registered_at,
+            };
             occ.insert(record);
         }
         dashmap::mapref::entry::Entry::Vacant(vac) => {
+            agent_id = Uuid::new_v4().to_string();
+            let record = AgentRecord {
+                id: agent_id.clone(),
+                project_id: project_id.clone(),
+                name: name.clone(),
+                program: program.to_string(),
+                model: model.to_string(),
+                registered_at,
+            };
             vac.insert(record);
         }
     }
@@ -372,10 +387,12 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     if from_agent.is_empty() {
         return Err("from_agent must not be empty".to_string());
     }
-    if from_agent.len() > MAX_FROM_AGENT_LEN {
+    // Use MAX_AGENT_NAME_LEN (128) instead of MAX_FROM_AGENT_LEN (256) so
+    // from_agent names cannot exceed what create_agent accepts (DR26-H5).
+    if from_agent.len() > MAX_AGENT_NAME_LEN {
         return Err(format!(
             "from_agent exceeds {} character limit",
-            MAX_FROM_AGENT_LEN
+            MAX_AGENT_NAME_LEN
         ));
     }
     if from_agent.contains('\0') {
@@ -524,13 +541,23 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         }
     }
 
-    // All inboxes have capacity — deliver atomically per recipient.
+    // All inboxes have capacity (per pre-check). Deliver with per-entry
+    // atomic guard to handle concurrent races — if a concurrent send filled
+    // an inbox between pre-check and delivery, the entry() block skips the
+    // push instead of overshooting MAX_INBOX_SIZE (DR26-H4).
     for recipient in &to_agents {
         state
             .inboxes
             .entry(recipient.clone())
-            .or_default()
-            .push(entry.clone());
+            .and_modify(|inbox| {
+                if inbox.len() < MAX_INBOX_SIZE {
+                    inbox.push(entry.clone());
+                }
+                // Else: concurrent race filled this inbox after pre-check.
+                // Silently skip — acceptable since races are rare and the
+                // alternative (overshooting the cap) is worse.
+            })
+            .or_insert_with(|| vec![entry.clone()]);
     }
 
     // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
@@ -792,10 +819,10 @@ mod tests {
         )
         .unwrap();
 
-        // Both succeed — second is an upsert
-        assert_ne!(
+        // Both succeed — second is an upsert with stable ID (DR26-H2 fix)
+        assert_eq!(
             r1["id"], r2["id"],
-            "Re-registration generates a new agent_id"
+            "FIXED: Re-registration preserves original agent_id (DR26-H2)"
         );
         let record = state.agents.get("Bob").unwrap();
         assert_eq!(record.program, "v2", "Upsert should update the record");
@@ -1830,9 +1857,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_ne!(
+        // FIXED: agent_id is now stable across re-registrations (DR26-H2)
+        assert_eq!(
             r1["id"], r2["id"],
-            "Upsert generates a new agent_id each time"
+            "FIXED: Upsert preserves original agent_id (DR26-H2)"
         );
         assert_eq!(
             r1["project_id"], r2["project_id"],
@@ -1852,8 +1880,8 @@ mod tests {
     async fn h4_from_agent_accepts_any_string() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 200-char from_agent — within MAX_FROM_AGENT_LEN (256)
-        let long_from = "X".repeat(200);
+        // 100-char from_agent — within MAX_AGENT_NAME_LEN (128, DR26-H5 fix)
+        let long_from = "X".repeat(100);
         let result = send_message(
             &state,
             json!({
@@ -1863,7 +1891,7 @@ mod tests {
                 "body": "hello",
             }),
         );
-        assert!(result.is_ok(), "200-char from_agent is accepted");
+        assert!(result.is_ok(), "100-char from_agent is accepted");
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
         assert_eq!(
@@ -2396,7 +2424,8 @@ mod tests {
     async fn dr6_h6_from_agent_boundary_accepted() {
         let (state, _idx, _repo) = test_post_office();
 
-        let from = "X".repeat(256);
+        // UPDATED: from_agent now aligned with MAX_AGENT_NAME_LEN (128) per DR26-H5
+        let from = "X".repeat(128);
 
         let result = send_message(
             &state,
@@ -2410,7 +2439,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Exactly 256-char from_agent must be accepted"
+            "Exactly 128-char from_agent must be accepted (DR26-H5 aligned limit)"
         );
 
         let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
@@ -2419,8 +2448,8 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .len(),
-            256,
-            "Full 256-char from_agent preserved in inbox entry"
+            128,
+            "Full 128-char from_agent preserved in inbox entry"
         );
     }
 
@@ -2524,18 +2553,13 @@ mod tests {
     async fn dr7_h1_empty_project_key_produces_valid_id() {
         let (state, _idx, _repo) = test_post_office();
 
-        let r1 = create_agent(&state, json!({ "project_key": "", "name_hint": "Agent1" })).unwrap();
-        let r2 = create_agent(&state, json!({ "project_key": "", "name_hint": "Agent2" })).unwrap();
-
-        // Empty project_key → deterministic UUID v5 from empty bytes
-        assert_eq!(
-            r1["project_id"], r2["project_id"],
-            "Empty project_key must produce the same deterministic project_id"
-        );
+        // UPDATED: Empty project_key is now rejected (DR26-H1)
+        let r1 = create_agent(&state, json!({ "project_key": "", "name_hint": "Agent1" }));
         assert!(
-            r1["project_id"].as_str().unwrap().starts_with("proj_"),
-            "project_id must have proj_ prefix"
+            r1.is_err(),
+            "FIXED: Empty project_key is now rejected (DR26-H1)"
         );
+        assert!(r1.unwrap_err().contains("must not be empty"));
     }
 
     // ── H2 (DISPROVED): Long recipient names don't amplify memory ───────
@@ -3504,7 +3528,8 @@ mod tests {
     async fn dr12_h5_max_fields_combined() {
         let (state, _idx, _repo) = test_post_office();
 
-        let max_from = "F".repeat(super::MAX_FROM_AGENT_LEN);
+        // UPDATED: from_agent now uses MAX_AGENT_NAME_LEN (128) per DR26-H5
+        let max_from = "F".repeat(super::MAX_AGENT_NAME_LEN);
         let max_subject = "S".repeat(super::MAX_SUBJECT_LEN);
         let max_body = "B".repeat(super::MAX_BODY_LEN);
         let recipients: Vec<String> = (0..super::MAX_RECIPIENTS)
@@ -3533,7 +3558,7 @@ mod tests {
             assert_eq!(msgs.len(), 1);
             assert_eq!(
                 msgs[0]["from_agent"].as_str().unwrap().len(),
-                super::MAX_FROM_AGENT_LEN
+                super::MAX_AGENT_NAME_LEN
             );
             assert_eq!(
                 msgs[0]["subject"].as_str().unwrap().len(),
@@ -3751,11 +3776,11 @@ mod tests {
     async fn dr14_h4_empty_json_request_returns_error() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Empty JSON object has no "jsonrpc" — now returns -32600 (DR25 fix)
+        // Empty JSON object has no "id" — treated as notification, silently dropped (DR26-H3 fix)
         let response = handle_mcp_request(state, json!({})).await;
-        assert_eq!(
-            response["error"]["code"], -32600,
-            "UPDATED: Empty JSON now fails jsonrpc validation (DR25)"
+        assert!(
+            response.is_null(),
+            "UPDATED: Empty JSON (no id) is a notification — silently dropped (DR26)"
         );
 
         // With "id" and "jsonrpc" present, returns Method not found
@@ -4177,8 +4202,11 @@ mod tests {
             "Upsert also includes registered_at"
         );
 
-        // Only id differs between registration and upsert
-        assert_ne!(r1["id"], r2["id"], "Different ids on re-registration");
+        // UPDATED: id is now stable across re-registrations (DR26-H2)
+        assert_eq!(
+            r1["id"], r2["id"],
+            "FIXED: Same id on re-registration (DR26-H2)"
+        );
         assert_eq!(r1["project_id"], r2["project_id"], "Same project_id");
     }
 
@@ -5550,9 +5578,13 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("whitespace-only"));
 
-        // Empty string is still accepted (valid edge case — documented in DR7)
+        // UPDATED: Empty string is also now rejected (DR26-H1)
         let result2 = create_agent(&state, json!({ "project_key": "", "name_hint": "Agent2" }));
-        assert!(result2.is_ok(), "Empty project_key still accepted");
+        assert!(
+            result2.is_err(),
+            "FIXED: Empty project_key also rejected (DR26-H1)"
+        );
+        assert!(result2.unwrap_err().contains("must not be empty"));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -6309,9 +6341,8 @@ mod tests {
 
     // ── DR26 Hypotheses ─────────────────────────────────────────────────────
 
-    // DR26-H1: Empty project_key is accepted by create_agent.
-    // The whitespace-only check (trim().is_empty() && !is_empty()) short-circuits
-    // when the string IS empty, so empty project_key passes all validation.
+    // DR26-H1: Empty project_key is now rejected by create_agent.
+    // FIXED: Added explicit is_empty() check before the whitespace-only check.
     #[tokio::test]
     async fn dr26_h1_empty_project_key_accepted() {
         let (state, _idx, _repo) = test_post_office();
@@ -6324,31 +6355,26 @@ mod tests {
             }),
         );
 
-        // CONFIRMED: empty project_key succeeds — should be rejected
+        // FIXED: empty project_key is now rejected
+        assert!(result.is_err(), "FIXED: empty project_key is rejected");
         assert!(
-            result.is_ok(),
-            "BUG CONFIRMED: empty project_key is accepted, creating a project with meaningless ID"
+            result.unwrap_err().contains("must not be empty"),
+            "Error message mentions empty"
         );
 
-        // The deterministic project_id is derived from empty bytes — it's valid but meaningless.
-        let resp = result.unwrap();
-        let project_id = resp["project_id"].as_str().unwrap();
+        // No project or agent should have been created
         assert!(
-            project_id.starts_with("proj_"),
-            "Project ID is still generated from empty key"
+            state.projects.is_empty(),
+            "No project created for empty key"
         );
-
-        // The project mapping stores "" as the human key
-        assert_eq!(
-            state.projects.get(project_id).unwrap().value(),
-            "",
-            "Project human key is empty string"
+        assert!(
+            state.agents.is_empty(),
+            "No agent created for empty project key"
         );
     }
 
-    // DR26-H2: Agent re-registration generates a new agent_id each time.
-    // Uuid::new_v4() is called unconditionally before the entry check,
-    // so re-registration in the same project always changes the agent's ID.
+    // DR26-H2: Agent re-registration now preserves the original agent_id.
+    // FIXED: The Occupied branch reuses occ.get().id instead of generating new UUID.
     #[tokio::test]
     async fn dr26_h2_reregistration_changes_agent_id() {
         let (state, _idx, _repo) = test_post_office();
@@ -6375,29 +6401,28 @@ mod tests {
         .unwrap();
         let id2 = r2["id"].as_str().unwrap().to_string();
 
-        // CONFIRMED: agent_id changes on re-registration
-        assert_ne!(
+        // FIXED: agent_id is stable across re-registrations
+        assert_eq!(
             id1, id2,
-            "BUG CONFIRMED: re-registration generates new agent_id — external ID caching breaks"
+            "FIXED: re-registration preserves original agent_id"
         );
 
-        // The DashMap record uses the latest ID
+        // The DashMap record preserves the original ID
         let record = state.agents.get("StableAgent").unwrap();
         assert_eq!(
-            record.id, id2,
-            "DashMap stores the latest agent_id, old one is lost"
+            record.id, id1,
+            "DashMap stores the original agent_id across upserts"
         );
     }
 
-    // DR26-H3: Notification check runs AFTER jsonrpc validation.
-    // A request without "id" but with wrong "jsonrpc" gets an error response
-    // instead of being silently dropped (Value::Null → 204 No Content).
-    // JSON-RPC 2.0 §4.1: "The Server MUST NOT reply to a Notification."
+    // DR26-H3: Notification check now runs BEFORE jsonrpc validation.
+    // FIXED: All requests without "id" are silently dropped (Value::Null),
+    // even if jsonrpc version is wrong or missing.
     #[tokio::test]
     async fn dr26_h3_malformed_notification_gets_response() {
         let (state, _idx, _repo) = test_post_office();
 
-        // No "id" field, wrong jsonrpc version → should be treated as notification (no response)
+        // No "id" field, wrong jsonrpc version → silently dropped
         let response = handle_mcp_request(
             state.clone(),
             json!({
@@ -6407,18 +6432,13 @@ mod tests {
         )
         .await;
 
-        // CONFIRMED: server responds to malformed notification instead of dropping it.
-        // Per JSON-RPC 2.0 spec, absence of "id" = notification → no response.
+        // FIXED: malformed notification is silently dropped (no response)
         assert!(
-            !response.is_null(),
-            "BUG CONFIRMED: malformed notification gets error response instead of being silently dropped"
-        );
-        assert_eq!(
-            response["error"]["code"], -32600,
-            "Returns -32600 error instead of Value::Null (204 No Content)"
+            response.is_null(),
+            "FIXED: malformed notification silently dropped per JSON-RPC 2.0 §4.1"
         );
 
-        // Control: valid notification (correct jsonrpc, no id) IS silently dropped
+        // Valid notification (correct jsonrpc, no id) also silently dropped
         let valid_notification = handle_mcp_request(
             state.clone(),
             json!({
@@ -6432,7 +6452,7 @@ mod tests {
             "Valid notification correctly returns Value::Null"
         );
 
-        // Control: no "id" and no "jsonrpc" at all → also a malformed notification
+        // No "id" and no "jsonrpc" at all → also silently dropped
         let no_jsonrpc = handle_mcp_request(
             state.clone(),
             json!({
@@ -6441,8 +6461,8 @@ mod tests {
         )
         .await;
         assert!(
-            !no_jsonrpc.is_null(),
-            "BUG CONFIRMED: missing-jsonrpc notification also gets error response"
+            no_jsonrpc.is_null(),
+            "FIXED: missing-jsonrpc notification also silently dropped"
         );
     }
 
@@ -6474,9 +6494,7 @@ mod tests {
                 project_id: "test".to_string(),
             });
         }
-        state
-            .inboxes
-            .insert("CapTarget".to_string(), entries);
+        state.inboxes.insert("CapTarget".to_string(), entries);
 
         // Verify we're at MAX_INBOX_SIZE - 1
         assert_eq!(
@@ -6526,8 +6544,8 @@ mod tests {
         // This is the same soft-cap pattern as MAX_INBOXES (acknowledged).
     }
 
-    // DR26-H5: from_agent max length (256) differs from agent name max (128).
-    // Messages can be sent FROM names too long to register as agents.
+    // DR26-H5: from_agent max length now aligned with agent name max (128).
+    // FIXED: from_agent uses MAX_AGENT_NAME_LEN instead of MAX_FROM_AGENT_LEN.
     #[tokio::test]
     async fn dr26_h5_from_agent_length_asymmetry() {
         let (state, _idx, _repo) = test_post_office();
@@ -6539,8 +6557,21 @@ mod tests {
         )
         .unwrap();
 
-        // 129 chars: too long for create_agent (MAX_AGENT_NAME_LEN = 128)
-        let long_name: String = "A".repeat(129);
+        // 128 chars: accepted by both create_agent and from_agent
+        let max_name: String = "A".repeat(128);
+        let send_ok = send_message(
+            &state,
+            json!({
+                "from_agent": max_name,
+                "to": ["Receiver"],
+                "subject": "ok",
+                "body": "at limit"
+            }),
+        );
+        assert!(send_ok.is_ok(), "128-char from_agent accepted (at limit)");
+
+        // 129 chars: now rejected by BOTH create_agent and from_agent
+        let long_name: String = "B".repeat(129);
         let create_result = create_agent(
             &state,
             json!({ "project_key": "len_test", "name_hint": long_name }),
@@ -6550,57 +6581,24 @@ mod tests {
             "129-char name rejected by create_agent"
         );
 
-        // But 129 chars is accepted as from_agent (MAX_FROM_AGENT_LEN = 256)
         let send_result = send_message(
             &state,
             json!({
                 "from_agent": long_name,
                 "to": ["Receiver"],
                 "subject": "ghost",
-                "body": "from unregisterable name"
+                "body": "from long name"
             }),
         );
 
-        // CONFIRMED: from_agent accepts names that can never be registered
+        // FIXED: from_agent now also rejects names > 128 chars
         assert!(
-            send_result.is_ok(),
-            "BUG CONFIRMED: 129-char from_agent accepted, but can never be a registered agent"
+            send_result.is_err(),
+            "FIXED: 129-char from_agent rejected, consistent with create_agent"
         );
-
-        // The message arrives with the unregisterable from_agent
-        let inbox = get_inbox(&state, json!({ "agent_name": "Receiver" })).unwrap();
-        let msgs = inbox["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(
-            msgs[0]["from_agent"].as_str().unwrap().len(),
-            129,
-            "Message stored with 129-char from_agent that can't be registered"
+        assert!(
+            send_result.unwrap_err().contains("128"),
+            "Error references the aligned limit of 128"
         );
-
-        // Boundary: 256 chars is the limit for from_agent
-        let max_from: String = "B".repeat(256);
-        let at_limit = send_message(
-            &state,
-            json!({
-                "from_agent": max_from,
-                "to": ["Receiver"],
-                "subject": "max",
-                "body": "at limit"
-            }),
-        );
-        assert!(at_limit.is_ok(), "256-char from_agent accepted");
-
-        // 257 chars exceeds from_agent limit
-        let over_from: String = "C".repeat(257);
-        let over_result = send_message(
-            &state,
-            json!({
-                "from_agent": over_from,
-                "to": ["Receiver"],
-                "subject": "over",
-                "body": "too long"
-            }),
-        );
-        assert!(over_result.is_err(), "257-char from_agent rejected");
     }
 }
