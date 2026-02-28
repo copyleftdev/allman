@@ -6020,4 +6020,223 @@ mod tests {
             "FIXED: Null params returns -32602"
         );
     }
+
+    // ── DR25: Cross-Cutting Concerns & Spec Compliance ──────────────────────
+
+    // H1: No cap on total inbox count — unlimited DashMap entries via unique recipients
+    #[tokio::test]
+    async fn dr25_h1_inbox_dashmap_has_no_total_count_cap() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Create 200 unique inboxes by sending to distinct recipients.
+        // agents DashMap has MAX_AGENTS=100K cap. projects has MAX_PROJECTS=100K cap.
+        // But inboxes has NO cap.
+        for i in 0..200 {
+            let recipient = format!("phantom_agent_{}", i);
+            let result = send_message(
+                &state,
+                json!({
+                    "from_agent": "spammer",
+                    "to": [recipient],
+                    "subject": "test",
+                    "body": "x"
+                }),
+            );
+            assert!(result.is_ok(), "Send to phantom_agent_{} should succeed", i);
+        }
+
+        // Verify 200 distinct inbox entries were created
+        assert_eq!(
+            state.inboxes.len(),
+            200,
+            "CONFIRMED: 200 phantom inboxes created with no cap. \
+             agents has MAX_AGENTS={}, projects has MAX_PROJECTS={}, \
+             but inboxes has no limit.",
+            MAX_AGENTS,
+            MAX_PROJECTS
+        );
+
+        // None of these "agents" are registered — inboxes exist without agents
+        assert_eq!(
+            state.agents.len(),
+            0,
+            "No agents registered, yet 200 inboxes exist"
+        );
+    }
+
+    // H2: from_agent missing starts_with('.') check — asymmetry with recipients and get_inbox
+    #[tokio::test]
+    async fn dr25_h2_from_agent_accepts_dot_prefixed_names() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // from_agent with dot prefix — should be blocked for consistency
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": ".evil",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "CONFIRMED: from_agent accepts '.evil' despite recipients and \
+             get_inbox rejecting dot-prefixed names (DR24 fix)"
+        );
+
+        // Verify recipients block it for comparison
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [".evil"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(r2.is_err(), "Recipients correctly reject '.evil'");
+        assert!(r2.unwrap_err().contains("must not start with '.'"));
+
+        // Verify get_inbox blocks it
+        let r3 = get_inbox(&state, json!({ "agent_name": ".evil" }));
+        assert!(r3.is_err(), "get_inbox correctly rejects '.evil'");
+        assert!(r3.unwrap_err().contains("must not start with '.'"));
+    }
+
+    // H3: Missing jsonrpc version field validation — server accepts any version or missing field
+    #[tokio::test]
+    async fn dr25_h3_jsonrpc_version_not_validated() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Request with wrong version "1.0"
+        let r1 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "1.0",
+                "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            r1.get("result").is_some(),
+            "CONFIRMED: Server accepts jsonrpc '1.0' without error. \
+             JSON-RPC 2.0 spec requires version MUST be exactly '2.0'."
+        );
+
+        // Request with missing jsonrpc field entirely
+        let r2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "id": 2,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            r2.get("result").is_some(),
+            "CONFIRMED: Server accepts missing jsonrpc field without error"
+        );
+
+        // Request with non-string jsonrpc
+        let r3 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": 2,
+                "id": 3,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        assert!(
+            r3.get("result").is_some(),
+            "CONFIRMED: Server accepts integer jsonrpc field without error"
+        );
+    }
+
+    // H4: Unknown tool uses -32601 (Method not found) instead of -32602 (Invalid params)
+    #[tokio::test]
+    async fn dr25_h4_unknown_tool_uses_wrong_error_code() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let response = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "nonexistent_tool",
+                    "arguments": {}
+                }
+            }),
+        )
+        .await;
+
+        let code = response["error"]["code"].as_i64().unwrap();
+        assert_eq!(
+            code, -32601,
+            "CONFIRMED: Unknown tool returns -32601 (Method not found). \
+             The method 'tools/call' IS found — only the tool name parameter \
+             is invalid. Per JSON-RPC 2.0, this should be -32602 (Invalid params)."
+        );
+
+        // Compare with actual method-not-found
+        let (state2, _idx2, _repo2) = test_post_office();
+        let r2 = handle_mcp_request(
+            state2,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "nonexistent/method"
+            }),
+        )
+        .await;
+        let code2 = r2["error"]["code"].as_i64().unwrap();
+        assert_eq!(
+            code2, -32601,
+            "Method not found also returns -32601 — same code for different errors"
+        );
+    }
+
+    // H5: JSON array body treated as notification (204) instead of error
+    #[tokio::test]
+    async fn dr25_h5_array_body_treated_as_notification() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send a JSON array (batch request per JSON-RPC 2.0)
+        let response = handle_mcp_request(
+            state.clone(),
+            json!([
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+            ]),
+        )
+        .await;
+
+        // handle_mcp_request returns Value::Null for notifications.
+        // mcp_handler converts Null → 204 No Content.
+        assert!(
+            response.is_null(),
+            "CONFIRMED: Array body returns Value::Null (→ 204 in mcp_handler). \
+             Per JSON-RPC 2.0 spec, arrays are batch requests and should be \
+             processed or return -32600 Invalid Request."
+        );
+
+        // Also test a non-object, non-array body (plain number)
+        let r2 = handle_mcp_request(state.clone(), json!(42)).await;
+        assert!(
+            r2.is_null(),
+            "CONFIRMED: Integer body also returns Null (→ 204). \
+             Should return -32600 Invalid Request."
+        );
+
+        // String body
+        let r3 = handle_mcp_request(state.clone(), json!("hello")).await;
+        assert!(
+            r3.is_null(),
+            "CONFIRMED: String body also returns Null (→ 204)"
+        );
+    }
 }
