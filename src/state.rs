@@ -85,6 +85,12 @@ pub struct PostOffice {
     // Persist worker JoinHandle — stored so shutdown() can join the thread
     // and wait for pending Tantivy batches to commit (DR34-H3).
     persist_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    // Git actor JoinHandle — stored so shutdown() can join the thread
+    // after the persist worker exits (which drops the last git_tx sender,
+    // closing the Git channel). Ensures pending git commits complete
+    // before process exit (DR35-H1).
+    git_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl PostOffice {
@@ -112,9 +118,11 @@ impl PostOffice {
         let index_reader = index.reader()?;
 
         // ── 2. Git Actor (dedicated OS thread — git2 is sync) ────────────────
+        // JoinHandle stored so shutdown() can join after persist worker exits,
+        // ensuring pending git commits complete before process exit (DR35-H1).
         let (git_tx, git_rx) = bounded::<GitRequest>(10_000);
         let actor = GitActor::new(repo_root.to_path_buf(), git_rx);
-        std::thread::Builder::new()
+        let git_handle = std::thread::Builder::new()
             .name("git-actor".into())
             .spawn(move || actor.run())
             .context("Failed to spawn git actor thread")?;
@@ -168,23 +176,41 @@ impl PostOffice {
             persist_tx,
             _nrt_guard: nrt_guard,
             persist_handle: Arc::new(Mutex::new(Some(persist_handle))),
+            git_handle: Arc::new(Mutex::new(Some(git_handle))),
         })
     }
 
-    /// Shut down the persist pipeline and wait for pending Tantivy batches
-    /// to commit. Drops the persist channel sender to signal the worker,
-    /// then joins the worker thread to ensure all queued ops are flushed
-    /// before the process exits (DR34-H3).
+    /// Shut down the persist pipeline and wait for all background threads
+    /// to complete. Sequence:
+    /// 1. Drop persist_tx → persist worker drains remaining ops and exits.
+    /// 2. Join persist worker → all Tantivy batches committed (DR34-H3).
+    /// 3. Persist worker exit drops git_tx → Git channel closes.
+    /// 4. Join git actor → all pending git commits complete (DR35-H1).
     pub fn shutdown(self) {
         // Drop the sender to close the channel — this signals the persist
         // worker to drain remaining ops and exit its loop.
         drop(self.persist_tx);
 
         // Join the persist worker thread so pending batches are committed.
+        // When the persist worker exits, it drops its git_tx clone (the last
+        // sender), which closes the Git channel.
         if let Ok(mut guard) = self.persist_handle.lock() {
             if let Some(handle) = guard.take() {
                 if let Err(e) = handle.join() {
                     tracing::error!("Persist worker thread panicked: {:?}", e);
+                }
+            }
+        }
+
+        // Join the git actor thread so pending git commits complete.
+        // The Git channel is now closed (persist worker dropped the last
+        // sender above), so the git actor drains remaining requests and
+        // exits. Joining ensures all commits finish before process exit
+        // (DR35-H1).
+        if let Ok(mut guard) = self.git_handle.lock() {
+            if let Some(handle) = guard.take() {
+                if let Err(e) = handle.join() {
+                    tracing::error!("Git actor thread panicked: {:?}", e);
                 }
             }
         }

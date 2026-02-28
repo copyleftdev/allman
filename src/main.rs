@@ -64,10 +64,31 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C handler");
-    tracing::info!("Received shutdown signal");
+    // Handle both SIGINT (Ctrl-C) and SIGTERM (Docker/Kubernetes/systemd).
+    // Previously only SIGINT was handled — SIGTERM bypassed the graceful
+    // shutdown path, potentially losing pending Tantivy batches and git
+    // commits (DR35-H2).
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received SIGINT (Ctrl-C)");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install CTRL+C handler");
+        tracing::info!("Received shutdown signal");
+    }
 }
 
 async fn health_check() -> &'static str {
