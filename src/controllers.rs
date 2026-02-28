@@ -90,7 +90,22 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
 
     match method {
         "tools/call" => {
-            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            // Validate tool name type: non-string values (integers, booleans,
+            // null) must return a clear type error, not fall through to
+            // "Unknown tool: " which is misleading (DR29-H4).
+            let tool_name = match params.get("name") {
+                Some(v) => match v.as_str() {
+                    Some(s) => s,
+                    None => {
+                        return json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32602, "message": "Invalid params: name must be a string" }
+                        });
+                    }
+                },
+                None => "",
+            };
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             // Validate arguments is an object (or absent → defaulted to {}).
@@ -427,9 +442,14 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         Some(v) => v.as_array().ok_or("to must be a JSON array")?,
         None => return Err("Missing to recipients".to_string()),
     };
-    // Check for non-string elements BEFORE filtering, so the error message
-    // explains why recipients were rejected instead of "No recipients specified" (DR28-H2).
-    let has_nonstring = to_array.iter().any(|v| !v.is_string() && !v.is_null());
+    // Reject ANY non-string elements in the to array up front. The DR28-H2
+    // fix only caught the "all non-string" case; mixed arrays like [42, "Alice"]
+    // silently dropped the non-string and delivered only to Alice (DR29-H5).
+    if to_array.iter().any(|v| !v.is_string() && !v.is_null()) {
+        return Err(
+            "to array contains non-string elements — all recipients must be strings".to_string(),
+        );
+    }
     let to_agents: Vec<String> = {
         let mut seen = std::collections::HashSet::new();
         to_array
@@ -440,17 +460,25 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
             .map(|s| s.to_string())
             .collect()
     };
-    if to_agents.is_empty() && has_nonstring {
-        return Err(
-            "to array contains non-string elements — all recipients must be strings".to_string(),
-        );
-    }
-    let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-    let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let project_id = args
-        .get("project_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // Validate optional string fields: non-string types (integers, booleans,
+    // arrays) must return type errors, not silently default to "" (DR29-H3).
+    let subject = match args.get("subject") {
+        Some(v) if v.is_null() => "",
+        Some(v) => v.as_str().ok_or("subject must be a string if provided")?,
+        None => "",
+    };
+    let body = match args.get("body") {
+        Some(v) if v.is_null() => "",
+        Some(v) => v.as_str().ok_or("body must be a string if provided")?,
+        None => "",
+    };
+    let project_id = match args.get("project_id") {
+        Some(v) if v.is_null() => "",
+        Some(v) => v
+            .as_str()
+            .ok_or("project_id must be a string if provided")?,
+        None => "",
+    };
 
     if from_agent.is_empty() {
         return Err("from_agent must not be empty".to_string());
@@ -695,11 +723,14 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         return Err("agent_name must not have leading or trailing whitespace".to_string());
     }
 
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(DEFAULT_INBOX_LIMIT as i64)
-        .clamp(1, MAX_INBOX_LIMIT as i64) as usize;
+    // Validate limit type: non-integer types (strings, booleans, objects)
+    // must return a type error, not silently use the default (DR29-H1).
+    let limit = match args.get("limit") {
+        Some(v) if v.is_null() => DEFAULT_INBOX_LIMIT as i64,
+        Some(v) => v.as_i64().ok_or("limit must be an integer if provided")?,
+        None => DEFAULT_INBOX_LIMIT as i64,
+    }
+    .clamp(1, MAX_INBOX_LIMIT as i64) as usize;
 
     // Atomic drain via entry() API. Holds the DashMap shard lock for the
     // entire operation, preventing concurrent send_message from inserting
@@ -788,11 +819,14 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     if query_str.len() > MAX_QUERY_LEN {
         return Err(format!("query exceeds {} byte limit", MAX_QUERY_LEN));
     }
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(DEFAULT_SEARCH_LIMIT as i64)
-        .clamp(1, MAX_SEARCH_LIMIT as i64) as usize;
+    // Validate limit type: non-integer types (strings, booleans, floats)
+    // must return a type error, not silently use the default (DR29-H2).
+    let limit = match args.get("limit") {
+        Some(v) if v.is_null() => DEFAULT_SEARCH_LIMIT as i64,
+        Some(v) => v.as_i64().ok_or("limit must be an integer if provided")?,
+        None => DEFAULT_SEARCH_LIMIT as i64,
+    }
+    .clamp(1, MAX_SEARCH_LIMIT as i64) as usize;
 
     let index = &state.index;
     let searcher = state.index_reader.searcher();
@@ -1028,6 +1062,7 @@ mod tests {
     async fn h10_non_string_recipients_are_filtered() {
         let (state, _idx, _repo) = test_post_office();
 
+        // Mixed array with non-string elements is now rejected entirely (DR29-H5).
         let result = send_message(
             &state,
             json!({
@@ -1037,15 +1072,30 @@ mod tests {
                 "body": "hello",
             }),
         );
-        assert!(result.is_ok());
-
-        // "bob" gets the message (valid string recipient)
-        assert!(state.inboxes.contains_key("bob"));
-        // Non-string elements must NOT create empty-string inbox entries
         assert!(
-            !state.inboxes.contains_key(""),
-            "Non-string to elements must be filtered out, not coerced to empty string"
+            result.is_err(),
+            "Mixed to array with non-strings must be rejected"
         );
+        assert!(
+            result.unwrap_err().contains("non-string"),
+            "Error must mention non-string elements"
+        );
+
+        // Pure string array with nulls still works (nulls are filtered)
+        let result2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob", null],
+                "subject": "test",
+                "body": "hello",
+            }),
+        );
+        assert!(
+            result2.is_ok(),
+            "Nulls in to array are filtered, not rejected"
+        );
+        assert!(state.inboxes.contains_key("bob"));
     }
 
     // Empty-string recipients in the array must also be filtered.
@@ -2531,34 +2581,20 @@ mod tests {
         );
     }
 
-    // ── H7 (DISPROVED): Float limit in get_inbox falls back to default ───
-    // as_i64() returns None for JSON floats, triggering the default limit.
+    // ── H7: Float limit in get_inbox now returns type error (DR29-H1) ───
+    // Previously as_i64() returned None for floats → silent default.
+    // Now match-based extraction rejects non-integer types.
     #[tokio::test]
     async fn dr6_h7_float_limit_falls_back_to_default() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send 150 messages
-        for i in 0..150 {
-            send_message(
-                &state,
-                json!({
-                    "from_agent": "sender",
-                    "to": ["target"],
-                    "subject": format!("msg {}", i),
-                    "body": "x",
-                }),
-            )
-            .unwrap();
-        }
-
-        // Float limit — as_i64() returns None → default (100)
-        let result = get_inbox(&state, json!({ "agent_name": "target", "limit": 1.5 })).unwrap();
-        assert_eq!(
-            inbox_messages(&result).len(),
-            100,
-            "Float limit should fall back to DEFAULT_INBOX_LIMIT (100)"
+        // Float limit — now rejected with type error instead of silent default
+        let result = get_inbox(&state, json!({ "agent_name": "target", "limit": 1.5 }));
+        assert!(result.is_err(), "Float limit must be rejected");
+        assert!(
+            result.unwrap_err().contains("limit must be an integer"),
+            "Error must mention integer type requirement"
         );
-        assert_eq!(result["remaining"], 50);
     }
 
     // ── H8 (DISPROVED): swarm_stress team broadcast stays within MAX_RECIPIENTS
@@ -5781,48 +5817,34 @@ mod tests {
     }
 
     // ── H3 (CONFIRMED): Non-integer limit silently falls back to default ────────
-    // get_inbox and search_messages use as_i64() for limit. Boolean, string,
-    // and null all return None → default limit is used silently.
+    // ── H3 (FIXED): Non-integer limit now returns type error (DR29-H1/H2) ──
+    // Boolean, string, float limits are rejected instead of silently defaulting.
     #[tokio::test]
     async fn dr23_h3_non_integer_limit_falls_back_to_default() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Send 150 messages
-        for i in 0..150 {
-            send_message(
-                &state,
-                json!({
-                    "from_agent": "sender",
-                    "to": ["target"],
-                    "subject": format!("msg {}", i),
-                    "body": "x",
-                }),
-            )
-            .unwrap();
-        }
-
-        // Boolean limit → as_i64() returns None → DEFAULT_INBOX_LIMIT (100)
-        let r1 = get_inbox(&state, json!({ "agent_name": "target", "limit": true })).unwrap();
-        assert_eq!(
-            inbox_messages(&r1).len(),
-            100,
-            "CONFIRMED: Boolean limit falls back to default (100)"
-        );
-
-        // String limit → as_i64() returns None → DEFAULT_INBOX_LIMIT (100)
-        // (only 50 remain after draining 100 above)
-        let r2 = get_inbox(&state, json!({ "agent_name": "target", "limit": "999" })).unwrap();
-        assert_eq!(
-            inbox_messages(&r2).len(),
-            50,
-            "CONFIRMED: String limit falls back to default, drains remaining 50"
-        );
-
-        // Same behavior for search_messages
-        let search_result = search_messages(&state, json!({ "query": "hello", "limit": false }));
+        // Boolean limit → type error
+        let r1 = get_inbox(&state, json!({ "agent_name": "target", "limit": true }));
+        assert!(r1.is_err(), "Boolean limit must be rejected");
         assert!(
-            search_result.is_ok(),
-            "CONFIRMED: Boolean limit in search falls back to default"
+            r1.unwrap_err().contains("limit must be an integer"),
+            "FIXED: Boolean limit returns type error instead of silent default"
+        );
+
+        // String limit → type error
+        let r2 = get_inbox(&state, json!({ "agent_name": "target", "limit": "999" }));
+        assert!(r2.is_err(), "String limit must be rejected");
+        assert!(
+            r2.unwrap_err().contains("limit must be an integer"),
+            "FIXED: String limit returns type error instead of silent default"
+        );
+
+        // Same for search_messages
+        let r3 = search_messages(&state, json!({ "query": "hello", "limit": false }));
+        assert!(r3.is_err(), "Boolean limit in search must be rejected");
+        assert!(
+            r3.unwrap_err().contains("limit must be an integer"),
+            "FIXED: Boolean limit in search returns type error"
         );
     }
 
@@ -7021,7 +7043,8 @@ mod tests {
             err
         );
 
-        // Mixed array: valid strings + non-strings → strings are accepted
+        // Mixed array: valid strings + non-strings → NOW also rejected (DR29-H5).
+        // Previously only the all-non-string case was caught.
         let result2 = send_message(
             &state,
             json!({
@@ -7032,8 +7055,12 @@ mod tests {
             }),
         );
         assert!(
-            result2.is_ok(),
-            "Mixed array with valid strings succeeds (non-strings filtered)"
+            result2.is_err(),
+            "FIXED: Mixed array with non-strings now rejected entirely (DR29-H5)"
+        );
+        assert!(
+            result2.unwrap_err().contains("non-string"),
+            "Error mentions non-string elements"
         );
     }
 
@@ -7184,5 +7211,284 @@ mod tests {
         let r5 = send_message(&state, json!({ "to": ["Bob"] }));
         assert!(r5.is_err());
         assert_eq!(r5.unwrap_err(), "Missing from_agent");
+    }
+
+    // ── DR29-H1 (FIXED): get_inbox limit non-integer type returns error ──
+    // Non-integer limit now returns "limit must be an integer if provided".
+    #[tokio::test]
+    async fn dr29_h1_get_inbox_limit_noninteger_silently_defaults() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // String "50" → type error
+        let r1 = get_inbox(&state, json!({ "agent_name": "Agent29H1", "limit": "50" }));
+        assert!(r1.is_err(), "FIXED: string limit is rejected");
+        assert!(
+            r1.unwrap_err().contains("limit must be an integer"),
+            "FIXED: error explains type requirement"
+        );
+
+        // Boolean true → type error
+        let r2 = get_inbox(&state, json!({ "agent_name": "Agent29H1", "limit": true }));
+        assert!(r2.is_err(), "FIXED: boolean limit is rejected");
+        assert!(r2.unwrap_err().contains("limit must be an integer"));
+
+        // Object → type error
+        let r3 = get_inbox(
+            &state,
+            json!({ "agent_name": "Agent29H1", "limit": {"value": 5} }),
+        );
+        assert!(r3.is_err(), "FIXED: object limit is rejected");
+        assert!(r3.unwrap_err().contains("limit must be an integer"));
+
+        // Null → uses default (same as absent)
+        create_agent(
+            &state,
+            json!({ "project_key": "proj_dr29h1", "name_hint": "Agent29H1" }),
+        )
+        .unwrap();
+        send_message(
+            &state,
+            json!({ "from_agent": "Sender29H1", "to": ["Agent29H1"], "subject": "test", "body": "hello" }),
+        )
+        .unwrap();
+        let r4 = get_inbox(&state, json!({ "agent_name": "Agent29H1", "limit": null }));
+        assert!(r4.is_ok(), "Null limit uses default (same as absent)");
+
+        // Valid integer still works
+        send_message(
+            &state,
+            json!({ "from_agent": "Sender29H1", "to": ["Agent29H1"], "subject": "test2", "body": "hi" }),
+        )
+        .unwrap();
+        let r5 = get_inbox(&state, json!({ "agent_name": "Agent29H1", "limit": 5 }));
+        assert!(r5.is_ok(), "Integer limit still works");
+    }
+
+    // ── DR29-H2 (FIXED): search_messages limit non-integer returns error ─
+    // Non-integer limit now returns "limit must be an integer if provided".
+    #[tokio::test]
+    async fn dr29_h2_search_messages_limit_noninteger_silently_defaults() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // String → type error
+        let r1 = search_messages(&state, json!({ "query": "hello", "limit": "5" }));
+        assert!(r1.is_err(), "FIXED: string limit is rejected");
+        assert!(r1.unwrap_err().contains("limit must be an integer"));
+
+        // Boolean → type error
+        let r2 = search_messages(&state, json!({ "query": "hello", "limit": false }));
+        assert!(r2.is_err(), "FIXED: boolean limit is rejected");
+        assert!(r2.unwrap_err().contains("limit must be an integer"));
+
+        // Float → type error
+        let r3 = search_messages(&state, json!({ "query": "hello", "limit": 3.7 }));
+        assert!(r3.is_err(), "FIXED: float limit is rejected");
+        assert!(r3.unwrap_err().contains("limit must be an integer"));
+
+        // Null → uses default (same as absent)
+        let r4 = search_messages(&state, json!({ "query": "hello", "limit": null }));
+        assert!(r4.is_ok(), "Null limit uses default (same as absent)");
+
+        // Valid integer still works
+        let r5 = search_messages(&state, json!({ "query": "hello", "limit": 5 }));
+        assert!(r5.is_ok(), "Integer limit still works");
+    }
+
+    // ── DR29-H3 (FIXED): send_message optional fields reject non-string ──
+    // Non-string subject, body, project_id now return type errors.
+    #[tokio::test]
+    async fn dr29_h3_send_message_optional_fields_nonstring_silently_default() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Integer subject → type error
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H3",
+                "to": ["Recip29H3"],
+                "subject": 42,
+                "body": "hello"
+            }),
+        );
+        assert!(r1.is_err(), "FIXED: integer subject is rejected");
+        assert!(
+            r1.unwrap_err().contains("subject must be a string"),
+            "Error mentions type requirement"
+        );
+
+        // Boolean body → type error
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H3",
+                "to": ["Recip29H3"],
+                "subject": "test",
+                "body": true
+            }),
+        );
+        assert!(r2.is_err(), "FIXED: boolean body is rejected");
+        assert!(r2.unwrap_err().contains("body must be a string"));
+
+        // Array project_id → type error
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H3",
+                "to": ["Recip29H3"],
+                "subject": "test",
+                "body": "hello",
+                "project_id": [1, 2, 3]
+            }),
+        );
+        assert!(r3.is_err(), "FIXED: array project_id is rejected");
+        assert!(r3.unwrap_err().contains("project_id must be a string"));
+
+        // Null values → use default (same as absent)
+        let r4 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H3",
+                "to": ["Recip29H3"],
+                "subject": null,
+                "body": null,
+                "project_id": null
+            }),
+        );
+        assert!(r4.is_ok(), "Null values use defaults (same as absent)");
+    }
+
+    // ── DR29-H4 (FIXED): tools/call non-string name → clear type error ──
+    // Non-string name now returns "name must be a string" with -32602.
+    #[tokio::test]
+    async fn dr29_h4_tools_call_nonstring_name_misleading_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Non-string name: integer → type error
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": 42, "arguments": {} }
+            }),
+        )
+        .await;
+        let err_msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            err_msg.contains("name must be a string"),
+            "FIXED: integer name returns type error: {}",
+            err_msg
+        );
+        assert_eq!(resp["error"]["code"], -32602);
+
+        // Non-string name: boolean → type error
+        let resp2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": true, "arguments": {} }
+            }),
+        )
+        .await;
+        let err_msg2 = resp2["error"]["message"].as_str().unwrap();
+        assert!(
+            err_msg2.contains("name must be a string"),
+            "FIXED: boolean name returns type error: {}",
+            err_msg2
+        );
+
+        // Null name → type error
+        let resp3 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": null, "arguments": {} }
+            }),
+        )
+        .await;
+        let err_msg3 = resp3["error"]["message"].as_str().unwrap();
+        assert!(
+            err_msg3.contains("name must be a string"),
+            "FIXED: null name returns type error: {}",
+            err_msg3
+        );
+
+        // Absent name → still falls through to "Unknown tool: " (empty string is not a known tool)
+        let resp4 = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": { "arguments": {} }
+            }),
+        )
+        .await;
+        let err_msg4 = resp4["error"]["message"].as_str().unwrap();
+        assert!(
+            err_msg4.contains("Unknown tool"),
+            "Absent name still produces Unknown tool error: {}",
+            err_msg4
+        );
+    }
+
+    // ── DR29-H5 (FIXED): send_message mixed-type to array now rejected ──
+    // Any non-string element in the to array rejects the entire request.
+    #[tokio::test]
+    async fn dr29_h5_send_message_mixed_to_array_silently_drops() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Mixed to array: integer + valid string → rejected
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H5",
+                "to": [42, "Recip29H5"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r1.is_err(), "FIXED: mixed to array is rejected entirely");
+        assert!(
+            r1.unwrap_err().contains("non-string"),
+            "Error mentions non-string elements"
+        );
+
+        // No messages delivered (entire request rejected)
+        assert!(
+            !state.inboxes.contains_key("Recip29H5"),
+            "No partial delivery — entire request rejected"
+        );
+
+        // All-non-string case still caught
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H5",
+                "to": [42, true],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r2.is_err(), "All-non-string case still rejected");
+        assert!(r2.unwrap_err().contains("non-string"));
+
+        // Pure string array with nulls still works
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender29H5",
+                "to": ["Recip29H5", null],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r3.is_ok(), "Nulls are filtered, not rejected");
+        assert!(state.inboxes.contains_key("Recip29H5"));
     }
 }
