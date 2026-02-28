@@ -552,17 +552,17 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     // Subject is optional (defaults to "") — validate via shared helper to
     // prevent rule drift with project_id validation (DR40-H1).
     validate_optional_text(subject, "Subject", MAX_SUBJECT_LEN)?;
-    // Check length BEFORE content to fail fast on oversized bodies,
-    // matching subject's validation order (DR30-H4).
+    // Body validation is intentionally MORE lenient than subject/project_id:
+    // - Whitespace-only and whitespace-padded bodies are allowed (bodies are
+    //   multi-line content where indentation and blank content are valid).
+    // - Control chars \n, \t, \r are allowed (multi-line content).
+    // This asymmetry with validate_optional_text is by design (DR41-H1).
     if body.len() > MAX_BODY_LEN {
         return Err(format!("Body exceeds {} byte limit", MAX_BODY_LEN));
     }
     if body.contains('\0') {
         return Err("Body must not contain null bytes".to_string());
     }
-    // Reject control characters in body, but allow \n, \t, \r which are
-    // legitimate in multi-line message content. Subject rejects ALL control
-    // chars because subjects are single-line (DR30-H2).
     if body
         .chars()
         .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r')
@@ -832,26 +832,12 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         Some(v) => v.as_str().ok_or("query must be a string")?,
         None => return Err("Missing query".to_string()),
     };
-    if query_str.trim().is_empty() {
-        return Err("query must not be empty or whitespace-only".to_string());
-    }
-    // Check length BEFORE content to fail fast on oversized values,
-    // consistent with subject/body/project_id order (DR30-H4, DR32-H2).
-    if query_str.len() > MAX_QUERY_LEN {
-        return Err(format!("query exceeds {} byte limit", MAX_QUERY_LEN));
-    }
-    if query_str.contains('\0') {
-        return Err("query must not contain null bytes".to_string());
-    }
-    if query_str.chars().any(|c| c.is_control()) {
-        return Err("query must not contain control characters".to_string());
-    }
-    // Reject whitespace-padded queries, consistent with subject (DR33-H2),
-    // project_id (DR32-H3), and all validate_text_core paths (DR34-H2).
-    // Whitespace-only is already caught by trim().is_empty() above.
-    if query_str != query_str.trim() {
-        return Err("query must not have leading or trailing whitespace".to_string());
-    }
+    // Query is required — use validate_text_core (shared source of truth)
+    // to prevent rule drift with other text validation paths (DR41-H3).
+    // Previously this was inline with a different check order (empty+whitespace
+    // combined first). Now follows the canonical order: empty → length → null →
+    // control → whitespace-only → padded.
+    validate_text_core(query_str, "query", MAX_QUERY_LEN)?;
     // Validate limit type: non-integer types (strings, booleans, floats)
     // must return a type error, not silently use the default (DR29-H2).
     // Reject out-of-range values explicitly instead of silent clamping (DR30-H3).
@@ -909,6 +895,10 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         results.push(doc_val);
     }
 
+    // `count` is always results.len() — a convenience field so clients don't
+    // need to parse the array to get the count. `total_hits` is the useful
+    // pagination field: it reports ALL matching documents, not just the
+    // returned subset (DR41-H2).
     Ok(json!({
         "results": results,
         "count": results.len(),
@@ -3832,11 +3822,11 @@ mod tests {
 
         let result = search_messages(&state, json!({ "query": "" }));
 
-        // Empty query is now explicitly rejected (DR21 H3 fix)
+        // Empty query is rejected via validate_text_core (DR41-H3).
         assert!(result.is_err(), "Empty query must be rejected");
         assert!(
-            result.unwrap_err().contains("empty or whitespace-only"),
-            "Error should mention empty/whitespace"
+            result.unwrap_err().contains("must not be empty"),
+            "Error should mention empty"
         );
     }
 
@@ -5523,8 +5513,8 @@ mod tests {
         let result = search_messages(&state, json!({ "query": "   " }));
         assert!(result.is_err(), "FIXED: Whitespace-only query is rejected");
         assert!(
-            result.unwrap_err().contains("empty or whitespace-only"),
-            "Error should mention empty/whitespace"
+            result.unwrap_err().contains("whitespace-only"),
+            "Error should mention whitespace-only"
         );
     }
 
@@ -10448,8 +10438,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Search with limit=3 — returns 3 results, total_hits=5
-        let result =
-            search_messages(&state, json!({ "query": "countredundant41h2", "limit": 3 }));
+        let result = search_messages(&state, json!({ "query": "countredundant41h2", "limit": 3 }));
         let resp = result.unwrap();
         let results = resp["results"].as_array().unwrap();
         let count = resp["count"].as_u64().unwrap();
