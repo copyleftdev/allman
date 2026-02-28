@@ -66,7 +66,10 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
             });
         }
     };
-    let params = req.get("params").cloned().unwrap_or(json!({}));
+    // Borrow params as a reference — avoid cloning the entire params object
+    // which includes nested arguments with potentially large body strings.
+    // Only clone the specific sub-values we need (DR33-H4).
+    let params = req.get("params").unwrap_or(&Value::Null);
 
     // JSON-RPC 2.0 §4: "jsonrpc" MUST be exactly "2.0" (DR25-H3).
     if req.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
@@ -80,7 +83,9 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     // JSON-RPC 2.0: params MUST be an object or array (§4.2).
     // Reject non-object params early with a clear error instead of letting
     // them fall through to misleading "Unknown tool" errors (DR24-H5).
-    if !params.is_object() {
+    // Absent params (null) is treated as empty object for dispatch purposes,
+    // but non-null non-object params (string, array, number) are rejected.
+    if !params.is_null() && !params.is_object() {
         return json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -106,6 +111,9 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                 },
                 None => "",
             };
+            // Clone only arguments from the borrowed params reference — single
+            // clone instead of cloning all of params then cloning arguments
+            // out of the clone (DR33-H4).
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             // Validate arguments is an object (or absent → defaulted to {}).
@@ -230,8 +238,10 @@ fn validate_text_core(value: &str, field: &str, max_len: usize) -> Result<(), St
     if value.is_empty() {
         return Err(format!("{} must not be empty", field));
     }
+    // .len() returns byte count, not character count. Error message must
+    // say "byte limit" to be accurate for multi-byte UTF-8 strings (DR33-H1).
     if value.len() > max_len {
-        return Err(format!("{} exceeds {} character limit", field, max_len));
+        return Err(format!("{} exceeds {} byte limit", field, max_len));
     }
     // Null byte check fires before control char check for a more specific error
     // message. This is intentionally redundant — '\0'.is_control() is true, so
@@ -450,16 +460,17 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
             "to array contains non-string elements — all recipients must be strings".to_string(),
         );
     }
-    // Convert to owned strings first, then dedup — single allocation per
-    // recipient instead of two (DR32-H5).
+    // Dedup with HashSet<&str> borrowing from to_array — filter duplicates
+    // BEFORE allocating owned Strings, so duplicate recipients cause zero
+    // heap allocations. Only surviving unique recipients get .to_string() (DR33-H5).
     let to_agents: Vec<String> = {
         let mut seen = std::collections::HashSet::new();
         to_array
             .iter()
             .filter_map(|v| v.as_str())
             .filter(|s| !s.is_empty())
+            .filter(|s| seen.insert(*s))
             .map(|s| s.to_string())
-            .filter(|s| seen.insert(s.clone()))
             .collect()
     };
     // Validate optional string fields: non-string types (integers, booleans,
@@ -498,17 +509,26 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     for recipient in &to_agents {
         validate_name(recipient, "recipient")?;
     }
+    // .len() returns byte count — say "byte limit" not "character limit" (DR33-H1).
     if subject.len() > MAX_SUBJECT_LEN {
-        return Err(format!(
-            "Subject exceeds {} character limit",
-            MAX_SUBJECT_LEN
-        ));
+        return Err(format!("Subject exceeds {} byte limit", MAX_SUBJECT_LEN));
     }
     if subject.contains('\0') {
         return Err("Subject must not contain null bytes".to_string());
     }
     if subject.chars().any(|c| c.is_control()) {
         return Err("Subject must not contain control characters".to_string());
+    }
+    // Reject whitespace-only and whitespace-padded subjects, consistent with
+    // project_id (DR32-H3), project_key, agent names, program, model (DR33-H2).
+    // Empty string is allowed (subject is optional, defaults to "").
+    if !subject.is_empty() {
+        if subject.trim().is_empty() {
+            return Err("Subject must not be whitespace-only".to_string());
+        }
+        if subject != subject.trim() {
+            return Err("Subject must not have leading or trailing whitespace".to_string());
+        }
     }
     // Check length BEFORE content to fail fast on oversized bodies,
     // matching subject's validation order (DR30-H4).
@@ -556,19 +576,6 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         }
     }
 
-    let message_id = Uuid::new_v4().to_string();
-    let now = Utc::now().timestamp();
-
-    // 1. Deliver to each recipient's inbox (lock-free DashMap append)
-    let entry = InboxEntry {
-        message_id: message_id.clone(),
-        from_agent: from_agent.to_string(),
-        subject: subject.to_string(),
-        body: body.to_string(),
-        timestamp: now,
-        project_id: project_id.to_string(),
-    };
-
     // Soft cap on total inbox count. Prevents unbounded DashMap growth
     // from phantom recipients that are never drained (DR25-H1).
     // Checked BEFORE delivery to avoid creating entries past the cap.
@@ -598,6 +605,20 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
             }
         }
     }
+
+    // Construct InboxEntry AFTER pre-checks pass to avoid wasted heap
+    // allocations (from_agent, subject, body, project_id clones) when the
+    // send is rejected by capacity checks above (DR33-H3).
+    let message_id = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    let entry = InboxEntry {
+        message_id: message_id.clone(),
+        from_agent: from_agent.to_string(),
+        subject: subject.to_string(),
+        body: body.to_string(),
+        timestamp: now,
+        project_id: project_id.to_string(),
+    };
 
     // All inboxes have capacity (per pre-check). Deliver with per-entry
     // atomic guard to handle concurrent races — if a concurrent send filled
@@ -1433,8 +1454,8 @@ mod tests {
             "Agent name exceeding limit must be rejected"
         );
         assert!(
-            result.unwrap_err().contains("character limit"),
-            "Error should mention character limit"
+            result.unwrap_err().contains("byte limit"),
+            "Error should mention byte limit"
         );
     }
 
@@ -1489,8 +1510,8 @@ mod tests {
 
         assert!(result.is_err(), "Subject exceeding limit must be rejected");
         assert!(
-            result.unwrap_err().contains("character limit"),
-            "Error should mention character limit"
+            result.unwrap_err().contains("byte limit"),
+            "Error should mention byte limit"
         );
     }
 
@@ -3473,8 +3494,8 @@ mod tests {
         assert!(result.is_err(), "Oversized recipient name must be rejected");
         let err = result.unwrap_err();
         assert!(
-            err.contains("exceeds") && err.contains("character limit"),
-            "Error should mention exceeds character limit: {}",
+            err.contains("exceeds") && err.contains("byte limit"),
+            "Error should mention exceeds byte limit: {}",
             err
         );
 
@@ -6750,8 +6771,8 @@ mod tests {
         );
         let err = send_result.unwrap_err();
         assert!(
-            err.contains("exceeds") && err.contains("character limit"),
-            "Error should mention exceeds character limit: {}",
+            err.contains("exceeds") && err.contains("byte limit"),
+            "Error should mention exceeds byte limit: {}",
             err
         );
 
@@ -8368,12 +8389,10 @@ mod tests {
     // Deep Review #33 — Hypothesis Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // ── DR33-H1: validate_text_core error says "character limit" but checks bytes ─
-    // validate_text_core uses .len() (byte count) but the error message says
-    // "character limit". This is inconsistent with body ("byte limit"),
-    // project_id ("byte limit"), and query ("byte limit"). For multi-byte UTF-8,
-    // the error is misleading: a 32-character string of 4-byte chars (128 bytes)
-    // triggers "exceeds 128 character limit" when it has only 32 characters.
+    // ── DR33-H1 (FIXED): all length errors now consistently say "byte limit" ──
+    // FIXED: validate_text_core and subject validation now say "byte limit"
+    // instead of "character limit", consistent with body/project_id/query.
+    // Accurate for multi-byte UTF-8 strings.
     #[tokio::test]
     async fn dr33_h1_validate_text_core_error_says_character_but_checks_bytes() {
         let (state, _idx, _repo) = test_post_office();
@@ -8384,21 +8403,18 @@ mod tests {
         assert_eq!(name.chars().count(), 33, "Only 33 characters");
 
         // validate_text_core (via validate_name) checks .len() > MAX_AGENT_NAME_LEN (128)
-        // 132 > 128 → rejected. Error says "character limit" but the limit is byte-based.
-        let r = create_agent(
-            &state,
-            json!({ "project_key": "test", "name_hint": name }),
-        );
+        // 132 > 128 → rejected.
+        let r = create_agent(&state, json!({ "project_key": "test", "name_hint": name }));
         assert!(r.is_err(), "132-byte name exceeds 128-byte limit");
         let err = r.unwrap_err();
-        // CONFIRMED: error says "character limit" even though .len() counts bytes
+        // FIXED: error now correctly says "byte limit" (DR33-H1)
         assert!(
-            err.contains("character limit"),
-            "Error says 'character limit' but means bytes: {}",
+            err.contains("byte limit"),
+            "FIXED: Error now says 'byte limit' (was 'character limit'): {}",
             err
         );
 
-        // In contrast, body validation correctly says "byte limit":
+        // Body also says "byte limit" — now consistent:
         let big_body = "B".repeat(super::MAX_BODY_LEN + 1);
         let r2 = send_message(
             &state,
@@ -8411,14 +8427,13 @@ mod tests {
         );
         assert!(r2.is_err());
         let err2 = r2.unwrap_err();
-        // Body correctly says "byte limit"
         assert!(
             err2.contains("byte limit"),
-            "Body error correctly says 'byte limit': {}",
+            "Body says 'byte limit': {}",
             err2
         );
 
-        // Subject also says "character limit" (inconsistent with body):
+        // FIXED: Subject now also says "byte limit" — all consistent:
         let big_subject = "S".repeat(super::MAX_SUBJECT_LEN + 1);
         let r3 = send_message(
             &state,
@@ -8432,24 +8447,21 @@ mod tests {
         assert!(r3.is_err());
         let err3 = r3.unwrap_err();
         assert!(
-            err3.contains("character limit"),
-            "Subject also says 'character limit' instead of 'byte limit': {}",
+            err3.contains("byte limit"),
+            "FIXED: Subject now says 'byte limit' (was 'character limit'): {}",
             err3
         );
     }
 
-    // ── DR33-H2: subject validation lacks whitespace checks ──────────────────────
-    // Subject is validated inline (length, null, control) but NOT through
-    // validate_text_core. It lacks the whitespace-only and leading/trailing
-    // whitespace checks that all other text fields have. A subject of "   "
-    // (spaces-only) is silently accepted. This is inconsistent with project_id
-    // (which rejects whitespace since DR32-H3), project_key, agent names,
-    // program, and model.
+    // ── DR33-H2 (FIXED): subject now rejects whitespace-only and padded values ──
+    // FIXED: Subject validation now includes whitespace-only and leading/trailing
+    // whitespace checks, consistent with project_id (DR32-H3), project_key,
+    // agent names, program, and model. Empty subject is still allowed (optional).
     #[tokio::test]
     async fn dr33_h2_subject_accepts_whitespace_only_and_padded() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Whitespace-only subject — accepted (inconsistent with other fields)
+        // FIXED: Whitespace-only subject now rejected
         let r1 = send_message(
             &state,
             json!({
@@ -8459,17 +8471,13 @@ mod tests {
                 "body": "hello",
             }),
         );
-        // CONFIRMED: whitespace-only subject is accepted
         assert!(
-            r1.is_ok(),
-            "CONFIRMED: whitespace-only subject is accepted (no whitespace check)"
+            r1.is_err(),
+            "FIXED: whitespace-only subject is now rejected (DR33-H2)"
         );
+        assert!(r1.unwrap_err().contains("whitespace"));
 
-        let inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        let msgs = inbox_messages(&inbox);
-        assert_eq!(msgs[0]["subject"], "   ", "Subject preserved as-is");
-
-        // Leading/trailing whitespace in subject — accepted (inconsistent)
+        // FIXED: Leading/trailing whitespace in subject now rejected
         let r2 = send_message(
             &state,
             json!({
@@ -8480,11 +8488,12 @@ mod tests {
             }),
         );
         assert!(
-            r2.is_ok(),
-            "CONFIRMED: padded subject is accepted (no trim check)"
+            r2.is_err(),
+            "FIXED: padded subject is now rejected (DR33-H2)"
         );
+        assert!(r2.unwrap_err().contains("whitespace"));
 
-        // Compare with project_id which rejects whitespace (DR32-H3):
+        // project_id also rejects whitespace (DR32-H3) — now consistent:
         let r3 = send_message(
             &state,
             json!({
@@ -8497,10 +8506,10 @@ mod tests {
         );
         assert!(
             r3.is_err(),
-            "project_id rejects whitespace-only (DR32-H3) — inconsistent with subject"
+            "project_id rejects whitespace-only (DR32-H3) — now consistent with subject"
         );
 
-        // Compare with project_key which rejects whitespace via validate_text_field:
+        // project_key also rejects whitespace via validate_text_field — all consistent:
         let r4 = create_agent(
             &state,
             json!({ "project_key": "   ", "name_hint": "Agent33H2" }),
@@ -8509,13 +8518,24 @@ mod tests {
             r4.is_err(),
             "project_key rejects whitespace-only via validate_text_field"
         );
+
+        // Empty subject is still allowed (optional field defaults to ""):
+        let r5 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["eve"],
+                "subject": "",
+                "body": "hello",
+            }),
+        );
+        assert!(r5.is_ok(), "Empty subject still allowed (optional field)");
     }
 
-    // ── DR33-H3: send_message allocates InboxEntry before pre-checks ─────────────
-    // InboxEntry is constructed (cloning from_agent, subject, body, project_id)
-    // on line 563-570, BEFORE the inbox count cap check (576) and inbox fullness
-    // pre-check (590). If either check rejects the send, the string allocations
-    // in InboxEntry were wasted. For 64KB body × rejection = 64KB wasted heap.
+    // ── DR33-H3 (FIXED): InboxEntry now allocated after pre-checks ─────────────
+    // FIXED: InboxEntry construction (cloning from_agent, subject, body, project_id)
+    // is now after the inbox count cap check and inbox fullness pre-check.
+    // Rejected sends no longer waste heap allocations.
     #[tokio::test]
     async fn dr33_h3_inbox_entry_allocated_before_precheck_rejection() {
         let (state, _idx, _repo) = test_post_office();
@@ -8534,9 +8554,8 @@ mod tests {
             .unwrap();
         }
 
-        // Now send with a 64KB body to the full inbox — this will be rejected
-        // by the inbox fullness pre-check, but InboxEntry was already allocated
-        // with the 64KB body clone.
+        // Send with a 64KB body to the full inbox — rejected by pre-check.
+        // FIXED: InboxEntry is NOT allocated before rejection (DR33-H3).
         let big_body = "B".repeat(super::MAX_BODY_LEN);
         let r = send_message(
             &state,
@@ -8549,12 +8568,8 @@ mod tests {
         );
         assert!(
             r.is_err(),
-            "Send to full inbox rejected — but InboxEntry was already allocated"
+            "FIXED: Send to full inbox rejected without allocating InboxEntry"
         );
-
-        // CONFIRMED: InboxEntry (including 64KB body clone) is constructed at
-        // line 563-570 before the pre-checks at lines 576 and 590. The allocation
-        // is wasted. Moving entry construction after the pre-checks would avoid this.
 
         // Verify no partial state mutation
         assert!(
@@ -8563,20 +8578,15 @@ mod tests {
         );
     }
 
-    // ── DR33-H4: handle_mcp_request double-clones params for tools/call ──────────
-    // Line 69: params = req.get("params").cloned() — clones entire params including
-    // nested arguments with body. Line 109: args = params.get("arguments").cloned()
-    // — clones arguments out of the already-cloned params. For send_message with
-    // 64KB body, this creates 2 copies before the tool function sees it.
+    // ── DR33-H4 (FIXED): handle_mcp_request now borrows params, clones only args ─
+    // FIXED: params is now borrowed as a &Value reference instead of cloned.
+    // Only arguments is cloned — single copy of the body instead of two.
     #[tokio::test]
     async fn dr33_h4_handle_mcp_double_clones_params() {
         let (state, _idx, _repo) = test_post_office();
 
-        // Construct a tools/call request with a large body.
-        // The handler will:
-        //   1. Clone all of params (including "arguments" with body) — 64KB+ copy
-        //   2. Clone "arguments" out of the cloned params — another 64KB+ copy
-        // By the time send_message() sees `args`, there have been 2 intermediate copies.
+        // FIXED: tools/call with large body now clones only arguments,
+        // not the entire params object. Single copy instead of double.
         let big_body = "B".repeat(super::MAX_BODY_LEN);
         let resp = handle_mcp_request(
             state,
@@ -8589,7 +8599,7 @@ mod tests {
                     "arguments": {
                         "from_agent": "alice",
                         "to": ["bob"],
-                        "subject": "double clone test",
+                        "subject": "single clone test",
                         "body": big_body
                     }
                 }
@@ -8597,30 +8607,22 @@ mod tests {
         )
         .await;
 
-        // The request succeeds — the double clone is functional but wasteful.
         assert!(
             resp.get("result").is_some(),
-            "Request succeeds despite double clone overhead"
+            "FIXED: Request succeeds with single clone of arguments (DR33-H4)"
         );
-
-        // CONFIRMED: handle_mcp_request clones params (line 69) then clones
-        // arguments (line 109) — two full copies of the body. Could be
-        // restructured to clone only arguments directly from req.
     }
 
-    // ── DR33-H5: to_agents dedup clones String for HashSet when &str suffices ────
-    // The DR32-H5 fix improved dedup from 2 allocations to 1 allocation + clone.
-    // But HashSet<&str> borrowing from the JSON array would eliminate the clone
-    // entirely: filter with HashSet<&str> first, then .map(to_string) only for
-    // survivors. This is truly zero-copy dedup.
+    // ── DR33-H5 (FIXED): to_agents dedup now uses HashSet<&str> for zero-copy ───
+    // FIXED: Dedup uses HashSet<&str> borrowing from the JSON array. Duplicates
+    // are filtered BEFORE .map(to_string), so only unique recipients allocate
+    // a String. Duplicates cause zero heap allocations.
     #[tokio::test]
     async fn dr33_h5_to_agents_dedup_clones_for_hashset() {
         let (state, _idx, _repo) = test_post_office();
 
         // 50 unique recipients with duplicates (75 total entries, 50 unique)
-        let mut recipients: Vec<String> = (0..50)
-            .map(|i| format!("Agent33H5_{:03}", i))
-            .collect();
+        let mut recipients: Vec<String> = (0..50).map(|i| format!("Agent33H5_{:03}", i)).collect();
         // Add 25 duplicates
         for i in 0..25 {
             recipients.push(format!("Agent33H5_{:03}", i));
@@ -8643,11 +8645,9 @@ mod tests {
             "50 unique recipients delivered"
         );
 
-        // CONFIRMED: Current code does .map(to_string).filter(clone + insert).
-        // For the 25 duplicates, .map(to_string) allocates a String that is then
-        // immediately dropped by .filter() when insert returns false. That's 25
-        // wasted String allocations. With HashSet<&str>, duplicates would be
-        // filtered BEFORE .map(to_string), avoiding the allocation entirely.
+        // FIXED: Dedup now uses HashSet<&str> — duplicates are filtered by
+        // borrowing &str from the JSON array, then only unique survivors
+        // get .to_string(). 25 duplicates cause zero wasted allocations.
 
         // Verify delivery correctness
         for i in 0..50 {
