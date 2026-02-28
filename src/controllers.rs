@@ -5739,4 +5739,280 @@ mod tests {
         assert!(r3.is_err(), "Null `to` returns error");
         assert_eq!(r3.unwrap_err(), "Missing to recipients");
     }
+
+    // ── DR24: Validation Asymmetries II ─────────────────────────────────────
+
+    // H1: search_messages query accepts control characters (unlike all other string inputs)
+    #[tokio::test]
+    async fn dr24_h1_search_query_accepts_control_characters() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Control char in query (e.g., \x01)
+        let result = search_messages(
+            &state,
+            json!({ "query": "hello\x01world" }),
+        );
+        // HYPOTHESIS: search_messages does NOT check for control characters,
+        // unlike from_agent, subject, recipients, project_id, and agent_name.
+        // Null bytes ARE checked (line 613), but general control chars are not.
+        assert!(
+            result.is_ok() || result.as_ref().unwrap_err().contains("Query parse error"),
+            "CONFIRMED: Control chars are not rejected by validation — \
+             they either pass through or fail at Tantivy parse level. \
+             Got: {:?}",
+            result
+        );
+        // Verify that other inputs DO reject control chars for comparison:
+        let send_result = send_message(
+            &state,
+            json!({
+                "from_agent": "hello\x01world",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(
+            send_result.is_err() && send_result.unwrap_err().contains("control characters"),
+            "from_agent correctly rejects control characters"
+        );
+    }
+
+    // H2: Dot-prefixed recipients accepted by send_message and drainable by get_inbox,
+    // but create_agent rejects them — creating "ghost agent" asymmetry.
+    #[tokio::test]
+    async fn dr24_h2_dot_prefixed_recipient_accepted_by_send_and_inbox() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // send_message accepts ".hidden" as recipient
+        let send_result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [".hidden"],
+                "subject": "secret",
+                "body": "test"
+            }),
+        );
+        assert!(
+            send_result.is_ok(),
+            "CONFIRMED: send_message accepts dot-prefixed recipient '.hidden'"
+        );
+
+        // get_inbox can drain ".hidden" inbox
+        let inbox_result = get_inbox(
+            &state,
+            json!({ "agent_name": ".hidden" }),
+        );
+        assert!(
+            inbox_result.is_ok(),
+            "CONFIRMED: get_inbox accepts dot-prefixed agent_name '.hidden'"
+        );
+        let msgs = inbox_result.unwrap();
+        assert_eq!(
+            msgs["messages"].as_array().unwrap().len(),
+            1,
+            "Message was delivered and is drainable"
+        );
+
+        // But create_agent rejects ".hidden"
+        let create_result = create_agent(
+            &state,
+            json!({
+                "project_key": "test_proj",
+                "name_hint": ".hidden"
+            }),
+        );
+        assert!(
+            create_result.is_err(),
+            "CONFIRMED: create_agent rejects dot-prefixed name '.hidden'"
+        );
+        assert!(create_result.unwrap_err().contains("must not start with '.'"));
+    }
+
+    // H3: from_agent validation lacks path separator and ".." checks (unlike recipients and get_inbox)
+    #[tokio::test]
+    async fn dr24_h3_from_agent_missing_path_separator_and_dotdot_checks() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register recipient so we have a valid target
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "test", "name_hint": "bob" }),
+        );
+
+        // from_agent with path separator — should be blocked but isn't
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "../../etc/passwd",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "CONFIRMED: from_agent accepts path traversal '../../etc/passwd'"
+        );
+
+        // from_agent with ".." — should be blocked but isn't
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice..bob",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "CONFIRMED: from_agent accepts '..' sequences"
+        );
+
+        // from_agent with backslash
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice\\bob",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(
+            r3.is_ok(),
+            "CONFIRMED: from_agent accepts backslash path separator"
+        );
+
+        // Verify that recipients DO block these for comparison:
+        let r4 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["../../etc/passwd"],
+                "subject": "test",
+                "body": "test"
+            }),
+        );
+        assert!(r4.is_err(), "Recipients correctly block path separators");
+        assert!(r4.unwrap_err().contains("path separators"));
+    }
+
+    // H4: tools/list inputSchema omits machine-readable limit constraints (minimum/maximum/default)
+    #[tokio::test]
+    async fn dr24_h4_tools_list_schema_missing_limit_constraints() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let response = handle_mcp_request(
+            state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+
+        let tools = response["result"]["tools"].as_array().unwrap();
+
+        // Find search_messages tool
+        let search_tool = tools
+            .iter()
+            .find(|t| t["name"] == "search_messages")
+            .expect("search_messages tool must exist");
+        let search_limit = &search_tool["inputSchema"]["properties"]["limit"];
+        assert!(
+            search_limit.get("minimum").is_none(),
+            "CONFIRMED: search_messages limit schema has no 'minimum' constraint"
+        );
+        assert!(
+            search_limit.get("maximum").is_none(),
+            "CONFIRMED: search_messages limit schema has no 'maximum' constraint"
+        );
+        assert!(
+            search_limit.get("default").is_none(),
+            "CONFIRMED: search_messages limit schema has no 'default' value"
+        );
+
+        // Find get_inbox tool
+        let inbox_tool = tools
+            .iter()
+            .find(|t| t["name"] == "get_inbox")
+            .expect("get_inbox tool must exist");
+        let inbox_limit = &inbox_tool["inputSchema"]["properties"]["limit"];
+        assert!(
+            inbox_limit.get("minimum").is_none(),
+            "CONFIRMED: get_inbox limit schema has no 'minimum' constraint"
+        );
+        assert!(
+            inbox_limit.get("maximum").is_none(),
+            "CONFIRMED: get_inbox limit schema has no 'maximum' constraint"
+        );
+        assert!(
+            inbox_limit.get("default").is_none(),
+            "CONFIRMED: get_inbox limit schema has no 'default' value"
+        );
+    }
+
+    // H5: Non-object params produces misleading "Unknown tool" error instead of "invalid params"
+    #[tokio::test]
+    async fn dr24_h5_non_object_params_misleading_error() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // params is a string instead of an object
+        let r1 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": "not an object"
+            }),
+        )
+        .await;
+        let error_msg = r1["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            error_msg.contains("Unknown tool"),
+            "CONFIRMED: String params produces misleading 'Unknown tool' error. Got: {}",
+            error_msg
+        );
+
+        // params is an array
+        let r2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": [1, 2, 3]
+            }),
+        )
+        .await;
+        let error_msg2 = r2["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            error_msg2.contains("Unknown tool"),
+            "CONFIRMED: Array params produces misleading 'Unknown tool' error. Got: {}",
+            error_msg2
+        );
+
+        // params is null
+        let r3 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": null
+            }),
+        )
+        .await;
+        let error_msg3 = r3["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            error_msg3.contains("Unknown tool"),
+            "CONFIRMED: Null params produces misleading 'Unknown tool' error. Got: {}",
+            error_msg3
+        );
+    }
 }
