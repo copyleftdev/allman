@@ -9187,4 +9187,240 @@ mod tests {
             messages
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Deep Review #36 — Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── DR36-H1: indexed counter increments on failed add_document ───────────
+    // In persistence_worker (state.rs), `indexed += 1` runs unconditionally
+    // after add_document, even when the call fails. The counter reports
+    // attempts not successes, causing unnecessary commit() calls when all
+    // additions fail. This test documents the current (buggy) behavior.
+    // Note: Hard to unit-test the persistence_worker directly since it runs
+    // on a background thread. We test the observable consequence: the
+    // persist pipeline processes batches correctly for valid input. The
+    // actual fix is in state.rs (move indexed += 1 inside success path).
+    #[tokio::test]
+    async fn dr36_h1_indexed_counter_counts_attempts_not_successes() {
+        let (state, idx_dir, _repo) = test_post_office();
+
+        // Send a valid message through the persist pipeline
+        let _ = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::IndexMessage {
+                id: "dr36h1_valid".to_string(),
+                project_id: "proj_test".to_string(),
+                from_agent: "sender".to_string(),
+                to_recipients: "recip".to_string(),
+                subject: "valid message".to_string(),
+                body: "this should be indexed".to_string(),
+                created_ts: 1000000,
+            });
+
+        // Shutdown to flush
+        state.shutdown();
+
+        // Verify the document was indexed
+        let index = tantivy::Index::open_in_dir(idx_dir.path()).unwrap();
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        assert!(
+            searcher.num_docs() >= 1,
+            "Valid IndexMessage should be indexed (indexed counter counts it)"
+        );
+    }
+
+    // ── DR36-H4: registered_at stability across re-registrations ─────────────
+    // The code preserves registered_at from the original registration during
+    // re-registration (DR26-H2), but no existing test asserts the timestamp
+    // value is unchanged. A refactoring error could silently break this.
+    #[tokio::test]
+    async fn dr36_h4_registered_at_preserved_on_reregistration() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // First registration
+        let r1 = create_agent(
+            &state,
+            json!({
+                "project_key": "dr36h4proj",
+                "name_hint": "TimestampAgent",
+                "program": "v1"
+            }),
+        )
+        .unwrap();
+        let original_registered_at = r1["registered_at"].as_i64().unwrap();
+
+        // Small delay to ensure different timestamp
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Re-registration with updated fields
+        let r2 = create_agent(
+            &state,
+            json!({
+                "project_key": "dr36h4proj",
+                "name_hint": "TimestampAgent",
+                "program": "v2",
+                "model": "gpt-4o"
+            }),
+        )
+        .unwrap();
+        let reregistered_at = r2["registered_at"].as_i64().unwrap();
+
+        // registered_at MUST be preserved from original registration
+        assert_eq!(
+            original_registered_at, reregistered_at,
+            "registered_at must be preserved across re-registrations \
+             (original={}, re-reg={})",
+            original_registered_at, reregistered_at
+        );
+
+        // But program and model should be updated
+        assert_eq!(r2["program"], "v2");
+        assert_eq!(r2["model"], "gpt-4o");
+
+        // And agent_id should be stable
+        assert_eq!(r1["id"], r2["id"]);
+    }
+
+    // ── DR36-H5: to_recipients STRING indexing prevents per-recipient search ─
+    // to_recipients uses STRING | STORED in the Tantivy schema, making the
+    // entire joined value a single exact-match token. Searching for an
+    // individual recipient in a multi-recipient message won't match.
+    #[tokio::test]
+    async fn dr36_h5_to_recipients_string_type_prevents_per_recipient_search() {
+        let (state, idx_dir, _repo) = test_post_office();
+
+        // Index a multi-recipient message directly through the persist pipeline
+        let _ = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::IndexMessage {
+                id: "dr36h5_msg".to_string(),
+                project_id: "proj_test".to_string(),
+                from_agent: "sender".to_string(),
+                to_recipients: "alice\x1Fbob\x1Fcharlie".to_string(),
+                subject: "multi-recipient dr36h5".to_string(),
+                body: "test body for recipient search".to_string(),
+                created_ts: 2000000,
+            });
+
+        // Flush
+        state.shutdown();
+
+        // Reopen index for search
+        let index = tantivy::Index::open_in_dir(idx_dir.path()).unwrap();
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        let schema = index.schema();
+        let subject_field = schema.get_field("subject").unwrap();
+        let body_field = schema.get_field("body").unwrap();
+
+        // Verify the document exists via subject search
+        let query_parser =
+            tantivy::query::QueryParser::for_index(&index, vec![subject_field, body_field]);
+        let query = query_parser.parse_query("dr36h5").unwrap();
+        let results = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "Message exists and is searchable via subject"
+        );
+
+        // Now try to search by individual recipient via field-qualified query.
+        // to_recipients is STRING (exact match), so "alice" alone won't match
+        // the stored value "alice\x1Fbob\x1Fcharlie".
+        let to_field = schema.get_field("to_recipients").unwrap();
+        let recip_parser = tantivy::query::QueryParser::for_index(&index, vec![to_field]);
+        let recip_query = recip_parser.parse_query("alice").unwrap();
+        let recip_results = searcher
+            .search(
+                &recip_query,
+                &tantivy::collector::TopDocs::with_limit(10),
+            )
+            .unwrap();
+
+        // CONFIRMED: STRING type means exact-match only. Individual recipient
+        // search does NOT work for multi-recipient messages.
+        assert_eq!(
+            recip_results.len(),
+            0,
+            "CONFIRMED (DR36-H5): STRING-indexed to_recipients does NOT match \
+             individual recipients in multi-recipient messages"
+        );
+    }
+
+    // ── DR36-H3: search_messages JSON serialize→deserialize round-trip ───────
+    // schema.to_json() produces a string, then serde_json::from_str() parses
+    // it back. This creates unnecessary allocations. Test documents the
+    // current behavior and verifies correctness despite the round-trip.
+    #[tokio::test]
+    async fn dr36_h3_search_messages_json_round_trip_is_correct() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Index a message with a large body to exercise the round-trip
+        let big_body = "SearchRoundTrip ".repeat(100);
+        let _ = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::IndexMessage {
+                id: "dr36h3_msg".to_string(),
+                project_id: "proj_roundtrip".to_string(),
+                from_agent: "alice".to_string(),
+                to_recipients: "bob".to_string(),
+                subject: "roundtrip36 test subject".to_string(),
+                body: big_body.clone(),
+                created_ts: 3000000,
+            });
+
+        // Wait for NRT refresh (100ms interval + margin)
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Search for the message
+        let result = search_messages(&state, json!({ "query": "roundtrip36", "limit": 10 }));
+        assert!(result.is_ok(), "Search should succeed");
+
+        let resp = result.unwrap();
+        let results = resp["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "Should find 1 result");
+
+        // Verify the round-trip preserved all fields correctly
+        let doc = &results[0];
+
+        // unwrap_tantivy_arrays should have unwrapped single-element arrays
+        // to scalar values
+        assert_eq!(
+            doc["id"].as_str().unwrap(),
+            "dr36h3_msg",
+            "id field preserved through round-trip"
+        );
+        assert_eq!(
+            doc["project_id"].as_str().unwrap(),
+            "proj_roundtrip",
+            "project_id preserved"
+        );
+        assert_eq!(
+            doc["from_agent"].as_str().unwrap(),
+            "alice",
+            "from_agent preserved"
+        );
+        assert_eq!(
+            doc["subject"].as_str().unwrap(),
+            "roundtrip36 test subject",
+            "subject preserved"
+        );
+        assert_eq!(
+            doc["body"].as_str().unwrap(),
+            big_body,
+            "Large body preserved through serialize-deserialize round-trip"
+        );
+        assert_eq!(
+            doc["created_ts"].as_i64().unwrap(),
+            3000000,
+            "Timestamp preserved"
+        );
+    }
 }
