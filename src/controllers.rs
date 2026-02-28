@@ -397,6 +397,12 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         if recipient.contains("..") {
             return Err(format!("Recipient '{}' must not contain '..'", recipient));
         }
+        if recipient != recipient.trim() {
+            return Err(format!(
+                "Recipient '{}' must not have leading or trailing whitespace",
+                recipient
+            ));
+        }
     }
     if subject.len() > MAX_SUBJECT_LEN {
         return Err(format!(
@@ -2680,14 +2686,14 @@ mod tests {
         assert_eq!(inbox_messages(&inbox)[0]["from_agent"], "alice");
     }
 
-    // ── H3 (UPDATED): Whitespace-only recipient still accepted in send ──
-    // send_message accepts whitespace-only recipients (no validation on
-    // recipient content beyond null/control/path checks). But get_inbox
-    // now rejects whitespace-only agent_name (DR22 H3 fix).
+    // ── H3 (UPDATED): Whitespace-only recipient now rejected in send ─────
+    // send_message now rejects whitespace-padded recipients (DR23 H1 fix),
+    // matching get_inbox's existing whitespace validation.
     #[tokio::test]
     async fn dr8_h3_whitespace_recipient_is_functional() {
         let (state, _idx, _repo) = test_post_office();
 
+        // UPDATED: Whitespace-only recipient now rejected in send (DR23 fix)
         let result = send_message(
             &state,
             json!({
@@ -2698,15 +2704,16 @@ mod tests {
             }),
         );
         assert!(
-            result.is_ok(),
-            "Whitespace-only recipient is accepted in send"
+            result.is_err(),
+            "UPDATED: Whitespace-only recipient rejected by send_message (DR23)"
         );
+        assert!(result.unwrap_err().contains("whitespace"));
 
-        // get_inbox now rejects whitespace-only agent_name (DR22 fix)
+        // get_inbox also rejects whitespace-only agent_name (DR22 fix)
         let inbox_result = get_inbox(&state, json!({ "agent_name": "   " }));
         assert!(
             inbox_result.is_err(),
-            "UPDATED: Whitespace-only agent_name rejected by get_inbox (DR22)"
+            "Whitespace-only agent_name rejected by get_inbox (DR22)"
         );
     }
 
@@ -5489,16 +5496,14 @@ mod tests {
     // Deep Review #23 — Hypothesis Tests
     // ══════════════════════════════════════════════════════════════════════
 
-    // ── H1 (CONFIRMED): Whitespace-padded recipients create undrainable inboxes ──
-    // send_message validates recipients for null bytes, control chars, path
-    // separators, and ".." — but does NOT check for whitespace trim.
-    // get_inbox DOES reject whitespace-padded agent_name.
-    // This means sending to " bob " succeeds but get_inbox(" bob ") is rejected.
+    // ── H1 (FIXED): Whitespace-padded recipients now rejected ──────────────────
+    // send_message now validates recipients for whitespace trim, matching
+    // get_inbox's validation. Prevents undrainable inbox entries.
     #[tokio::test]
     async fn dr23_h1_whitespace_padded_recipient_creates_undrainable_inbox() {
         let (state, _idx, _repo) = test_post_office();
 
-        // send_message: " bob " as recipient — no whitespace check on recipients
+        // FIXED: send_message rejects whitespace-padded recipients
         let send_result = send_message(
             &state,
             json!({
@@ -5508,34 +5513,56 @@ mod tests {
                 "body": "this message cannot be drained"
             }),
         );
-        // CONFIRMED: send_message accepts whitespace-padded recipient
         assert!(
-            send_result.is_ok(),
-            "CONFIRMED: send_message accepts whitespace-padded recipient"
+            send_result.is_err(),
+            "FIXED: send_message rejects whitespace-padded recipient"
+        );
+        assert!(
+            send_result.unwrap_err().contains("whitespace"),
+            "Error mentions whitespace"
         );
 
-        // Message was delivered to inbox key " bob "
+        // No inbox entry created
         assert!(
-            state.inboxes.contains_key(" bob "),
-            "Inbox entry created for ' bob '"
+            !state.inboxes.contains_key(" bob "),
+            "FIXED: No inbox entry for ' bob '"
         );
 
-        // get_inbox: " bob " is rejected by whitespace trim check
-        let inbox_result = get_inbox(&state, json!({ "agent_name": " bob " }));
-        assert!(
-            inbox_result.is_err(),
-            "CONFIRMED: get_inbox rejects whitespace-padded agent_name"
+        // Leading whitespace also rejected
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": [" bob"],
+                "subject": "test",
+                "body": "hello"
+            }),
         );
-        assert!(inbox_result.unwrap_err().contains("whitespace"));
+        assert!(r2.is_err(), "FIXED: Leading whitespace rejected");
 
-        // The message is permanently trapped — no way to drain it
-        // Clean "bob" inbox is empty (different DashMap key)
-        let clean_inbox = get_inbox(&state, json!({ "agent_name": "bob" })).unwrap();
-        assert_eq!(
-            inbox_messages(&clean_inbox).len(),
-            0,
-            "CONFIRMED: 'bob' (clean) inbox is empty — message trapped in ' bob ' inbox"
+        // Trailing whitespace also rejected
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob "],
+                "subject": "test",
+                "body": "hello"
+            }),
         );
+        assert!(r3.is_err(), "FIXED: Trailing whitespace rejected");
+
+        // Clean recipient still works
+        let r4 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r4.is_ok(), "Clean recipient accepted");
     }
 
     // ── H2 (CONFIRMED): Recipient deduplication is case-sensitive ──────────────
