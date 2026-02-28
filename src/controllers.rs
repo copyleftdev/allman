@@ -278,6 +278,18 @@ fn validate_text_field(value: &str, field: &str, max_len: usize) -> Result<(), S
     validate_text_core(value, field, max_len)
 }
 
+// Validate optional text fields (subject, project_id) that may be empty strings.
+// Applies the same checks as validate_text_core but allows empty values —
+// empty string means "not provided" for optional fields (DR40-H1).
+// Single source of truth: prevents rule drift between subject and project_id
+// validation, which previously duplicated the same 5-check inline pattern.
+fn validate_optional_text(value: &str, field: &str, max_len: usize) -> Result<(), String> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_text_core(value, field, max_len)
+}
+
 // Validate agent names used in filesystem paths (name_hint, from_agent,
 // recipients, agent_name). Adds path-safety rules on top of the shared core.
 // Single source of truth — all name validation goes through this function
@@ -537,27 +549,9 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     for recipient in &to_agents {
         validate_name(recipient, "recipient")?;
     }
-    // .len() returns byte count — say "byte limit" not "character limit" (DR33-H1).
-    if subject.len() > MAX_SUBJECT_LEN {
-        return Err(format!("Subject exceeds {} byte limit", MAX_SUBJECT_LEN));
-    }
-    if subject.contains('\0') {
-        return Err("Subject must not contain null bytes".to_string());
-    }
-    if subject.chars().any(|c| c.is_control()) {
-        return Err("Subject must not contain control characters".to_string());
-    }
-    // Reject whitespace-only and whitespace-padded subjects, consistent with
-    // project_id (DR32-H3), project_key, agent names, program, model (DR33-H2).
-    // Empty string is allowed (subject is optional, defaults to "").
-    if !subject.is_empty() {
-        if subject.trim().is_empty() {
-            return Err("Subject must not be whitespace-only".to_string());
-        }
-        if subject != subject.trim() {
-            return Err("Subject must not have leading or trailing whitespace".to_string());
-        }
-    }
+    // Subject is optional (defaults to "") — validate via shared helper to
+    // prevent rule drift with project_id validation (DR40-H1).
+    validate_optional_text(subject, "Subject", MAX_SUBJECT_LEN)?;
     // Check length BEFORE content to fail fast on oversized bodies,
     // matching subject's validation order (DR30-H4).
     if body.len() > MAX_BODY_LEN {
@@ -578,31 +572,9 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
                 .to_string(),
         );
     }
-    // Check length BEFORE content to fail fast on oversized values,
-    // consistent with subject/body validation order (DR30-H4, DR32-H1).
-    if project_id.len() > MAX_PROJECT_ID_LEN {
-        return Err(format!(
-            "project_id exceeds {} byte limit",
-            MAX_PROJECT_ID_LEN
-        ));
-    }
-    if project_id.contains('\0') {
-        return Err("project_id must not contain null bytes".to_string());
-    }
-    if project_id.chars().any(|c| c.is_control()) {
-        return Err("project_id must not contain control characters".to_string());
-    }
-    // Reject whitespace-only and whitespace-padded project_id values.
-    // Consistent with project_key validation via validate_text_field() (DR32-H3).
-    // Empty string is allowed (project_id is optional, defaults to "").
-    if !project_id.is_empty() {
-        if project_id.trim().is_empty() {
-            return Err("project_id must not be whitespace-only".to_string());
-        }
-        if project_id != project_id.trim() {
-            return Err("project_id must not have leading or trailing whitespace".to_string());
-        }
-    }
+    // project_id is optional (defaults to "") — validate via shared helper to
+    // prevent rule drift with subject validation (DR40-H1).
+    validate_optional_text(project_id, "project_id", MAX_PROJECT_ID_LEN)?;
 
     // Soft cap on total inbox count. Prevents unbounded DashMap growth
     // from phantom recipients that are never drained (DR25-H1).
@@ -10221,10 +10193,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Verify all messages were indexed through the batch pipeline
-        let result = search_messages(
-            &state,
-            json!({ "query": "batch_test", "limit": 20 }),
-        );
+        let result = search_messages(&state, json!({ "query": "batch_test", "limit": 20 }));
         let docs = result.unwrap();
         let arr = docs["results"].as_array().unwrap();
         assert!(
@@ -10297,7 +10266,10 @@ mod tests {
         {
             let record = state.agents.get("reccheck40h4").unwrap();
             assert!(!record.id.is_empty(), "id should be populated");
-            assert!(!record.project_id.is_empty(), "project_id should be populated");
+            assert!(
+                !record.project_id.is_empty(),
+                "project_id should be populated"
+            );
             assert_eq!(record.name, "reccheck40h4");
             assert_eq!(record.program, "my-program");
             assert_eq!(record.model, "my-model");
@@ -10345,10 +10317,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let result = search_messages(
-            &state,
-            json!({ "query": "unwraptest40h5", "limit": 5 }),
-        );
+        let result = search_messages(&state, json!({ "query": "unwraptest40h5", "limit": 5 }));
         let docs = result.unwrap();
         let arr = docs["results"].as_array().unwrap();
         assert!(!arr.is_empty(), "Should find the indexed message");

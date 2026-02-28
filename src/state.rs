@@ -47,8 +47,12 @@ pub enum PersistOp {
 }
 
 // ── Agent Record (stored in DashMap) ─────────────────────────────────────────
+// Fields are populated during create_agent and stored for future API extensions
+// (e.g., agent listing, admin endpoints). Currently only `name` (the DashMap key)
+// is read on hot paths — send_message uses contains_key(), get_inbox uses the
+// inboxes map. The remaining fields are write-only for now (DR40-H4).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields stored for future API extensions (DR40-H4)
 pub struct AgentRecord {
     pub id: String,
     pub project_id: String,
@@ -279,6 +283,10 @@ fn persistence_worker(
     let f_body = sf.body;
     let f_ts = sf.created_ts;
 
+    // Allocate batch buffer once outside the loop. Reused across iterations
+    // via clear() to avoid ~200KB heap allocation per batch (DR40-H2).
+    let mut batch: Vec<PersistOp> = Vec::with_capacity(4096);
+
     loop {
         // Block until the first operation arrives
         let first = match rx.recv() {
@@ -290,9 +298,8 @@ fn persistence_worker(
         };
 
         // Drain all pending ops (non-blocking) up to batch limit.
-        // Pre-allocate to match the drain bound (4096) to avoid heap
-        // reallocations during high-throughput bursts (DR34-H4).
-        let mut batch = Vec::with_capacity(4096);
+        // clear() reuses the existing heap allocation (DR40-H2).
+        batch.clear();
         batch.push(first);
         while batch.len() < 4096 {
             match rx.try_recv() {
@@ -303,7 +310,7 @@ fn persistence_worker(
 
         let mut indexed = 0usize;
 
-        for op in batch {
+        for op in batch.drain(..) {
             match op {
                 PersistOp::IndexMessage {
                     id,
@@ -337,12 +344,16 @@ fn persistence_worker(
                     content,
                     message,
                 } => {
-                    if let Err(e) = git_tx.try_send(GitRequest::CommitFile {
-                        path: path.clone(),
+                    // Move path by value into the request — no clone needed
+                    // on the success path. On failure, extract path from the
+                    // error's returned value for the log message (DR40-H3).
+                    let req = GitRequest::CommitFile {
+                        path,
                         content,
                         message,
-                    }) {
-                        tracing::warn!("Git channel full, dropping commit for {}: {}", path, e);
+                    };
+                    if let Err(e) = git_tx.try_send(req) {
+                        tracing::warn!("Git channel full, dropping commit: {}", e);
                     }
                 }
             }
