@@ -5,7 +5,8 @@ use crossbeam_channel::{bounded, Sender as CbSender};
 use dashmap::DashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tantivy::{schema::*, Index, IndexReader};
 use tokio::task;
@@ -80,6 +81,10 @@ pub struct PostOffice {
     // NRT shutdown guard — when the last PostOffice clone is dropped,
     // the guard sets a flag that stops the NRT reader refresh task.
     _nrt_guard: Arc<NrtShutdownGuard>,
+
+    // Persist worker JoinHandle — stored so shutdown() can join the thread
+    // and wait for pending Tantivy batches to commit (DR34-H3).
+    persist_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl PostOffice {
@@ -117,8 +122,9 @@ impl PostOffice {
         // ── 3. Persistence Worker (dedicated OS thread) ──────────────────────
         // Owns the Tantivy IndexWriter exclusively. Batches operations for throughput.
         // Pattern: block on first op → drain pending → commit batch.
+        // JoinHandle stored so shutdown() can wait for pending batches (DR34-H3).
         let (persist_tx, persist_rx) = bounded::<PersistOp>(100_000);
-        {
+        let persist_handle = {
             let schema = schema.clone();
             let git_tx = git_tx.clone();
             std::thread::Builder::new()
@@ -126,8 +132,8 @@ impl PostOffice {
                 .spawn(move || {
                     persistence_worker(persist_rx, index_writer, schema, git_tx);
                 })
-                .context("Failed to spawn persistence worker")?;
-        }
+                .context("Failed to spawn persistence worker")?
+        };
 
         // ── 4. NRT Reader Refresh (lightweight tokio task) ───────────────────
         // Uses a shared AtomicBool flag for clean shutdown. When the last
@@ -161,7 +167,27 @@ impl PostOffice {
             index_reader,
             persist_tx,
             _nrt_guard: nrt_guard,
+            persist_handle: Arc::new(Mutex::new(Some(persist_handle))),
         })
+    }
+
+    /// Shut down the persist pipeline and wait for pending Tantivy batches
+    /// to commit. Drops the persist channel sender to signal the worker,
+    /// then joins the worker thread to ensure all queued ops are flushed
+    /// before the process exits (DR34-H3).
+    pub fn shutdown(self) {
+        // Drop the sender to close the channel — this signals the persist
+        // worker to drain remaining ops and exit its loop.
+        drop(self.persist_tx);
+
+        // Join the persist worker thread so pending batches are committed.
+        if let Ok(mut guard) = self.persist_handle.lock() {
+            if let Some(handle) = guard.take() {
+                if let Err(e) = handle.join() {
+                    tracing::error!("Persist worker thread panicked: {:?}", e);
+                }
+            }
+        }
     }
 }
 
@@ -197,8 +223,10 @@ fn persistence_worker(
             }
         };
 
-        // Drain all pending ops (non-blocking) up to batch limit
-        let mut batch = Vec::with_capacity(1024);
+        // Drain all pending ops (non-blocking) up to batch limit.
+        // Pre-allocate to match the drain bound (4096) to avoid heap
+        // reallocations during high-throughput bursts (DR34-H4).
+        let mut batch = Vec::with_capacity(4096);
         batch.push(first);
         while batch.len() < 4096 {
             match rx.try_recv() {

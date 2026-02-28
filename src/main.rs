@@ -53,9 +53,11 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // Drain the persist pipeline before exiting
+    // Drain the persist pipeline before exiting — shutdown() drops the channel
+    // sender, then joins the persist worker thread to ensure all pending Tantivy
+    // batches are committed before the process exits (DR34-H3).
     tracing::info!("Server stopped, draining persist pipeline...");
-    drop(state);
+    state.shutdown();
     tracing::info!("Shutdown complete");
 
     Ok(())

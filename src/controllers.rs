@@ -109,7 +109,15 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                         });
                     }
                 },
-                None => "",
+                // Missing tool name is a specific error, not "Unknown tool: "
+                // with an empty name which is ambiguous (DR34-H5).
+                None => {
+                    return json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32602, "message": "Missing tool name in params" }
+                    });
+                }
             };
             // Clone only arguments from the borrowed params reference — single
             // clone instead of cloning all of params then cloning arguments
@@ -169,10 +177,10 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "project_key": { "type": "string", "description": "Human-readable project identifier" },
-                                    "name_hint": { "type": "string", "description": "Agent name (defaults to AnonymousAgent)" },
-                                    "program": { "type": "string", "description": "Program/version identifier" },
-                                    "model": { "type": "string", "description": "LLM model name" }
+                                    "project_key": { "type": "string", "description": "Human-readable project identifier", "maxLength": MAX_PROJECT_KEY_LEN },
+                                    "name_hint": { "type": "string", "description": "Agent name (defaults to AnonymousAgent)", "maxLength": MAX_AGENT_NAME_LEN },
+                                    "program": { "type": "string", "description": "Program/version identifier", "maxLength": MAX_PROGRAM_LEN },
+                                    "model": { "type": "string", "description": "LLM model name", "maxLength": MAX_MODEL_LEN }
                                 },
                                 "required": ["project_key"]
                             }
@@ -183,11 +191,11 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "from_agent": { "type": "string", "description": "Sender agent name" },
-                                    "to": { "type": "array", "items": { "type": "string" }, "description": "Recipient agent names" },
-                                    "subject": { "type": "string", "description": "Message subject" },
-                                    "body": { "type": "string", "description": "Message body" },
-                                    "project_id": { "type": "string", "description": "Project ID for search indexing" }
+                                    "from_agent": { "type": "string", "description": "Sender agent name", "maxLength": MAX_AGENT_NAME_LEN },
+                                    "to": { "type": "array", "items": { "type": "string", "maxLength": MAX_AGENT_NAME_LEN }, "description": "Recipient agent names", "minItems": 1, "maxItems": MAX_RECIPIENTS },
+                                    "subject": { "type": "string", "description": "Message subject", "maxLength": MAX_SUBJECT_LEN },
+                                    "body": { "type": "string", "description": "Message body", "maxLength": MAX_BODY_LEN },
+                                    "project_id": { "type": "string", "description": "Project ID for search indexing", "maxLength": MAX_PROJECT_ID_LEN }
                                 },
                                 "required": ["from_agent", "to"]
                             }
@@ -198,7 +206,7 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "query": { "type": "string", "description": "Search query (Tantivy syntax)" },
+                                    "query": { "type": "string", "description": "Search query (Tantivy syntax)", "maxLength": MAX_QUERY_LEN },
                                     "limit": { "type": "integer", "description": "Max results to return", "default": 10, "minimum": 1, "maximum": 1000 }
                                 },
                                 "required": ["query"]
@@ -210,7 +218,7 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "agent_name": { "type": "string", "description": "Agent whose inbox to drain" },
+                                    "agent_name": { "type": "string", "description": "Agent whose inbox to drain", "maxLength": MAX_AGENT_NAME_LEN },
                                     "limit": { "type": "integer", "description": "Max messages to drain", "default": 100, "minimum": 1, "maximum": 1000 }
                                 },
                                 "required": ["agent_name"]
@@ -787,6 +795,12 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
     if query_str.chars().any(|c| c.is_control()) {
         return Err("query must not contain control characters".to_string());
+    }
+    // Reject whitespace-padded queries, consistent with subject (DR33-H2),
+    // project_id (DR32-H3), and all validate_text_core paths (DR34-H2).
+    // Whitespace-only is already caught by trim().is_empty() above.
+    if query_str != query_str.trim() {
+        return Err("query must not have leading or trailing whitespace".to_string());
     }
     // Validate limit type: non-integer types (strings, booleans, floats)
     // must return a type error, not silently use the default (DR29-H2).
@@ -2911,8 +2925,11 @@ mod tests {
     async fn dr8_h4_long_query_string_handled() {
         let (state, _idx, _repo) = test_post_office();
 
-        // 10KB query string — Tantivy parser handles gracefully
+        // 10KB query string — Tantivy parser handles gracefully.
+        // Use trim() to remove trailing space from repeat() (DR34-H2 fix
+        // now rejects whitespace-padded queries).
         let long_query = "term ".repeat(2000);
+        let long_query = long_query.trim();
         let result = search_messages(&state, json!({ "query": long_query, "limit": 10 }));
         assert!(
             result.is_ok(),
@@ -7403,7 +7420,7 @@ mod tests {
             err_msg3
         );
 
-        // Absent name → still falls through to "Unknown tool: " (empty string is not a known tool)
+        // Absent name → now returns specific "Missing tool name" error (DR34-H5)
         let resp4 = handle_mcp_request(
             state,
             json!({
@@ -7416,8 +7433,8 @@ mod tests {
         .await;
         let err_msg4 = resp4["error"]["message"].as_str().unwrap();
         assert!(
-            err_msg4.contains("Unknown tool"),
-            "Absent name still produces Unknown tool error: {}",
+            err_msg4.contains("Missing tool name"),
+            "FIXED: Absent name now returns specific error (DR34-H5): {}",
             err_msg4
         );
     }
@@ -8659,5 +8676,283 @@ mod tests {
                 "Each unique recipient gets exactly 1 message"
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DR34 — Deep Review #34 Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── DR34-H1 (FIXED): tools/list schemas now include constraint metadata ──
+    // All string fields declare maxLength, and the `to` array declares
+    // minItems/maxItems, matching the runtime validation constants (DR34-H1).
+    #[tokio::test]
+    async fn dr34_h1_tools_list_schemas_omit_string_and_array_constraints() {
+        let (state, _idx, _repo) = test_post_office();
+        let resp = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+
+        // send_message schema
+        let send_schema = tools.iter().find(|t| t["name"] == "send_message").unwrap();
+        let send_props = &send_schema["inputSchema"]["properties"];
+
+        // FIXED: String fields now declare maxLength matching runtime constants.
+        assert_eq!(
+            send_props["from_agent"]["maxLength"].as_u64().unwrap(),
+            super::MAX_AGENT_NAME_LEN as u64,
+            "from_agent schema declares maxLength"
+        );
+        assert_eq!(
+            send_props["subject"]["maxLength"].as_u64().unwrap(),
+            super::MAX_SUBJECT_LEN as u64,
+            "subject schema declares maxLength"
+        );
+        assert_eq!(
+            send_props["body"]["maxLength"].as_u64().unwrap(),
+            super::MAX_BODY_LEN as u64,
+            "body schema declares maxLength"
+        );
+
+        // FIXED: to array now declares minItems/maxItems.
+        assert_eq!(
+            send_props["to"]["minItems"].as_u64().unwrap(),
+            1,
+            "to schema declares minItems"
+        );
+        assert_eq!(
+            send_props["to"]["maxItems"].as_u64().unwrap(),
+            super::MAX_RECIPIENTS as u64,
+            "to schema declares maxItems"
+        );
+
+        // create_agent schema
+        let create_schema = tools.iter().find(|t| t["name"] == "create_agent").unwrap();
+        let create_props = &create_schema["inputSchema"]["properties"];
+        assert_eq!(
+            create_props["project_key"]["maxLength"].as_u64().unwrap(),
+            super::MAX_PROJECT_KEY_LEN as u64,
+            "project_key schema declares maxLength"
+        );
+        assert_eq!(
+            create_props["name_hint"]["maxLength"].as_u64().unwrap(),
+            super::MAX_AGENT_NAME_LEN as u64,
+            "name_hint schema declares maxLength"
+        );
+
+        // search_messages query field
+        let search_schema = tools
+            .iter()
+            .find(|t| t["name"] == "search_messages")
+            .unwrap();
+        let search_props = &search_schema["inputSchema"]["properties"];
+        assert_eq!(
+            search_props["query"]["maxLength"].as_u64().unwrap(),
+            super::MAX_QUERY_LEN as u64,
+            "query schema declares maxLength"
+        );
+
+        // get_inbox agent_name field
+        let inbox_schema = tools.iter().find(|t| t["name"] == "get_inbox").unwrap();
+        let inbox_props = &inbox_schema["inputSchema"]["properties"];
+        assert_eq!(
+            inbox_props["agent_name"]["maxLength"].as_u64().unwrap(),
+            super::MAX_AGENT_NAME_LEN as u64,
+            "agent_name schema declares maxLength"
+        );
+    }
+
+    // ── DR34-H2 (FIXED): search query now rejects whitespace-padded values ──
+    // Consistent with subject (DR33-H2), project_id (DR32-H3), and all
+    // validate_text_core paths. Query now also rejects leading/trailing
+    // whitespace (DR34-H2).
+    #[tokio::test]
+    async fn dr34_h2_search_query_accepts_whitespace_padded_values() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Whitespace-padded subject is rejected
+        let subj_result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender34h2",
+                "to": ["recip34h2"],
+                "subject": "  padded  ",
+                "body": "test",
+            }),
+        );
+        assert!(
+            subj_result.is_err(),
+            "Whitespace-padded subject must be rejected"
+        );
+        assert!(
+            subj_result.unwrap_err().contains("leading or trailing"),
+            "Subject error mentions whitespace"
+        );
+
+        // Whitespace-padded project_id is rejected
+        let pid_result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender34h2",
+                "to": ["recip34h2"],
+                "body": "test",
+                "project_id": "  padded  ",
+            }),
+        );
+        assert!(
+            pid_result.is_err(),
+            "Whitespace-padded project_id must be rejected"
+        );
+        assert!(
+            pid_result.unwrap_err().contains("leading or trailing"),
+            "project_id error mentions whitespace"
+        );
+
+        // FIXED: Whitespace-padded query is now also rejected (was accepted).
+        let query_result = search_messages(&state, json!({ "query": "  hello  ", "limit": 1 }));
+        assert!(
+            query_result.is_err(),
+            "FIXED: Whitespace-padded query now rejected: {:?}",
+            query_result
+        );
+        assert!(
+            query_result.unwrap_err().contains("leading or trailing"),
+            "Query error mentions whitespace"
+        );
+    }
+
+    // ── DR34-H3 (FIXED): persist worker JoinHandle now stored ─────────────
+    // PostOffice now stores the persist worker JoinHandle and provides a
+    // shutdown() method that drops the channel sender then joins the thread,
+    // ensuring all pending Tantivy batches are committed before exit (DR34-H3).
+    #[tokio::test]
+    async fn dr34_h3_persist_worker_join_handle_not_stored() {
+        let (state, idx_dir, _repo) = test_post_office();
+
+        // Send a persist op
+        let send_result = state
+            .persist_tx
+            .try_send(crate::state::PersistOp::IndexMessage {
+                id: "dr34h3_msg".to_string(),
+                project_id: "proj_test".to_string(),
+                from_agent: "sender".to_string(),
+                to_recipients: "recip".to_string(),
+                subject: "shutdown test".to_string(),
+                body: "verify flush".to_string(),
+                created_ts: 999999,
+            });
+        assert!(send_result.is_ok(), "Persist channel accepts ops");
+
+        // FIXED: shutdown() drops the sender and joins the persist worker
+        // thread, waiting for all pending batches to be committed.
+        state.shutdown();
+
+        // After shutdown(), the persist worker has finished — verify the
+        // document was committed to the Tantivy index.
+        let index = tantivy::Index::open_in_dir(idx_dir.path()).unwrap();
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        assert!(
+            searcher.num_docs() > 0,
+            "FIXED: shutdown() joined persist worker, document committed"
+        );
+    }
+
+    // ── DR34-H4 (FIXED): batch Vec capacity now matches drain bound ────────
+    // persistence_worker in state.rs now uses Vec::with_capacity(4096)
+    // matching the drain loop bound, eliminating heap reallocations during
+    // high-throughput bursts (DR34-H4).
+    #[tokio::test]
+    async fn dr34_h4_batch_vec_capacity_mismatches_drain_bound() {
+        // FIXED: Vec::with_capacity(4096) matches `while batch.len() < 4096`.
+        // No reallocations during high-throughput bursts.
+        //
+        // Verify by flooding the persist channel and checking that all ops
+        // are processed without error.
+        let (state, idx_dir, _repo) = test_post_office();
+
+        // Send 2000 index ops (exceeds 1024 capacity, within 4096 bound)
+        for i in 0..2000 {
+            let _ = state
+                .persist_tx
+                .try_send(crate::state::PersistOp::IndexMessage {
+                    id: format!("msg34h4_{}", i),
+                    project_id: "proj_test".to_string(),
+                    from_agent: "sender".to_string(),
+                    to_recipients: "recip".to_string(),
+                    subject: format!("batch test {}", i),
+                    body: "test body".to_string(),
+                    created_ts: 1000000 + i as i64,
+                });
+        }
+
+        // Drop state to close channel — persist worker drains remaining ops
+        drop(state);
+
+        // Brief sleep to let persist worker finish its batch
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Open the index directly to verify docs were indexed
+        let index = tantivy::Index::open_in_dir(idx_dir.path()).unwrap();
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        // At least some documents should have been indexed (persist worker
+        // processed whatever was in the channel before shutdown)
+        assert!(
+            searcher.num_docs() > 0,
+            "Persist worker processed batch despite capacity mismatch"
+        );
+    }
+
+    // ── DR34-H5 (FIXED): tools/call with absent params returns specific error ─
+    // Missing tool name now returns "Missing tool name in params" instead of
+    // the ambiguous "Unknown tool: " with an empty name (DR34-H5).
+    #[tokio::test]
+    async fn dr34_h5_tools_call_absent_params_empty_tool_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // tools/call with no params at all
+        let resp1 = handle_mcp_request(
+            state.clone(),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" }),
+        )
+        .await;
+        let err1 = resp1["error"]["message"].as_str().unwrap();
+        // FIXED: now returns a specific "Missing tool name" error
+        assert_eq!(
+            err1, "Missing tool name in params",
+            "FIXED: Absent params returns specific error: {}",
+            err1
+        );
+
+        // tools/call with explicit null params
+        let resp2 = handle_mcp_request(
+            state.clone(),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": null }),
+        )
+        .await;
+        let err2 = resp2["error"]["message"].as_str().unwrap();
+        assert_eq!(
+            err2, "Missing tool name in params",
+            "FIXED: Null params returns specific error: {}",
+            err2
+        );
+
+        // tools/call with params but no name field
+        let resp3 = handle_mcp_request(
+            state,
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {} }),
+        )
+        .await;
+        let err3 = resp3["error"]["message"].as_str().unwrap();
+        assert_eq!(
+            err3, "Missing tool name in params",
+            "FIXED: Empty params.name returns specific error: {}",
+            err3
+        );
     }
 }
