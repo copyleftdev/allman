@@ -221,20 +221,51 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
 }
 
 // ── Input validation ─────────────────────────────────────────────────────────
-// Reject names that could cause path traversal or filesystem issues.
-// Used by create_agent (name_hint), send_message (from_agent, recipients),
-// and get_inbox (agent_name). Single source of truth — all name validation
-// goes through this function to prevent rule drift (DR30-H1).
-fn validate_name(name: &str, field: &str) -> Result<(), String> {
-    if name.is_empty() {
+
+// Shared text field validation: empty, null bytes (specific error message before
+// generic control char check — intentional redundancy, see DR31-H3), control
+// characters, length, whitespace. Used by validate_name() and validate_text_field().
+// Single source of truth for the checks common to all user-supplied strings (DR31-H2).
+fn validate_text_core(value: &str, field: &str, max_len: usize) -> Result<(), String> {
+    if value.is_empty() {
         return Err(format!("{} must not be empty", field));
     }
-    if name.len() > MAX_AGENT_NAME_LEN {
+    if value.len() > max_len {
+        return Err(format!("{} exceeds {} character limit", field, max_len));
+    }
+    // Null byte check fires before control char check for a more specific error
+    // message. This is intentionally redundant — '\0'.is_control() is true, so
+    // the control char check below would also catch it (DR31-H3).
+    if value.contains('\0') {
+        return Err(format!("{} must not contain null bytes", field));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!("{} must not contain control characters", field));
+    }
+    if value.trim().is_empty() {
+        return Err(format!("{} must not be whitespace-only", field));
+    }
+    if value != value.trim() {
         return Err(format!(
-            "{} exceeds {} character limit",
-            field, MAX_AGENT_NAME_LEN
+            "{} must not have leading or trailing whitespace",
+            field
         ));
     }
+    Ok(())
+}
+
+// Validate text fields that don't appear in filesystem paths (project_key,
+// program, model). Applies the shared core checks without path-specific rules.
+fn validate_text_field(value: &str, field: &str, max_len: usize) -> Result<(), String> {
+    validate_text_core(value, field, max_len)
+}
+
+// Validate agent names used in filesystem paths (name_hint, from_agent,
+// recipients, agent_name). Adds path-safety rules on top of the shared core.
+// Single source of truth — all name validation goes through this function
+// to prevent rule drift (DR30-H1).
+fn validate_name(name: &str, field: &str) -> Result<(), String> {
+    validate_text_core(name, field, MAX_AGENT_NAME_LEN)?;
     if name.contains('/') || name.contains('\\') {
         return Err(format!("{} must not contain path separators", field));
     }
@@ -246,21 +277,6 @@ fn validate_name(name: &str, field: &str) -> Result<(), String> {
     }
     if name.starts_with('.') {
         return Err(format!("{} must not start with '.'", field));
-    }
-    if name.contains('\0') {
-        return Err(format!("{} must not contain null bytes", field));
-    }
-    if name.chars().any(|c| c.is_control()) {
-        return Err(format!("{} must not contain control characters", field));
-    }
-    if name.trim().is_empty() {
-        return Err(format!("{} must not be whitespace-only", field));
-    }
-    if name != name.trim() {
-        return Err(format!(
-            "{} must not have leading or trailing whitespace",
-            field
-        ));
     }
     Ok(())
 }
@@ -279,27 +295,10 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
         Some(v) => v.as_str().ok_or("project_key must be a string")?,
         None => return Err("Missing project_key".to_string()),
     };
-    if project_key.is_empty() {
-        return Err("project_key must not be empty".to_string());
-    }
-    if project_key.contains('\0') {
-        return Err("project_key must not contain null bytes".to_string());
-    }
-    if project_key.chars().any(|c| c.is_control()) {
-        return Err("project_key must not contain control characters".to_string());
-    }
-    if project_key.len() > MAX_PROJECT_KEY_LEN {
-        return Err(format!(
-            "project_key exceeds {} character limit",
-            MAX_PROJECT_KEY_LEN
-        ));
-    }
-    if project_key.trim().is_empty() && !project_key.is_empty() {
-        return Err("project_key must not be whitespace-only".to_string());
-    }
-    if project_key != project_key.trim() {
-        return Err("project_key must not have leading or trailing whitespace".to_string());
-    }
+    // Shared text validation: empty, null bytes, control chars, length,
+    // whitespace. No path-separator or dot checks — project_key is only used
+    // for UUID generation, not filesystem paths (DR31-H2).
+    validate_text_field(project_key, "project_key", MAX_PROJECT_KEY_LEN)?;
     // Validate program/model types: if present and non-null, MUST be strings.
     // Silently defaulting to "unknown" for non-string values (e.g., integers)
     // is confusing — the same class of bug fixed for name_hint in DR27-H5 (DR28-H1).
@@ -323,24 +322,11 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
     };
 
     // Validate all inputs BEFORE mutating any state.
-    if program.contains('\0') {
-        return Err("program must not contain null bytes".to_string());
-    }
-    if program.chars().any(|c| c.is_control()) {
-        return Err("program must not contain control characters".to_string());
-    }
-    if program.len() > MAX_PROGRAM_LEN {
-        return Err(format!("program exceeds {} byte limit", MAX_PROGRAM_LEN));
-    }
-    if model.contains('\0') {
-        return Err("model must not contain null bytes".to_string());
-    }
-    if model.chars().any(|c| c.is_control()) {
-        return Err("model must not contain control characters".to_string());
-    }
-    if model.len() > MAX_MODEL_LEN {
-        return Err(format!("model exceeds {} byte limit", MAX_MODEL_LEN));
-    }
+    // program and model use validate_text_field (shared core checks, DR31-H2).
+    // They allow "unknown" as the default, which passes validation (non-empty,
+    // no control chars, under limit, no leading/trailing whitespace).
+    validate_text_field(program, "program", MAX_PROGRAM_LEN)?;
+    validate_text_field(model, "model", MAX_MODEL_LEN)?;
     let name = name_hint.unwrap_or("AnonymousAgent").to_string();
     validate_agent_name(&name)?;
 
@@ -455,10 +441,11 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         Some(v) => v.as_array().ok_or("to must be a JSON array")?,
         None => return Err("Missing to recipients".to_string()),
     };
-    // Reject ANY non-string elements in the to array up front. The DR28-H2
-    // fix only caught the "all non-string" case; mixed arrays like [42, "Alice"]
-    // silently dropped the non-string and delivered only to Alice (DR29-H5).
-    if to_array.iter().any(|v| !v.is_string() && !v.is_null()) {
+    // Reject ANY non-string elements in the to array up front, including nulls.
+    // The schema declares `items: { type: string }` — null is not a string.
+    // Previously nulls were silently dropped, causing schema-runtime
+    // inconsistency where to:[null] gave misleading "No recipients" (DR31-H1).
+    if to_array.iter().any(|v| !v.is_string()) {
         return Err(
             "to array contains non-string elements — all recipients must be strings".to_string(),
         );
@@ -507,7 +494,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     }
     // Single source of truth: use validate_name() for each recipient (DR30-H1).
     for recipient in &to_agents {
-        validate_name(recipient, &format!("Recipient '{}'", recipient))?;
+        validate_name(recipient, "recipient")?;
     }
     if subject.len() > MAX_SUBJECT_LEN {
         return Err(format!(
@@ -1030,7 +1017,7 @@ mod tests {
             "Error must mention non-string elements"
         );
 
-        // Pure string array with nulls still works (nulls are filtered)
+        // Nulls are also non-string — now rejected (DR31-H1)
         let result2 = send_message(
             &state,
             json!({
@@ -1041,10 +1028,10 @@ mod tests {
             }),
         );
         assert!(
-            result2.is_ok(),
-            "Nulls in to array are filtered, not rejected"
+            result2.is_err(),
+            "FIXED (DR31-H1): nulls in to array are now rejected"
         );
-        assert!(state.inboxes.contains_key("bob"));
+        assert!(result2.unwrap_err().contains("non-string"));
     }
 
     // Empty-string recipients in the array must also be filtered.
@@ -7434,7 +7421,7 @@ mod tests {
         assert!(r2.is_err(), "All-non-string case still rejected");
         assert!(r2.unwrap_err().contains("non-string"));
 
-        // Pure string array with nulls still works
+        // Nulls are now also rejected as non-string (DR31-H1)
         let r3 = send_message(
             &state,
             json!({
@@ -7444,8 +7431,11 @@ mod tests {
                 "body": "hello"
             }),
         );
-        assert!(r3.is_ok(), "Nulls are filtered, not rejected");
-        assert!(state.inboxes.contains_key("Recip29H5"));
+        assert!(
+            r3.is_err(),
+            "FIXED (DR31-H1): nulls in to array are now rejected"
+        );
+        assert!(r3.unwrap_err().contains("non-string"));
     }
 
     // ── DR30-H1: Inline name validation duplicates validate_agent_name() ──
@@ -7694,6 +7684,419 @@ mod tests {
             "FIXED: oversized body with null byte now reports 'exceeds' error \
              (length checked first): {}",
             err
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Deep Review #31 — Hypothesis Tests
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ── DR31-H1 (FIXED): `to` array null elements now rejected ─────────────
+    // FIXED: Nulls in `to` array are now rejected like any other non-string,
+    // matching the schema declaration `items: { type: string }`.
+    #[tokio::test]
+    async fn dr31_h1_to_array_null_elements_now_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // to: [null, "Alice"] — null is a non-string, entire request rejected
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": [null, "Alice31H1"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r1.is_err(), "FIXED: null in to array is now rejected");
+        assert!(r1.unwrap_err().contains("non-string"));
+
+        // to: [null] — rejected with clear "non-string" error (not misleading "No recipients")
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": [null],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r2.is_err(), "FIXED: to=[null] rejected as non-string");
+        assert!(
+            r2.unwrap_err().contains("non-string"),
+            "Error now correctly identifies the issue as non-string element"
+        );
+
+        // to: [null, null, "Bob31H1"] — rejected (null is non-string)
+        let r3 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": [null, null, "Bob31H1"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(
+            r3.is_err(),
+            "FIXED: multiple nulls trigger non-string rejection"
+        );
+
+        // Integer still rejected
+        let r4 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": [42, "Alice31H1"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r4.is_err(), "Integer in to array still rejected");
+
+        // Pure string array still works
+        let r5 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H1",
+                "to": ["Alice31H1", "Bob31H1"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(r5.is_ok(), "Pure string array still works");
+
+        // Verify schema-runtime alignment: schema says items must be strings
+        let (state2, _idx2, _repo2) = test_post_office();
+        let tools_list = handle_mcp_request(
+            state2,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        let to_schema = &tools_list["result"]["tools"][1]["inputSchema"]["properties"]["to"];
+        assert_eq!(
+            to_schema["items"]["type"].as_str().unwrap(),
+            "string",
+            "Schema declares items must be strings — runtime now agrees"
+        );
+    }
+
+    // ── DR31-H2 (FIXED): project_key/program/model use validate_text_field() ─
+    // FIXED: Shared checks (empty, null bytes, control chars, length, whitespace)
+    // are now in validate_text_core(), used by both validate_name() and
+    // validate_text_field(). New rules added to the core propagate automatically.
+    #[tokio::test]
+    async fn dr31_h2_project_key_validation_shares_patterns_with_validate_name() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Both reject: empty
+        assert!(validate_agent_name("").is_err(), "name: empty rejected");
+        let r = create_agent(&state, json!({ "project_key": "" }));
+        assert!(r.is_err(), "project_key: empty rejected");
+
+        // Both reject: null bytes
+        assert!(
+            validate_agent_name("a\0b").is_err(),
+            "name: null byte rejected"
+        );
+        let r = create_agent(&state, json!({ "project_key": "a\0b" }));
+        assert!(r.is_err(), "project_key: null byte rejected");
+
+        // Both reject: control chars
+        assert!(
+            validate_agent_name("a\x01b").is_err(),
+            "name: control char rejected"
+        );
+        let r = create_agent(&state, json!({ "project_key": "a\x01b" }));
+        assert!(r.is_err(), "project_key: control char rejected");
+
+        // Both reject: whitespace-only
+        assert!(
+            validate_agent_name("   ").is_err(),
+            "name: whitespace-only rejected"
+        );
+        let r = create_agent(&state, json!({ "project_key": "   " }));
+        assert!(r.is_err(), "project_key: whitespace-only rejected");
+
+        // Both reject: leading/trailing whitespace
+        assert!(
+            validate_agent_name(" a").is_err(),
+            "name: leading whitespace rejected"
+        );
+        let r = create_agent(&state, json!({ "project_key": " a" }));
+        assert!(r.is_err(), "project_key: leading whitespace rejected");
+
+        // DIVERGENCE: validate_name rejects path separators, project_key does not
+        assert!(
+            validate_agent_name("a/b").is_err(),
+            "name: path separator rejected"
+        );
+        let r = create_agent(
+            &state,
+            json!({ "project_key": "a/b", "name_hint": "AgentSlash" }),
+        );
+        assert!(
+            r.is_ok(),
+            "CONFIRMED: project_key accepts path separators (intentional divergence)"
+        );
+
+        // DIVERGENCE: validate_name rejects dot-prefixed, project_key does not
+        assert!(
+            validate_agent_name(".hidden").is_err(),
+            "name: dot-prefix rejected"
+        );
+        let r = create_agent(
+            &state,
+            json!({ "project_key": ".hidden", "name_hint": "AgentDot" }),
+        );
+        assert!(
+            r.is_ok(),
+            "CONFIRMED: project_key accepts dot-prefixed names (intentional divergence)"
+        );
+
+        // DIVERGENCE: validate_name rejects '..', project_key does not
+        assert!(
+            validate_agent_name("a..b").is_err(),
+            "name: double-dot rejected"
+        );
+        let r = create_agent(
+            &state,
+            json!({ "project_key": "a..b", "name_hint": "AgentDotDot" }),
+        );
+        assert!(
+            r.is_ok(),
+            "CONFIRMED: project_key accepts '..' (intentional divergence)"
+        );
+    }
+
+    // ── DR31-H3: validate_name() null byte check is redundant ────────────────
+    // The null byte check (line 250) is a subset of the control char check
+    // (line 253) since '\0'.is_control() == true. The null byte check only
+    // serves to produce a more specific error message. This test proves the
+    // redundancy and documents the error message priority.
+    #[tokio::test]
+    async fn dr31_h3_null_byte_check_is_subset_of_control_char_check() {
+        // Prove '\0' is a control character
+        assert!(
+            '\0'.is_control(),
+            "Null byte IS a control character in Rust's char::is_control()"
+        );
+
+        // validate_name catches null byte with specific message BEFORE control char check
+        let result = validate_name("a\0b", "test_field");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("null bytes"),
+            "Null byte caught by the specific null-byte check: {}",
+            err
+        );
+        assert!(
+            !err.contains("control character"),
+            "Error should NOT mention control characters (null byte check fires first)"
+        );
+
+        // Same redundancy exists in body validation: null byte check (line 529)
+        // before control char check (line 535)
+        let (state, _idx, _repo) = test_post_office();
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H3",
+                "to": ["Recip31H3"],
+                "subject": "test",
+                "body": "hello\0world"
+            }),
+        );
+        assert!(r.is_err());
+        let body_err = r.unwrap_err();
+        assert!(
+            body_err.contains("null bytes"),
+            "Body null byte caught by specific check: {}",
+            body_err
+        );
+
+        // Same redundancy in subject: null byte check (line 518) before
+        // control char check (line 521)
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H3",
+                "to": ["Recip31H3"],
+                "subject": "hello\0world",
+                "body": "ok"
+            }),
+        );
+        assert!(r.is_err());
+        let subj_err = r.unwrap_err();
+        assert!(
+            subj_err.contains("null bytes"),
+            "Subject null byte caught by specific check: {}",
+            subj_err
+        );
+
+        // Same redundancy in project_key
+        let r = create_agent(&state, json!({ "project_key": "test\0key" }));
+        assert!(r.is_err());
+        let pk_err = r.unwrap_err();
+        assert!(
+            pk_err.contains("null bytes"),
+            "project_key null byte caught by specific check: {}",
+            pk_err
+        );
+
+        // Same redundancy in program
+        let r = create_agent(
+            &state,
+            json!({ "project_key": "test", "program": "prog\0ram" }),
+        );
+        assert!(r.is_err());
+        let prog_err = r.unwrap_err();
+        assert!(
+            prog_err.contains("null bytes"),
+            "program null byte caught by specific check: {}",
+            prog_err
+        );
+
+        // Same redundancy in model
+        let r = create_agent(&state, json!({ "project_key": "test", "model": "mod\0el" }));
+        assert!(r.is_err());
+        let model_err = r.unwrap_err();
+        assert!(
+            model_err.contains("null bytes"),
+            "model null byte caught by specific check: {}",
+            model_err
+        );
+    }
+
+    // ── DR31-H4: empty project_id indexed as empty STRING in Tantivy ─────────
+    // When project_id is absent/null, it defaults to "". This empty string is
+    // indexed in Tantivy as a STRING field. This test verifies that messages
+    // with empty project_id are still findable via full-text search on subject/body.
+    #[tokio::test]
+    async fn dr31_h4_empty_project_id_indexed_in_tantivy() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Send message with no project_id (defaults to "")
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H4",
+                "to": ["Recip31H4"],
+                "subject": "xylophonereview",
+                "body": "empty pid message"
+            }),
+        );
+        assert!(r1.is_ok());
+
+        // Send message WITH a project_id, using the SAME searchable body term
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "Sender31H4",
+                "to": ["Recip31H4"],
+                "subject": "xylophonereview",
+                "body": "nonempty pid message",
+                "project_id": "proj_test31h4"
+            }),
+        );
+        assert!(r2.is_ok());
+
+        // Wait for NRT refresh
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Search by the shared subject term should find both messages
+        let search = search_messages(&state, json!({ "query": "xylophonereview", "limit": 10 }));
+        assert!(
+            search.is_ok(),
+            "Search should work for messages with empty project_id"
+        );
+        let results = search.unwrap();
+        let hits = results["results"].as_array().unwrap();
+        assert!(
+            hits.len() >= 2,
+            "Both messages should be findable via shared subject term, got {}",
+            hits.len()
+        );
+
+        // Check the project_id field value in the search results
+        let mut found_empty_pid = false;
+        let mut found_nonempty_pid = false;
+        for hit in hits {
+            let pid = hit
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("MISSING");
+            if pid.is_empty() {
+                found_empty_pid = true;
+            }
+            if pid == "proj_test31h4" {
+                found_nonempty_pid = true;
+            }
+        }
+        assert!(
+            found_empty_pid,
+            "CONFIRMED: Empty project_id is stored and returned in search results"
+        );
+        assert!(
+            found_nonempty_pid,
+            "Non-empty project_id also stored correctly"
+        );
+    }
+
+    // ── DR31-H5 (FIXED): validate_name() uses static field for recipients ───
+    // FIXED: validate_name(recipient, "recipient") uses a static &str instead of
+    // format!("Recipient '{}'", recipient). Eliminates per-recipient heap
+    // allocation on the hot path. 100-recipient broadcast now has zero
+    // validation-related allocations.
+    #[tokio::test]
+    async fn dr31_h5_validate_name_static_field_for_recipients() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Create a message with maximum recipients (100) — all valid names.
+        // validate_name now uses static "recipient" field, zero format! allocations.
+        let recipients: Vec<String> = (0..super::MAX_RECIPIENTS)
+            .map(|i| format!("Agent{:03}", i))
+            .collect();
+        let to_array: Vec<Value> = recipients.iter().map(|s| json!(s)).collect();
+
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "BroadcastSender",
+                "to": to_array,
+                "subject": "broadcast",
+                "body": "hello all"
+            }),
+        );
+        assert!(r.is_ok(), "100-recipient broadcast should succeed");
+
+        // Verify all 100 recipients received the message
+        let mut delivered = 0;
+        for name in &recipients {
+            let inbox = get_inbox(&state, json!({ "agent_name": name })).unwrap();
+            let msgs = inbox_messages(&inbox);
+            delivered += msgs.len();
+        }
+        assert_eq!(
+            delivered, 100,
+            "All 100 recipients should receive the message"
+        );
+
+        // Error messages still identify the field (though not the specific name)
+        let bad_r = send_message(
+            &state,
+            json!({
+                "from_agent": "BroadcastSender",
+                "to": ["valid", "a/b"],
+                "subject": "test",
+                "body": "hello"
+            }),
+        );
+        assert!(bad_r.is_err());
+        assert!(
+            bad_r.unwrap_err().contains("recipient"),
+            "Error message still identifies field as 'recipient'"
         );
     }
 }
