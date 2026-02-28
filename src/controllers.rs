@@ -2,7 +2,7 @@ use crate::models::InboxEntry;
 use crate::state::{AgentRecord, PersistOp, PostOffice};
 use chrono::Utc;
 use serde_json::{json, Value};
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
 use uuid::Uuid;
 
@@ -430,15 +430,29 @@ fn create_agent(state: &PostOffice, args: Value) -> Result<Value, String> {
             .or_insert_with(|| project_key.to_string());
     }
 
-    // Fire-and-forget: persist agent profile to Git
-    let profile = json!({
-        "id": agent_id,
-        "project_id": project_id,
-        "name": name,
-        "program": program,
-        "model": model,
-        "registered_at": registered_at
-    });
+    // Fire-and-forget: persist agent profile to Git.
+    // Include updated_at on re-registration so the file content alone
+    // can distinguish fresh registrations from updates (DR38-H4).
+    let profile = if is_reregistration {
+        json!({
+            "id": agent_id,
+            "project_id": project_id,
+            "name": name,
+            "program": program,
+            "model": model,
+            "registered_at": registered_at,
+            "updated_at": now
+        })
+    } else {
+        json!({
+            "id": agent_id,
+            "project_id": project_id,
+            "name": name,
+            "program": program,
+            "model": model,
+            "registered_at": registered_at
+        })
+    };
     // Use distinct commit messages for fresh registration vs re-registration
     // so the Git audit trail can distinguish them (DR35-H5).
     let commit_msg = if is_reregistration {
@@ -649,7 +663,22 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     // skipped due to concurrent races (DR27-H4).
     let mut delivered_count = 0usize;
     // Deliver to a single recipient's inbox. Returns true if delivered.
+    // Try get_mut() first to avoid a String allocation for the key when
+    // the inbox already exists (the common case). Only fall back to
+    // entry() (which requires an owned key) for new inboxes (DR38-H5).
     let deliver = |recipient: &str, inbox_entry: InboxEntry| -> bool {
+        // Fast path: existing inbox — borrows &str, no heap allocation.
+        if let Some(mut inbox) = state.inboxes.get_mut(recipient) {
+            if inbox.len() < MAX_INBOX_SIZE {
+                inbox.push(inbox_entry);
+                return true;
+            }
+            // Concurrent race filled this inbox after pre-check.
+            return false;
+        }
+        // Slow path: new inbox — allocates String for the DashMap key.
+        // Re-check via entry() in case another thread created it between
+        // the get_mut miss and this call.
         match state.inboxes.entry(recipient.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                 let inbox = occ.get_mut();
@@ -657,7 +686,6 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
                     inbox.push(inbox_entry);
                     true
                 } else {
-                    // Concurrent race filled this inbox after pre-check.
                     false
                 }
             }
@@ -874,8 +902,11 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         .parse_query(query_str)
         .map_err(|e| format!("Query parse error: {}", e))?;
 
-    let top_docs = searcher
-        .search(&query, &TopDocs::with_limit(limit))
+    // Multi-collector: TopDocs for results + Count for total matching
+    // documents. Previously `count` was always results.len() which is
+    // redundant — now it reports total hits for pagination (DR38-H3).
+    let (top_docs, total_hits) = searcher
+        .search(&query, &(TopDocs::with_limit(limit), Count))
         .map_err(|e| format!("Search error: {}", e))?;
 
     // Build JSON directly from Tantivy document fields — avoids the
@@ -900,7 +931,8 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
 
     Ok(json!({
         "results": results,
-        "count": results.len()
+        "count": results.len(),
+        "total_hits": total_hits
     }))
 }
 
@@ -9665,8 +9697,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Read back via search_messages (uses SearchFields from PostOffice)
-        let result =
-            search_messages(&state, json!({ "query": "consistency38h2", "limit": 10 }));
+        let result = search_messages(&state, json!({ "query": "consistency38h2", "limit": 10 }));
         assert!(result.is_ok(), "Search should succeed");
 
         let resp = result.unwrap();
@@ -9708,23 +9739,27 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Search with limit=2 — should return 2 results, count=2 (not 5)
-        let result =
-            search_messages(&state, json!({ "query": "counttest38h3", "limit": 2 }));
+        // Search with limit=2 — should return 2 results, total_hits=5
+        let result = search_messages(&state, json!({ "query": "counttest38h3", "limit": 2 }));
         assert!(result.is_ok());
 
         let resp = result.unwrap();
         let results = resp["results"].as_array().unwrap();
         let count = resp["count"].as_u64().unwrap();
+        let total_hits = resp["total_hits"].as_u64().unwrap();
 
         assert_eq!(results.len(), 2, "Should return exactly 2 results");
         assert_eq!(
             count,
             results.len() as u64,
-            "count must equal results array length"
+            "count equals results array length"
         );
-        // count is NOT total matching docs (which would be 5)
-        assert_eq!(count, 2, "count is the returned subset, not total matches");
+        // total_hits reports ALL matching docs, not just the returned subset (DR38-H3)
+        assert_eq!(total_hits, 5, "total_hits reports all matching documents");
+        assert!(
+            total_hits > count,
+            "total_hits > count when limit < total matches"
+        );
     }
 
     // ── DR38-H4: re-registration profile lacks updated_at ───────────────
@@ -9776,11 +9811,19 @@ mod tests {
         assert_eq!(profile2["program"].as_str().unwrap(), "v2");
         assert_eq!(profile2["model"].as_str().unwrap(), "gpt-5");
 
-        // There is no updated_at field — the profile JSON alone cannot
-        // distinguish a fresh registration from a re-registration.
+        // updated_at is present on re-registration so the profile JSON
+        // alone can distinguish fresh registrations from updates (DR38-H4).
+        let updated_at = profile2["updated_at"].as_i64();
+        assert!(updated_at.is_some(), "updated_at exists on re-registration");
         assert!(
-            profile2.get("updated_at").is_none(),
-            "No updated_at field exists (DR38-H4)"
+            updated_at.unwrap() >= registered_at_1,
+            "updated_at >= registered_at"
+        );
+
+        // First registration should NOT have updated_at
+        assert!(
+            profile1.get("updated_at").is_none(),
+            "Fresh registration has no updated_at"
         );
     }
 
