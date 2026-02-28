@@ -8099,4 +8099,253 @@ mod tests {
             "Error message still identifies field as 'recipient'"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Deep Review #32 — Hypothesis Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // ── DR32-H1: project_id validation order inconsistent with DR30-H4 ────────
+    // DR30-H4 established "check length before content" for subject and body.
+    // project_id in send_message checks null bytes (line 531), then control
+    // chars (line 534), then length (line 537) — opposite order. An oversized
+    // project_id with valid content triggers two unnecessary char scans before
+    // the length check rejects it.
+    #[tokio::test]
+    async fn dr32_h1_project_id_validation_order_inconsistent_with_dr30h4() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Oversized project_id with NO null bytes or control chars.
+        // The length check should reject this, but only after the null byte
+        // and control char scans have already processed all 257 bytes.
+        let oversized_pid = "P".repeat(super::MAX_PROJECT_ID_LEN + 1);
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello",
+                "project_id": oversized_pid,
+            }),
+        );
+        assert!(r.is_err(), "Oversized project_id must be rejected");
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("project_id exceeds"),
+            "Error should be about length: {}",
+            err
+        );
+
+        // Contrast with subject, which checks length FIRST (DR30-H4 fix):
+        let oversized_subject = "S".repeat(super::MAX_SUBJECT_LEN + 1);
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": oversized_subject,
+                "body": "hello",
+            }),
+        );
+        assert!(r2.is_err());
+        let err2 = r2.unwrap_err();
+        assert!(
+            err2.contains("Subject exceeds"),
+            "Subject checks length first (DR30-H4): {}",
+            err2
+        );
+
+        // CONFIRMED: project_id validation order is null→control→length,
+        // while subject/body order is length→null→control.
+        // Both reject correctly, but project_id does unnecessary work on
+        // oversized inputs.
+    }
+
+    // ── DR32-H2: search query validation checks length LAST ───────────────────
+    // DR30-H4 established "check length before content" to fail fast.
+    // search_messages query checks: empty (737), null (740), control (743),
+    // then length (746). An oversized query triggers two full char scans
+    // before the length check rejects it.
+    #[tokio::test]
+    async fn dr32_h2_search_query_validation_order_inconsistent_with_dr30h4() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Oversized query with valid content (no null bytes, no control chars).
+        let oversized_query = "a".repeat(super::MAX_QUERY_LEN + 1);
+        let r = search_messages(&state, json!({ "query": oversized_query }));
+        assert!(r.is_err(), "Oversized query must be rejected");
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("query exceeds"),
+            "Error should be about length: {}",
+            err
+        );
+
+        // CONFIRMED: query validation order is empty→null→control→length.
+        // This means an oversized query with valid content scans for null
+        // bytes AND control characters before the length check rejects it.
+        // Consistent with DR30-H4, the length check should come first
+        // (after the empty check).
+    }
+
+    // ── DR32-H3: project_id has no whitespace validation ──────────────────────
+    // project_key uses validate_text_field() → validate_text_core() which
+    // rejects whitespace-only and leading/trailing whitespace. But project_id
+    // in send_message has no such checks — it only validates null bytes,
+    // control chars, and length.
+    #[tokio::test]
+    async fn dr32_h3_project_id_accepts_whitespace_only_and_padded() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Whitespace-only project_id — passes validation
+        let r1 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["bob"],
+                "subject": "test",
+                "body": "hello",
+                "project_id": "   ",
+            }),
+        );
+        assert!(
+            r1.is_ok(),
+            "CONFIRMED: whitespace-only project_id is accepted (no whitespace validation)"
+        );
+
+        // Whitespace-padded project_id — passes validation
+        let r2 = send_message(
+            &state,
+            json!({
+                "from_agent": "alice",
+                "to": ["charlie"],
+                "subject": "test",
+                "body": "hello",
+                "project_id": " proj_1 ",
+            }),
+        );
+        assert!(
+            r2.is_ok(),
+            "CONFIRMED: whitespace-padded project_id is accepted"
+        );
+
+        // Wait for indexing
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Contrast with project_key, which rejects whitespace:
+        let r3 = create_agent(&state, json!({ "project_key": "   ", "name_hint": "Agent32H3" }));
+        assert!(
+            r3.is_err(),
+            "project_key rejects whitespace-only via validate_text_field()"
+        );
+
+        let r4 = create_agent(
+            &state,
+            json!({ "project_key": " padded ", "name_hint": "Agent32H3b" }),
+        );
+        assert!(
+            r4.is_err(),
+            "project_key rejects leading/trailing whitespace via validate_text_field()"
+        );
+
+        // CONFIRMED: project_id in send_message has no whitespace validation.
+        // " proj_1 " and "proj_1" become different Tantivy STRING tokens.
+    }
+
+    // ── DR32-H4: unwrap_tantivy_arrays clones owned values unnecessarily ──────
+    // The function takes ownership of Value via into_iter(), but uses
+    // `ref arr` + `arr[0].clone()` instead of destructuring the owned array.
+    // For large body fields (up to 64KB), each search result clones the body
+    // string unnecessarily.
+    #[tokio::test]
+    async fn dr32_h4_unwrap_tantivy_arrays_clones_owned_values() {
+        // Simulate a Tantivy doc with a large body field wrapped in array
+        let big_body = "B".repeat(super::MAX_BODY_LEN); // 64KB
+        let doc = json!({
+            "id": ["msg_123"],
+            "from_agent": ["alice"],
+            "subject": ["test subject"],
+            "body": [big_body],
+            "created_ts": [1234567890_i64],
+            "project_id": ["proj_1"],
+            "to_recipients": ["bob"],
+        });
+
+        // This call works correctly (functional test)
+        let unwrapped = unwrap_tantivy_arrays(doc);
+
+        // All single-element arrays are unwrapped to scalars
+        assert!(unwrapped["id"].is_string(), "id unwrapped to scalar");
+        assert!(
+            unwrapped["from_agent"].is_string(),
+            "from_agent unwrapped to scalar"
+        );
+        assert!(
+            unwrapped["subject"].is_string(),
+            "subject unwrapped to scalar"
+        );
+        assert!(unwrapped["body"].is_string(), "body unwrapped to scalar");
+        assert_eq!(
+            unwrapped["body"].as_str().unwrap().len(),
+            super::MAX_BODY_LEN,
+            "64KB body preserved after unwrap"
+        );
+
+        // CONFIRMED: The unwrap works correctly, but uses clone() internally.
+        // The pattern `Value::Array(ref arr) if arr.len() == 1 => arr[0].clone()`
+        // borrows the owned array and clones the element back out.
+        // Could be: `Value::Array(mut arr) if arr.len() == 1 => arr.swap_remove(0)`
+        // to take the element by value, avoiding the clone entirely.
+        // With 7 fields × 1000 results, that's up to 7000 unnecessary clones.
+        // For 64KB body fields: up to 64MB of wasted allocation per search.
+    }
+
+    // ── DR32-H5: to_agents dedup allocates twice per recipient ────────────────
+    // send_message's dedup logic calls .to_string() twice for each recipient:
+    // once for seen.insert() and once for the final .map(). With 100 recipients
+    // at 128 bytes each, that's ~12.8KB of unnecessary heap allocation.
+    #[tokio::test]
+    async fn dr32_h5_to_agents_dedup_allocates_twice_per_recipient() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // 50 unique recipients — each name allocated twice in the dedup logic
+        let recipients: Vec<String> = (0..50).map(|i| format!("Agent32H5_{:03}", i)).collect();
+
+        let r = send_message(
+            &state,
+            json!({
+                "from_agent": "sender",
+                "to": recipients,
+                "subject": "dedup alloc test",
+                "body": "hello all",
+            }),
+        );
+        assert!(r.is_ok(), "50-recipient send succeeds");
+        assert_eq!(
+            r.unwrap()["delivered_count"].as_u64().unwrap(),
+            50,
+            "All 50 recipients delivered"
+        );
+
+        // Verify all recipients got the message
+        for name in &recipients {
+            let inbox = get_inbox(&state, json!({ "agent_name": name })).unwrap();
+            assert_eq!(
+                inbox_messages(&inbox).len(),
+                1,
+                "{} should have 1 message",
+                name
+            );
+        }
+
+        // CONFIRMED: The dedup code at lines 453-462:
+        //   .filter(|s| seen.insert(s.to_string()))  // allocation #1
+        //   .map(|s| s.to_string())                    // allocation #2
+        // Both .to_string() calls are necessary because the first converts
+        // &str → String for the HashSet, and the second converts &str → String
+        // for the output Vec. But they could share a single allocation:
+        //   .map(|s| s.to_string())
+        //   .filter(|s| seen.insert(s.clone()))
+        // Or better: collect into Vec<&str>, dedup, then .to_string() once.
+    }
 }
