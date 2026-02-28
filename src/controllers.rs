@@ -777,21 +777,20 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
     }))
 }
 
-// ── Tantivy field unwrapper ──────────────────────────────────────────────────
+// ── Tantivy field unwrapper (used by tests only) ────────────────────────────
 // Tantivy's schema.to_json() wraps each field value in an array because
 // documents can have multiple values per field. Our schema only adds one
-// value per field, so unwrap single-element arrays to produce scalar fields
-// consistent with get_inbox's response format.
+// value per field, so unwrap single-element arrays to produce scalar fields.
+// NOTE: The main search_messages path now uses direct field extraction to
+// avoid the serialize→deserialize round-trip (DR36-H3). This function is
+// retained for existing test assertions.
+#[cfg(test)]
 fn unwrap_tantivy_arrays(doc: Value) -> Value {
     match doc {
         Value::Object(map) => {
             let unwrapped = map
                 .into_iter()
                 .map(|(k, v)| {
-                    // Take the element by value instead of clone() (DR32-H4).
-                    // The array is already owned via into_iter(), so swap_remove
-                    // extracts the element without copying. Avoids cloning up to
-                    // 64KB body strings per search result.
                     let val = match v {
                         Value::Array(mut arr) if arr.len() == 1 => arr.swap_remove(0),
                         other => other,
@@ -806,7 +805,7 @@ fn unwrap_tantivy_arrays(doc: Value) -> Value {
 }
 
 // ── search_messages ──────────────────────────────────────────────────────────
-// Tantivy NRT search — unchanged, already fast.
+// Tantivy NRT search.
 fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     let query_str = match args.get("query") {
         Some(v) => v.as_str().ok_or("query must be a string")?,
@@ -854,10 +853,15 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
     let searcher = state.index_reader.searcher();
 
     let schema = index.schema();
-    let subject = schema.get_field("subject").unwrap();
-    let body = schema.get_field("body").unwrap();
+    let f_id = schema.get_field("id").unwrap();
+    let f_project = schema.get_field("project_id").unwrap();
+    let f_from = schema.get_field("from_agent").unwrap();
+    let f_to = schema.get_field("to_recipients").unwrap();
+    let f_subject = schema.get_field("subject").unwrap();
+    let f_body = schema.get_field("body").unwrap();
+    let f_ts = schema.get_field("created_ts").unwrap();
 
-    let query_parser = QueryParser::for_index(index, vec![subject, body]);
+    let query_parser = QueryParser::for_index(index, vec![f_subject, f_body]);
     let query = query_parser
         .parse_query(query_str)
         .map_err(|e| format!("Query parse error: {}", e))?;
@@ -866,16 +870,22 @@ fn search_messages(state: &PostOffice, args: Value) -> Result<Value, String> {
         .search(&query, &TopDocs::with_limit(limit))
         .map_err(|e| format!("Search error: {}", e))?;
 
+    // Build JSON directly from Tantivy document fields — avoids the
+    // schema.to_json() → serde_json::from_str() serialize-deserialize
+    // round-trip that created unnecessary string allocations (DR36-H3).
     let mut results = Vec::new();
     for (_score, doc_address) in top_docs {
         let retrieved_doc = searcher.doc(doc_address).map_err(|e| e.to_string())?;
-        let doc_json = schema.to_json(&retrieved_doc);
-        let parsed = serde_json::from_str::<Value>(&doc_json)
-            .map_err(|e| format!("Failed to parse doc JSON: {}", e))?;
-        // Tantivy's to_json wraps each field value in an array (multi-value support).
-        // Unwrap single-element arrays to match get_inbox's scalar field format.
-        let unwrapped = unwrap_tantivy_arrays(parsed);
-        results.push(unwrapped);
+        let doc_val = json!({
+            "id": retrieved_doc.get_first(f_id).and_then(|v| v.as_text()).unwrap_or(""),
+            "project_id": retrieved_doc.get_first(f_project).and_then(|v| v.as_text()).unwrap_or(""),
+            "from_agent": retrieved_doc.get_first(f_from).and_then(|v| v.as_text()).unwrap_or(""),
+            "to_recipients": retrieved_doc.get_first(f_to).and_then(|v| v.as_text()).unwrap_or(""),
+            "subject": retrieved_doc.get_first(f_subject).and_then(|v| v.as_text()).unwrap_or(""),
+            "body": retrieved_doc.get_first(f_body).and_then(|v| v.as_text()).unwrap_or(""),
+            "created_ts": retrieved_doc.get_first(f_ts).and_then(|v| v.as_i64()).unwrap_or(0),
+        });
+        results.push(doc_val);
     }
 
     Ok(json!({
@@ -9331,33 +9341,29 @@ mod tests {
             "Message exists and is searchable via subject"
         );
 
-        // Now try to search by individual recipient via field-qualified query.
-        // to_recipients is STRING (exact match), so "alice" alone won't match
-        // the stored value "alice\x1Fbob\x1Fcharlie".
+        // FIXED (DR36-H5): to_recipients now uses TEXT (tokenized) instead of
+        // STRING (exact match). Individual recipient search works.
         let to_field = schema.get_field("to_recipients").unwrap();
         let recip_parser = tantivy::query::QueryParser::for_index(&index, vec![to_field]);
         let recip_query = recip_parser.parse_query("alice").unwrap();
         let recip_results = searcher
-            .search(
-                &recip_query,
-                &tantivy::collector::TopDocs::with_limit(10),
-            )
+            .search(&recip_query, &tantivy::collector::TopDocs::with_limit(10))
             .unwrap();
 
-        // CONFIRMED: STRING type means exact-match only. Individual recipient
-        // search does NOT work for multi-recipient messages.
+        // FIXED: TEXT type tokenizes the joined string, so "alice" matches
+        // within "alice\x1Fbob\x1Fcharlie". Per-recipient search now works.
         assert_eq!(
             recip_results.len(),
-            0,
-            "CONFIRMED (DR36-H5): STRING-indexed to_recipients does NOT match \
-             individual recipients in multi-recipient messages"
+            1,
+            "FIXED (DR36-H5): TEXT-indexed to_recipients matches individual \
+             recipients in multi-recipient messages"
         );
     }
 
-    // ── DR36-H3: search_messages JSON serialize→deserialize round-trip ───────
-    // schema.to_json() produces a string, then serde_json::from_str() parses
-    // it back. This creates unnecessary allocations. Test documents the
-    // current behavior and verifies correctness despite the round-trip.
+    // ── DR36-H3 (FIXED): search_messages now uses direct field extraction ─────
+    // Previously used schema.to_json() → serde_json::from_str() round-trip.
+    // Now builds JSON directly from Tantivy document fields, eliminating
+    // unnecessary string allocations (DR36-H3).
     #[tokio::test]
     async fn dr36_h3_search_messages_json_round_trip_is_correct() {
         let (state, _idx, _repo) = test_post_office();
@@ -9390,8 +9396,7 @@ mod tests {
         // Verify the round-trip preserved all fields correctly
         let doc = &results[0];
 
-        // unwrap_tantivy_arrays should have unwrapped single-element arrays
-        // to scalar values
+        // Direct field extraction produces scalar values (no arrays to unwrap)
         assert_eq!(
             doc["id"].as_str().unwrap(),
             "dr36h3_msg",
@@ -9415,7 +9420,7 @@ mod tests {
         assert_eq!(
             doc["body"].as_str().unwrap(),
             big_body,
-            "Large body preserved through serialize-deserialize round-trip"
+            "Large body preserved through direct field extraction"
         );
         assert_eq!(
             doc["created_ts"].as_i64().unwrap(),

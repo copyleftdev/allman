@@ -18,7 +18,10 @@ struct NrtShutdownGuard(Arc<AtomicBool>);
 
 impl Drop for NrtShutdownGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        // Release ensures the store is visible to the Acquire load in the
+        // NRT refresh task, providing a proper happens-before relationship
+        // on weak memory architectures (ARM, RISC-V) (DR36-H2).
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -99,7 +102,10 @@ impl PostOffice {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("project_id", STRING | STORED);
         schema_builder.add_text_field("from_agent", STRING | STORED);
-        schema_builder.add_text_field("to_recipients", STRING | STORED);
+        // TEXT (not STRING) so the joined recipient list is tokenized,
+        // enabling per-recipient search in multi-recipient messages.
+        // The \x1F separator is stripped during tokenization (DR36-H5).
+        schema_builder.add_text_field("to_recipients", TEXT | STORED);
         schema_builder.add_text_field("subject", TEXT | STORED);
         schema_builder.add_text_field("body", TEXT | STORED);
         schema_builder.add_i64_field("created_ts", INDEXED | STORED);
@@ -153,7 +159,7 @@ impl PostOffice {
         task::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                if shutdown_flag.load(Ordering::Relaxed) {
+                if shutdown_flag.load(Ordering::Acquire) {
                     tracing::info!("NRT reader refresh task shutting down");
                     break;
                 }
@@ -282,10 +288,15 @@ fn persistence_worker(
                     doc.add_text(f_subject, &subject);
                     doc.add_text(f_body, &body);
                     doc.add_i64(f_ts, created_ts);
-                    if let Err(e) = index_writer.add_document(doc) {
-                        tracing::error!("Tantivy add_document failed: {}", e);
+                    // Only count successful additions — failed add_document
+                    // calls should not trigger a commit or inflate the batch
+                    // count in error logs (DR36-H1).
+                    match index_writer.add_document(doc) {
+                        Ok(_) => indexed += 1,
+                        Err(e) => {
+                            tracing::error!("Tantivy add_document failed: {}", e)
+                        }
                     }
-                    indexed += 1;
                 }
                 PersistOp::GitCommit {
                     path,
