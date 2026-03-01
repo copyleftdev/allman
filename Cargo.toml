@@ -1,6 +1,6 @@
 [package]
 name = "allman"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["MCP Agent Mail Team"]
 description = "A high-performance, headless MCP Agent Mail server named in honor of Eric Allman."
