@@ -23,6 +23,7 @@ const MAX_SEARCH_LIMIT: usize = 1_000;
 const MAX_AGENTS: usize = 100_000;
 const MAX_PROJECTS: usize = 100_000;
 const MAX_INBOXES: usize = 100_000;
+const MAX_TOOL_NAME_LEN: usize = 64;
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     // JSON-RPC 2.0 §4: request MUST be a JSON Object.
@@ -119,6 +120,16 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                     });
                 }
             };
+            // Reject excessively long tool names before matching. Without this,
+            // a ~1MB tool name (the Axum body limit) would be echoed verbatim
+            // in the "Unknown tool" error response via format!() (DR44-H3).
+            if tool_name.len() > MAX_TOOL_NAME_LEN {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": format!("Tool name too long: {} bytes (max {})", tool_name.len(), MAX_TOOL_NAME_LEN) }
+                });
+            }
             // Clone only arguments from the borrowed params reference — single
             // clone instead of cloning all of params then cloning arguments
             // out of the clone (DR33-H4).
@@ -11154,6 +11165,297 @@ mod tests {
             "to_recipients",
         ];
         assert_eq!(inbox_fields, expected);
+
+        state.shutdown();
+    }
+
+    // ── DR44: Deep Review 44 ────────────────────────────────────────────────
+
+    // DR44-H1: axum::serve error path skips state.shutdown()
+    // This is an architectural issue in main.rs, not testable at the
+    // controller level. Documenting as a structural test that verifies
+    // PostOffice::shutdown() can be called safely (idempotent drain).
+    #[tokio::test]
+    async fn dr44_h1_shutdown_is_safe_after_normal_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("idx");
+        let repo = dir.path().join("repo");
+        let state = PostOffice::new(&idx, &repo).unwrap();
+
+        // Do some work
+        let create = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": { "name": "create_agent", "arguments": { "project_key": "dr44h1" } }
+            }),
+        )
+        .await;
+        assert!(create["error"].is_null());
+
+        // shutdown() drains the persist pipeline — must not panic
+        state.shutdown();
+    }
+
+    // DR44-H2: Single-recipient to_recipients has no \x1F separator.
+    // Verifies that a message sent to one recipient stores the raw name
+    // without a trailing or leading unit separator.
+    #[tokio::test]
+    async fn dr44_h2_single_recipient_no_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("idx");
+        let repo = dir.path().join("repo");
+        let state = PostOffice::new(&idx, &repo).unwrap();
+
+        // Create sender and recipient
+        let _ = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": { "name": "create_agent", "arguments": { "project_key": "dr44h2", "name_hint": "alice" } }
+            }),
+        )
+        .await;
+        let _ = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/call",
+                "params": { "name": "create_agent", "arguments": { "project_key": "dr44h2", "name_hint": "bob" } }
+            }),
+        )
+        .await;
+
+        // Send to single recipient
+        let _ = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 3,
+                "method": "tools/call",
+                "params": { "name": "send_message", "arguments": {
+                    "from_agent": "alice",
+                    "to": ["bob"],
+                    "subject": "solo",
+                    "body": "one recipient"
+                }}
+            }),
+        )
+        .await;
+
+        // Read inbox — to_recipients should be exactly "bob" with no \x1F
+        let inbox_resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 4,
+                "method": "tools/call",
+                "params": { "name": "get_inbox", "arguments": { "agent_name": "bob" } }
+            }),
+        )
+        .await;
+        let text = inbox_resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let msgs = parsed["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let to_field = msgs[0]["to_recipients"].as_str().unwrap();
+        assert_eq!(
+            to_field, "bob",
+            "Single recipient must not contain \\x1F separator"
+        );
+        assert!(
+            !to_field.contains('\x1F'),
+            "to_recipients for single recipient must not contain unit separator"
+        );
+
+        state.shutdown();
+    }
+
+    // DR44-H3: Tool name length is now validated (max 64 bytes).
+    // Previously, a ~1MB tool name would be echoed verbatim in the error
+    // response via format!("Unknown tool: {}"). Now rejected early with a
+    // length error that reports the byte count, not the tool name (DR44-H3).
+    #[tokio::test]
+    async fn dr44_h3_long_tool_name_echoed_in_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("idx");
+        let repo = dir.path().join("repo");
+        let state = PostOffice::new(&idx, &repo).unwrap();
+
+        let long_name = "x".repeat(10_000);
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": { "name": long_name, "arguments": {} }
+            }),
+        )
+        .await;
+
+        let err_msg = resp["error"]["message"].as_str().unwrap();
+        // FIXED: error no longer echoes the full tool name — reports byte count instead
+        assert!(
+            err_msg.contains("Tool name too long"),
+            "Error must reject with length message, got: {}",
+            err_msg
+        );
+        assert!(
+            !err_msg.contains(&long_name),
+            "Error must NOT echo the full tool name"
+        );
+        assert_eq!(resp["error"]["code"], -32602);
+
+        // Verify boundary: exactly MAX_TOOL_NAME_LEN is accepted (returns "Unknown tool")
+        let boundary_name = "z".repeat(MAX_TOOL_NAME_LEN);
+        let boundary_resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/call",
+                "params": { "name": boundary_name, "arguments": {} }
+            }),
+        )
+        .await;
+        let boundary_msg = boundary_resp["error"]["message"].as_str().unwrap();
+        assert!(
+            boundary_msg.starts_with("Unknown tool:"),
+            "Boundary length must reach the Unknown tool path, got: {}",
+            boundary_msg
+        );
+
+        state.shutdown();
+    }
+
+    // DR44-H4: create_agent fresh registration returns updated_at: null,
+    // re-registration returns updated_at as integer timestamp.
+    // Asserts type-level distinction (null vs i64), not just presence.
+    #[tokio::test]
+    async fn dr44_h4_updated_at_type_distinction() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("idx");
+        let repo = dir.path().join("repo");
+        let state = PostOffice::new(&idx, &repo).unwrap();
+
+        // Fresh registration
+        let r1 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": { "name": "create_agent", "arguments": { "project_key": "dr44h4", "name_hint": "typetest" } }
+            }),
+        )
+        .await;
+        let text1 = r1["result"]["content"][0]["text"].as_str().unwrap();
+        let profile1: Value = serde_json::from_str(text1).unwrap();
+        assert!(
+            profile1["updated_at"].is_null(),
+            "Fresh registration: updated_at must be JSON null, got {:?}",
+            profile1["updated_at"]
+        );
+
+        // Re-registration
+        let r2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/call",
+                "params": { "name": "create_agent", "arguments": { "project_key": "dr44h4", "name_hint": "typetest" } }
+            }),
+        )
+        .await;
+        let text2 = r2["result"]["content"][0]["text"].as_str().unwrap();
+        let profile2: Value = serde_json::from_str(text2).unwrap();
+        assert!(
+            profile2["updated_at"].is_i64(),
+            "Re-registration: updated_at must be i64, got {:?}",
+            profile2["updated_at"]
+        );
+
+        state.shutdown();
+    }
+
+    // DR44-H5: get_inbox with limit = MAX_INBOX_LIMIT (1000) on inbox
+    // with exactly 1000 messages triggers the full drain path (mem::take)
+    // and removes the DashMap entry.
+    #[tokio::test]
+    async fn dr44_h5_max_limit_exact_boundary_full_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("idx");
+        let repo = dir.path().join("repo");
+        let state = PostOffice::new(&idx, &repo).unwrap();
+
+        // Create agents
+        let _ = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": { "name": "create_agent", "arguments": { "project_key": "dr44h5", "name_hint": "sender" } }
+            }),
+        )
+        .await;
+        let _ = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/call",
+                "params": { "name": "create_agent", "arguments": { "project_key": "dr44h5", "name_hint": "receiver" } }
+            }),
+        )
+        .await;
+
+        // Send exactly MAX_INBOX_LIMIT messages
+        for i in 0..MAX_INBOX_LIMIT {
+            let _ = handle_mcp_request(
+                state.clone(),
+                json!({
+                    "jsonrpc": "2.0", "id": i + 10,
+                    "method": "tools/call",
+                    "params": { "name": "send_message", "arguments": {
+                        "from_agent": "sender",
+                        "to": ["receiver"],
+                        "subject": format!("msg-{}", i),
+                        "body": "boundary test"
+                    }}
+                }),
+            )
+            .await;
+        }
+
+        // Drain with limit = MAX_INBOX_LIMIT (1000)
+        // inbox.len() == limit → takes the full drain path (mem::take + occ.remove())
+        let inbox_resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 2000,
+                "method": "tools/call",
+                "params": { "name": "get_inbox", "arguments": {
+                    "agent_name": "receiver",
+                    "limit": MAX_INBOX_LIMIT
+                }}
+            }),
+        )
+        .await;
+        let text = inbox_resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let arr = parsed["messages"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            MAX_INBOX_LIMIT,
+            "Must return all {} messages",
+            MAX_INBOX_LIMIT
+        );
+
+        // Verify remaining is 0 (full drain path)
+        assert_eq!(parsed["remaining"], 0, "Full drain must report 0 remaining");
+
+        // DashMap entry should be removed after full drain
+        assert!(
+            !state.inboxes.contains_key("receiver"),
+            "DashMap entry must be removed after full drain at limit boundary"
+        );
 
         state.shutdown();
     }
