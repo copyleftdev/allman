@@ -23,6 +23,7 @@ const MAX_SEARCH_LIMIT: usize = 1_000;
 const MAX_AGENTS: usize = 100_000;
 const MAX_PROJECTS: usize = 100_000;
 const MAX_INBOXES: usize = 100_000;
+const MAX_TOOL_NAME_LEN: usize = 64;
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     // JSON-RPC 2.0 §4: request MUST be a JSON Object.
@@ -119,6 +120,16 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                     });
                 }
             };
+            // Reject excessively long tool names before matching. Without this,
+            // a ~1MB tool name (the Axum body limit) would be echoed verbatim
+            // in the "Unknown tool" error response via format!() (DR44-H3).
+            if tool_name.len() > MAX_TOOL_NAME_LEN {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": format!("Tool name too long: {} bytes (max {})", tool_name.len(), MAX_TOOL_NAME_LEN) }
+                });
+            }
             // Clone only arguments from the borrowed params reference — single
             // clone instead of cloning all of params then cloning arguments
             // out of the clone (DR33-H4).
@@ -11257,10 +11268,10 @@ mod tests {
         state.shutdown();
     }
 
-    // DR44-H3: Tool name with no length limit — long names echoed in error.
-    // A ~1MB tool name would be echoed back via format!("Unknown tool: {}").
-    // This test documents the behavior and asserts the error response contains
-    // the full tool name (confirming no truncation/validation exists).
+    // DR44-H3: Tool name length is now validated (max 64 bytes).
+    // Previously, a ~1MB tool name would be echoed verbatim in the error
+    // response via format!("Unknown tool: {}"). Now rejected early with a
+    // length error that reports the byte count, not the tool name (DR44-H3).
     #[tokio::test]
     async fn dr44_h3_long_tool_name_echoed_in_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -11268,9 +11279,6 @@ mod tests {
         let repo = dir.path().join("repo");
         let state = PostOffice::new(&idx, &repo).unwrap();
 
-        // Use a moderately long tool name (10KB) to demonstrate the issue
-        // without blowing up test memory. Real attack could use up to 1MB
-        // (the Axum body limit).
         let long_name = "x".repeat(10_000);
         let resp = handle_mcp_request(
             state.clone(),
@@ -11283,11 +11291,35 @@ mod tests {
         .await;
 
         let err_msg = resp["error"]["message"].as_str().unwrap();
+        // FIXED: error no longer echoes the full tool name — reports byte count instead
         assert!(
-            err_msg.contains(&long_name),
-            "Error echoes the entire tool name without truncation"
+            err_msg.contains("Tool name too long"),
+            "Error must reject with length message, got: {}",
+            err_msg
+        );
+        assert!(
+            !err_msg.contains(&long_name),
+            "Error must NOT echo the full tool name"
         );
         assert_eq!(resp["error"]["code"], -32602);
+
+        // Verify boundary: exactly MAX_TOOL_NAME_LEN is accepted (returns "Unknown tool")
+        let boundary_name = "z".repeat(MAX_TOOL_NAME_LEN);
+        let boundary_resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/call",
+                "params": { "name": boundary_name, "arguments": {} }
+            }),
+        )
+        .await;
+        let boundary_msg = boundary_resp["error"]["message"].as_str().unwrap();
+        assert!(
+            boundary_msg.starts_with("Unknown tool:"),
+            "Boundary length must reach the Unknown tool path, got: {}",
+            boundary_msg
+        );
 
         state.shutdown();
     }

@@ -49,17 +49,20 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
 
     // Drain the persist pipeline before exiting — shutdown() drops the channel
     // sender, then joins the persist worker thread to ensure all pending Tantivy
     // batches are committed before the process exits (DR34-H3).
+    // Runs regardless of whether serve succeeded or failed, so pending
+    // Tantivy batches and git commits are never silently lost (DR44-H1).
     tracing::info!("Server stopped, draining persist pipeline...");
     state.shutdown();
     tracing::info!("Shutdown complete");
 
+    serve_result?;
     Ok(())
 }
 
