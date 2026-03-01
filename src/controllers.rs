@@ -198,10 +198,13 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                     "error": { "code": -32602, "message": format!("Tool name too long: {} bytes (max {})", tool_name.len(), MAX_TOOL_NAME_LEN) }
                 });
             }
-            // Clone only arguments from the borrowed params reference — single
-            // clone instead of cloning all of params then cloning arguments
-            // out of the clone (DR33-H4).
-            let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            // Treat null arguments the same as absent — default to {}.
+            // `.cloned().unwrap_or()` treated null as present (Some(Null)),
+            // inconsistent with all other optional null handling (DR46-H1).
+            let args = match params.get("arguments") {
+                Some(v) if !v.is_null() => v.clone(),
+                _ => json!({}),
+            };
 
             // Validate arguments is an object (or absent → defaulted to {}).
             // Non-object arguments (string, array, number) would produce
@@ -11738,6 +11741,251 @@ mod tests {
             "Second drain returns next FIFO message"
         );
         assert_eq!(result2["remaining"], 3);
+
+        state.shutdown();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // DR46 — Deep Review 46
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── DR46-H1: arguments null returns error instead of defaulting ──────
+    // Fixed (DR46-H1): `"arguments": null` is now treated as absent,
+    // consistent with all other optional null handling in the API.
+    #[tokio::test]
+    async fn dr46_h1_arguments_null_treated_as_absent() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // tools/call with "arguments": null — must reach tool dispatch,
+        // not return "Invalid arguments: must be an object".
+        let resp_null = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_agent",
+                    "arguments": null
+                }
+            }),
+        )
+        .await;
+
+        // tools/call with absent arguments — same behavior expected.
+        let resp_absent = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_agent"
+                }
+            }),
+        )
+        .await;
+
+        // Both must reach the tool (create_agent) and fail with
+        // "Missing project_key", NOT "Invalid arguments".
+        for (label, resp) in [("null", &resp_null), ("absent", &resp_absent)] {
+            let err_msg = resp["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                !err_msg.contains("Invalid arguments"),
+                "arguments={} must not trigger 'Invalid arguments' error, got: {}",
+                label,
+                err_msg
+            );
+            // Should reach create_agent which requires project_key
+            assert!(
+                err_msg.contains("project_key") || resp.get("result").is_some(),
+                "arguments={} must reach tool dispatch, got: {}",
+                label,
+                err_msg
+            );
+        }
+
+        state.shutdown();
+    }
+
+    // ── DR46-H2: search_messages total_hits matches results ─────────────
+    // Disproved: Both TopDocs and Count collectors use the same Searcher
+    // snapshot, so total_hits is consistent with the returned results.
+    // Regression guard.
+    #[tokio::test]
+    async fn dr46_h2_search_total_hits_matches_results() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj46h2", "name_hint": "sender46h2" }),
+        )
+        .unwrap();
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj46h2", "name_hint": "recvr46h2" }),
+        )
+        .unwrap();
+
+        // Send 3 messages with searchable content
+        for i in 0..3 {
+            let _ = send_message(
+                &state,
+                json!({
+                    "from_agent": "sender46h2",
+                    "to": ["recvr46h2"],
+                    "subject": format!("totalhits-{}", i),
+                    "body": "dr46h2 consistency check"
+                }),
+            )
+            .unwrap();
+        }
+
+        // Wait for persist pipeline + NRT refresh (500ms matches other search tests)
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let result = search_messages(&state, json!({ "query": "dr46h2" })).unwrap();
+        let hits = result["results"].as_array().unwrap();
+        let total = result["total_hits"].as_u64().unwrap();
+
+        assert_eq!(
+            total,
+            hits.len() as u64,
+            "total_hits must equal returned results count (same searcher snapshot)"
+        );
+        assert_eq!(total, 3, "All 3 messages should be found");
+
+        state.shutdown();
+    }
+
+    // ── DR46-H3: re-registration preserves registered_at ────────────────
+    // Disproved: The Occupied branch in create_agent copies registered_at
+    // from the existing record, preserving the original timestamp.
+    // Regression guard.
+    #[tokio::test]
+    async fn dr46_h3_re_registration_preserves_registered_at() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "proj46h3", "name_hint": "agent46h3", "program": "v1" }),
+        )
+        .unwrap();
+        let name = r1["name"].as_str().unwrap().to_string();
+
+        // Capture original registered_at from the DashMap record
+        let original_ts = state.agents.get(&name).unwrap().registered_at;
+        assert!(original_ts > 0, "registered_at must be set");
+
+        // Small delay to ensure different timestamp if re-registration overwrites
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Re-register same agent (same project, same name)
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "proj46h3", "name_hint": "agent46h3", "program": "v2" }),
+        )
+        .unwrap();
+        assert_eq!(r2["name"].as_str().unwrap(), name);
+
+        // registered_at must be preserved from original registration
+        let updated_ts = state.agents.get(&name).unwrap().registered_at;
+        assert_eq!(
+            original_ts, updated_ts,
+            "Re-registration must preserve original registered_at"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR46-H4: arguments absent reaches tool dispatch ─────────────────
+    // Regression guard: confirms absent arguments defaults to {} and
+    // reaches the tool function (contrasts with H1 where null fails).
+    #[tokio::test]
+    async fn dr46_h4_arguments_absent_reaches_tool_dispatch() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // tools/call with no "arguments" key — should default to {} and
+        // reach the tool (create_agent), which returns "Missing project_key"
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_agent"
+                }
+            }),
+        )
+        .await;
+
+        // Should reach create_agent, not the arguments validation gate
+        let is_error = resp.get("error").is_some();
+        let is_result = resp.get("result").is_some();
+        assert!(
+            is_error || is_result,
+            "Must get a response (error or result) from tool dispatch"
+        );
+
+        if is_error {
+            let msg = resp["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                !msg.contains("Invalid arguments"),
+                "Absent arguments must bypass arguments validation and reach tool"
+            );
+        }
+
+        state.shutdown();
+    }
+
+    // ── DR46-H5: high message count doesn't lose DashMap entries ────────
+    // Disproved: The persistence worker batch limit of 4096 only affects
+    // Tantivy indexing batches — the hot path (DashMap) is unbounded.
+    // Messages sent via send_message are always stored in the DashMap
+    // inbox regardless of persistence worker batch size.
+    // Regression guard.
+    #[tokio::test]
+    async fn dr46_h5_high_message_count_no_dashmap_loss() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj46h5", "name_hint": "sender46h5" }),
+        )
+        .unwrap();
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj46h5", "name_hint": "recvr46h5" }),
+        )
+        .unwrap();
+
+        // Send 200 messages (well beyond any single batch, but reasonable for test speed)
+        let count = 200usize;
+        for i in 0..count {
+            let _ = send_message(
+                &state,
+                json!({
+                    "from_agent": "sender46h5",
+                    "to": ["recvr46h5"],
+                    "subject": format!("batch-{}", i),
+                    "body": "no loss test"
+                }),
+            )
+            .unwrap();
+        }
+
+        // All messages must be in the DashMap inbox (hot path is synchronous).
+        // Pass limit=1000 to override DEFAULT_INBOX_LIMIT (100).
+        let result =
+            get_inbox(&state, json!({ "agent_name": "recvr46h5", "limit": count })).unwrap();
+        let msgs = inbox_messages(&result);
+        assert_eq!(
+            msgs.len(),
+            count,
+            "All {} messages must be present in DashMap inbox",
+            count
+        );
 
         state.shutdown();
     }
