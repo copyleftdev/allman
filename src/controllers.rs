@@ -158,11 +158,18 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                     "id": id,
                     "result": { "content": [{ "type": "text", "text": content.to_string() }] }
                 }),
-                Err(e) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": -32602, "message": e }
-                }),
+                Err(e) => {
+                    // Log tool errors server-side so operators have visibility
+                    // into error rates and types without client cooperation.
+                    // Previously errors were only returned in the JSON-RPC
+                    // response with no server-side audit trail (DR43-H2).
+                    tracing::warn!(tool = tool_name, error = %e, "Tool call failed");
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32602, "message": e }
+                    })
+                }
             }
         }
         "tools/list" => {
@@ -314,11 +321,12 @@ fn validate_name(name: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Backward-compatible wrapper for create_agent's name_hint validation.
-// Error messages use "Invalid agent name:" prefix for consistency with
-// existing tests and API responses.
+// Wrapper for create_agent's name_hint validation. Uses standard field
+// name format ("name_hint") consistent with all other validate_name calls
+// (from_agent, recipient, agent_name) — previously used "Invalid agent name:"
+// prefix which created inconsistent error messages (DR43-H3).
 fn validate_agent_name(name: &str) -> Result<(), String> {
-    validate_name(name, "Invalid agent name:")
+    validate_name(name, "name_hint")
 }
 
 // ── create_agent ─────────────────────────────────────────────────────────────
@@ -787,6 +795,12 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         }
     }
 
+    // NOTE: `to_recipients` is a \x1F-delimited string (e.g., "Alice\x1FBob"),
+    // not a JSON array. This matches the Tantivy index format for consistency
+    // between get_inbox and search_messages. Clients should split on \x1F to
+    // recover individual recipient names. The input format (`to` in send_message)
+    // is a JSON array — this asymmetry is by design: the internal format avoids
+    // nested JSON in stored fields (DR43-H1).
     let result: Vec<Value> = taken
         .into_iter()
         .map(|e| {
@@ -1233,7 +1247,7 @@ mod tests {
         );
         assert!(r.is_err(), "name_hint with .. must be rejected");
         assert!(
-            r.unwrap_err().contains("Invalid"),
+            r.unwrap_err().contains("must not contain"),
             "Error message should indicate invalid name"
         );
     }
@@ -10874,9 +10888,21 @@ mod tests {
     async fn dr43_h1_to_recipients_format_asymmetry_input_vs_output() {
         let (state, _idx, _repo) = test_post_office();
 
-        create_agent(&state, json!({ "project_key": "dr43", "name_hint": "Sender" })).unwrap();
-        create_agent(&state, json!({ "project_key": "dr43", "name_hint": "RecA" })).unwrap();
-        create_agent(&state, json!({ "project_key": "dr43", "name_hint": "RecB" })).unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "Sender" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "RecA" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "RecB" }),
+        )
+        .unwrap();
 
         // Input format: JSON array
         send_message(
@@ -10914,10 +10940,10 @@ mod tests {
         state.shutdown();
     }
 
-    // ── DR43-H2: Tool errors not logged server-side ─────────────────────────
-    // CONFIRMED: Tool validation/capacity errors are returned as JSON-RPC
-    // error responses but never logged via tracing. controllers.rs has no
-    // tracing calls for tool errors — only for channel-full conditions.
+    // ── DR43-H2: Tool errors now logged server-side (fixed) ────────────────
+    // Previously tool errors were only returned in JSON-RPC responses with no
+    // server-side audit trail. Now tracing::warn! is emitted for all tool
+    // errors, giving operators visibility into error rates and types (DR43-H2).
     #[tokio::test]
     async fn dr43_h2_tool_errors_not_logged_server_side() {
         let (state, _idx, _repo) = test_post_office();
@@ -10932,9 +10958,9 @@ mod tests {
             err_msg
         );
 
-        // The error is wrapped in JSON-RPC response but NOT traced server-side.
-        // Verify the error path: handle_mcp_request returns the error in the
-        // response envelope without any tracing call.
+        // The error is wrapped in JSON-RPC response AND now traced server-side.
+        // tracing::warn!(tool, error, "Tool call failed") is emitted in the
+        // Err branch of handle_mcp_request's result match (DR43-H2 fix).
         let resp = handle_mcp_request(
             state.clone(),
             json!({
@@ -10953,28 +10979,23 @@ mod tests {
             "Error returned in JSON-RPC response"
         );
         assert_eq!(resp["error"]["code"], -32602);
-        // No tracing::warn! or tracing::error! is emitted for this error path.
-        // Only channel-full conditions (persist_tx.try_send) are traced.
 
         state.shutdown();
     }
 
-    // ── DR43-H3: validate_agent_name error format inconsistency ─────────────
-    // CONFIRMED: create_agent's name_hint validation uses "Invalid agent name:"
-    // prefix while all other validate_name calls use bare field names.
+    // ── DR43-H3: validate_agent_name error format consistency (fixed) ───────
+    // Previously create_agent used "Invalid agent name:" prefix while other
+    // tools used bare field names. Now all use standard "{field} {error}" format.
     #[tokio::test]
     async fn dr43_h3_validate_agent_name_error_format_inconsistency() {
         let (state, _idx, _repo) = test_post_office();
 
-        // create_agent uses validate_agent_name → "Invalid agent name:" prefix
-        let create_err = create_agent(
-            &state,
-            json!({ "project_key": "dr43", "name_hint": "" }),
-        )
-        .unwrap_err();
+        // create_agent now uses "name_hint" field name (DR43-H3 fix)
+        let create_err =
+            create_agent(&state, json!({ "project_key": "dr43", "name_hint": "" })).unwrap_err();
         assert!(
-            create_err.starts_with("Invalid agent name:"),
-            "create_agent error uses 'Invalid agent name:' prefix: {}",
+            create_err.starts_with("name_hint"),
+            "create_agent error now uses 'name_hint' field name: {}",
             create_err
         );
 
@@ -11002,13 +11023,11 @@ mod tests {
             inbox_err
         );
 
-        // Format inconsistency: "Invalid agent name: must not be empty"
-        // vs "from_agent must not be empty" vs "agent_name must not be empty"
-        assert_ne!(
-            create_err.split(' ').next().unwrap(),
-            send_err.split(' ').next().unwrap(),
-            "Error format differs between create_agent and send_message"
-        );
+        // All now use consistent "{field} {error}" format
+        // "name_hint must not be empty" / "from_agent must not be empty" / "agent_name must not be empty"
+        assert!(create_err.contains("must not be empty"));
+        assert!(send_err.contains("must not be empty"));
+        assert!(inbox_err.contains("must not be empty"));
 
         state.shutdown();
     }
@@ -11021,7 +11040,11 @@ mod tests {
     async fn dr43_h4_inbox_entry_string_field_count_matches_comment() {
         let (state, _idx, _repo) = test_post_office();
 
-        create_agent(&state, json!({ "project_key": "dr43", "name_hint": "Counter" })).unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "Counter" }),
+        )
+        .unwrap();
 
         send_message(
             &state,
@@ -11068,7 +11091,11 @@ mod tests {
     async fn dr43_h5_inbox_and_search_return_same_fields() {
         let (state, _idx, _repo) = test_post_office();
 
-        create_agent(&state, json!({ "project_key": "dr43", "name_hint": "FieldCheck" })).unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "FieldCheck" }),
+        )
+        .unwrap();
 
         send_message(
             &state,
@@ -11086,7 +11113,12 @@ mod tests {
         let inbox = get_inbox(&state, json!({ "agent_name": "FieldCheck" })).unwrap();
         let inbox_msgs = inbox_messages(&inbox);
         assert_eq!(inbox_msgs.len(), 1);
-        let mut inbox_fields: Vec<&str> = inbox_msgs[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut inbox_fields: Vec<&str> = inbox_msgs[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
         inbox_fields.sort();
 
         // Wait for search index
@@ -11097,7 +11129,12 @@ mod tests {
             search_messages(&state, json!({ "query": "dr43fieldcheck", "limit": 10 })).unwrap();
         let results = search["results"].as_array().unwrap();
         assert!(!results.is_empty(), "Search should find the message");
-        let mut search_fields: Vec<&str> = results[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut search_fields: Vec<&str> = results[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
         search_fields.sort();
 
         // Both should have the exact same field names
@@ -11108,7 +11145,13 @@ mod tests {
 
         // Verify the expected 7 fields
         let expected = vec![
-            "body", "created_ts", "from_agent", "id", "project_id", "subject", "to_recipients",
+            "body",
+            "created_ts",
+            "from_agent",
+            "id",
+            "project_id",
+            "subject",
+            "to_recipients",
         ];
         assert_eq!(inbox_fields, expected);
 
