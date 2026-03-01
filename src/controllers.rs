@@ -10609,4 +10609,260 @@ mod tests {
 
         state.shutdown();
     }
+
+    // ── DR42-H1: MCP result text is valid JSON string ────────────────────────
+    // DISPROVED: content.to_string() is correct MCP protocol behavior.
+    // The text field in MCP content blocks is a string representation of
+    // the tool result. Verify the text field is a parseable JSON string.
+    #[tokio::test]
+    async fn dr42_h1_mcp_result_text_is_valid_json_string() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Create an agent — the result will be wrapped in MCP envelope
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_agent",
+                    "arguments": { "project_key": "dr42" }
+                }
+            }),
+        )
+        .await;
+
+        // The MCP envelope wraps content in a text block
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(resp["result"]["content"][0]["type"], "text");
+
+        // The text field should be a valid JSON string that can be parsed
+        let parsed: Value = serde_json::from_str(text).expect(
+            "MCP text content should be a valid JSON string (not double-encoded)",
+        );
+        assert!(parsed.get("id").is_some(), "Parsed result should have id");
+        assert!(
+            parsed.get("name").is_some(),
+            "Parsed result should have name"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR42-H2: Unregistered sender can send messages ──────────────────────
+    // CONFIRMED: send_message validates from_agent format but does NOT check
+    // if the sender is a registered agent. Document this open addressing design.
+    #[tokio::test]
+    async fn dr42_h2_unregistered_sender_can_send_message() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Register a recipient but NOT the sender
+        create_agent(
+            &state,
+            json!({ "project_key": "dr42", "name_hint": "Recipient" }),
+        )
+        .unwrap();
+
+        // Send from an unregistered agent — should succeed
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "GhostSender",
+                "to": ["Recipient"],
+                "subject": "Hello",
+                "body": "Message from unregistered sender"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "Unregistered sender should be able to send messages: {:?}",
+            result.err()
+        );
+
+        // Verify the message was delivered
+        let inbox = get_inbox(&state, json!({ "agent_name": "Recipient" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["from_agent"], "GhostSender");
+
+        state.shutdown();
+    }
+
+    // ── DR42-H3: Inbox response missing to_recipients ───────────────────────
+    // CONFIRMED: InboxEntry lacks to_recipients field, so get_inbox responses
+    // omit recipient information that search_messages includes.
+    #[tokio::test]
+    async fn dr42_h3_inbox_response_missing_to_recipients() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "dr42", "name_hint": "Alice" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr42", "name_hint": "Bob" }),
+        )
+        .unwrap();
+
+        // Send to multiple recipients
+        send_message(
+            &state,
+            json!({
+                "from_agent": "Alice",
+                "to": ["Bob", "Alice"],
+                "subject": "Multi-recipient",
+                "body": "Sent to both",
+                "project_id": "dr42-proj"
+            }),
+        )
+        .unwrap();
+
+        // get_inbox does NOT include to_recipients
+        let inbox = get_inbox(&state, json!({ "agent_name": "Bob" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].get("to_recipients").is_none(),
+            "get_inbox response should NOT have to_recipients field (InboxEntry lacks it)"
+        );
+        // But it does have other expected fields
+        assert!(msgs[0].get("from_agent").is_some());
+        assert!(msgs[0].get("subject").is_some());
+        assert!(msgs[0].get("body").is_some());
+
+        // Wait for persist worker batch commit + NRT reader refresh
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // search_messages DOES include to_recipients
+        let search = search_messages(
+            &state,
+            json!({ "query": "both", "limit": 10 }),
+        )
+        .unwrap();
+        let results = search["results"].as_array().unwrap();
+        assert!(
+            !results.is_empty(),
+            "search_messages should find the indexed message"
+        );
+        assert!(
+            results[0].get("to_recipients").is_some(),
+            "search_messages response SHOULD have to_recipients field"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR42-H4: InboxEntry serde derives unused ────────────────────────────
+    // CONFIRMED: InboxEntry derives Serialize/Deserialize but both paths
+    // (construction in send_message, serialization in get_inbox) are manual.
+    #[tokio::test]
+    async fn dr42_h4_inbox_entry_serde_derives_unused() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "dr42", "name_hint": "Tester" }),
+        )
+        .unwrap();
+
+        send_message(
+            &state,
+            json!({
+                "from_agent": "Tester",
+                "to": ["Tester"],
+                "subject": "Self",
+                "body": "Self-message"
+            }),
+        )
+        .unwrap();
+
+        // get_inbox manually constructs JSON — verify it uses the expected
+        // field names (which differ from InboxEntry struct field names:
+        // "id" vs "message_id", "created_ts" vs "timestamp")
+        let inbox = get_inbox(&state, json!({ "agent_name": "Tester" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+
+        // Manual serialization uses "id" (not "message_id" from struct)
+        assert!(
+            msgs[0].get("id").is_some(),
+            "get_inbox uses 'id' not InboxEntry's 'message_id'"
+        );
+        // Manual serialization uses "created_ts" (not "timestamp" from struct)
+        assert!(
+            msgs[0].get("created_ts").is_some(),
+            "get_inbox uses 'created_ts' not InboxEntry's 'timestamp'"
+        );
+        // If serde_json::to_value() were used, fields would be "message_id"
+        // and "timestamp" (matching the struct). The manual mapping proves
+        // the Serialize derive is unused.
+
+        state.shutdown();
+    }
+
+    // ── DR42-H5: Schema defaults match code constants ───────────────────────
+    // DISPROVED: All schema values use Rust constants directly, preventing drift.
+    #[tokio::test]
+    async fn dr42_h5_schema_defaults_match_code_constants() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+
+        let tools = resp["result"]["tools"].as_array().unwrap();
+
+        // Find search_messages tool
+        let search_tool = tools
+            .iter()
+            .find(|t| t["name"] == "search_messages")
+            .unwrap();
+        let search_limit = &search_tool["inputSchema"]["properties"]["limit"];
+        assert_eq!(search_limit["default"], DEFAULT_SEARCH_LIMIT);
+        assert_eq!(search_limit["minimum"], 1);
+        assert_eq!(search_limit["maximum"], MAX_SEARCH_LIMIT);
+        assert_eq!(
+            search_tool["inputSchema"]["properties"]["query"]["maxLength"],
+            MAX_QUERY_LEN
+        );
+
+        // Find get_inbox tool
+        let inbox_tool = tools
+            .iter()
+            .find(|t| t["name"] == "get_inbox")
+            .unwrap();
+        let inbox_limit = &inbox_tool["inputSchema"]["properties"]["limit"];
+        assert_eq!(inbox_limit["default"], DEFAULT_INBOX_LIMIT);
+        assert_eq!(inbox_limit["minimum"], 1);
+        assert_eq!(inbox_limit["maximum"], MAX_INBOX_LIMIT);
+        assert_eq!(
+            inbox_tool["inputSchema"]["properties"]["agent_name"]["maxLength"],
+            MAX_AGENT_NAME_LEN
+        );
+
+        // Find create_agent tool
+        let create_tool = tools
+            .iter()
+            .find(|t| t["name"] == "create_agent")
+            .unwrap();
+        assert_eq!(
+            create_tool["inputSchema"]["properties"]["project_key"]["maxLength"],
+            MAX_PROJECT_KEY_LEN
+        );
+        assert_eq!(
+            create_tool["inputSchema"]["properties"]["name_hint"]["maxLength"],
+            MAX_AGENT_NAME_LEN
+        );
+
+        state.shutdown();
+    }
 }
