@@ -11459,4 +11459,250 @@ mod tests {
 
         state.shutdown();
     }
+
+    // ── DR45: Deep Review 45 ────────────────────────────────────────────────
+
+    // DR45-H1: tools/list response is static but rebuilt from scratch on
+    // every request. This test asserts the response is byte-identical across
+    // calls, confirming the output is deterministic and could be cached.
+    #[tokio::test]
+    async fn dr45_h1_tools_list_response_is_static_and_deterministic() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp1 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        let resp2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+
+        // Responses must be byte-identical (same id, same content)
+        assert_eq!(
+            resp1.to_string(),
+            resp2.to_string(),
+            "tools/list response must be deterministic — could be cached"
+        );
+
+        // Verify the response includes all 4 tools
+        let tools = resp1["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+
+        state.shutdown();
+    }
+
+    // DR45-H2: send_message with exactly 1 recipient skips the clone path.
+    // The loop at line 694 iterates over &to_agents[..to_agents.len()-1],
+    // which is empty for a single recipient. The entry is moved (not cloned)
+    // into the last recipient's inbox via to_agents.last().unwrap().
+    #[tokio::test]
+    async fn dr45_h2_single_recipient_skips_clone_path() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h2", "name_hint": "sender45" }),
+        );
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h2", "name_hint": "receiver45" }),
+        );
+
+        // Send to exactly 1 recipient — entry should be moved, not cloned
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender45",
+                "to": ["receiver45"],
+                "subject": "single",
+                "body": "no clone needed"
+            }),
+        );
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        assert_eq!(resp["delivered_count"], 1);
+        assert_eq!(resp["status"], "sent");
+
+        // Verify the message was actually delivered
+        let inbox = get_inbox(&state, json!({ "agent_name": "receiver45" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["subject"], "single");
+        assert_eq!(msgs[0]["body"], "no clone needed");
+
+        state.shutdown();
+    }
+
+    // DR45-H3: create_agent concurrent re-registration with identical args
+    // preserves agent_id and registered_at — verifying the idempotent upsert
+    // produces stable identity across multiple re-registrations.
+    #[tokio::test]
+    async fn dr45_h3_triple_registration_preserves_identity() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // First registration
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "dr45h3", "name_hint": "stable", "program": "v1" }),
+        )
+        .unwrap();
+        let id1 = r1["id"].as_str().unwrap().to_string();
+        let reg_at1 = r1["registered_at"].as_i64().unwrap();
+
+        // Second registration (re-reg)
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "dr45h3", "name_hint": "stable", "program": "v2" }),
+        )
+        .unwrap();
+        let id2 = r2["id"].as_str().unwrap().to_string();
+        let reg_at2 = r2["registered_at"].as_i64().unwrap();
+
+        // Third registration (re-reg again)
+        let r3 = create_agent(
+            &state,
+            json!({ "project_key": "dr45h3", "name_hint": "stable", "program": "v3" }),
+        )
+        .unwrap();
+        let id3 = r3["id"].as_str().unwrap().to_string();
+        let reg_at3 = r3["registered_at"].as_i64().unwrap();
+
+        // Identity must be stable across all 3 registrations
+        assert_eq!(id1, id2, "agent_id must be stable on re-registration");
+        assert_eq!(id2, id3, "agent_id must be stable on triple registration");
+        assert_eq!(
+            reg_at1, reg_at2,
+            "registered_at must be stable on re-registration"
+        );
+        assert_eq!(
+            reg_at2, reg_at3,
+            "registered_at must be stable on triple registration"
+        );
+
+        // But program must reflect the latest value
+        {
+            let record = state.agents.get("stable").unwrap();
+            assert_eq!(
+                record.program, "v3",
+                "program must reflect latest registration"
+            );
+        }
+
+        state.shutdown();
+    }
+
+    // DR45-H4: send_message response has no field indicating whether the
+    // Tantivy index operation succeeded or was dropped. The response always
+    // says status: "sent" regardless of persist channel state. This test
+    // documents the behavior — "sent" refers to inbox delivery only.
+    #[tokio::test]
+    async fn dr45_h4_send_response_status_refers_to_inbox_only() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h4", "name_hint": "alice45" }),
+        );
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h4", "name_hint": "bob45" }),
+        );
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice45",
+                "to": ["bob45"],
+                "subject": "test",
+                "body": "indexing status unknown"
+            }),
+        )
+        .unwrap();
+
+        // Response says "sent" — this refers to inbox delivery only
+        assert_eq!(result["status"], "sent");
+        assert_eq!(result["delivered_count"], 1);
+
+        // No "indexed" field exists in the response (removed in DR21)
+        assert!(
+            result.get("indexed").is_none(),
+            "Response must not expose internal indexing status"
+        );
+
+        // No field indicates whether the persist channel accepted the op
+        assert!(
+            result.get("persist_status").is_none(),
+            "Response has no persist_status field — indexing is fire-and-forget"
+        );
+
+        state.shutdown();
+    }
+
+    // DR45-H5: get_inbox with limit=1 on an inbox with many messages uses
+    // the partial drain path and returns accurate remaining count.
+    #[tokio::test]
+    async fn dr45_h5_limit_one_partial_drain_remaining_count() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h5", "name_hint": "sender45h5" }),
+        );
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h5", "name_hint": "recvr45h5" }),
+        );
+
+        // Send 5 messages
+        for i in 0..5 {
+            let _ = send_message(
+                &state,
+                json!({
+                    "from_agent": "sender45h5",
+                    "to": ["recvr45h5"],
+                    "subject": format!("msg-{}", i),
+                    "body": "partial drain test"
+                }),
+            )
+            .unwrap();
+        }
+
+        // Drain with limit=1 — should return 1 message and remaining=4
+        let result = get_inbox(&state, json!({ "agent_name": "recvr45h5", "limit": 1 })).unwrap();
+        let msgs = inbox_messages(&result);
+        assert_eq!(msgs.len(), 1, "limit=1 must return exactly 1 message");
+        assert_eq!(
+            result["remaining"], 4,
+            "remaining must be 4 after draining 1 of 5"
+        );
+
+        // The first message should be returned (FIFO order)
+        assert_eq!(msgs[0]["subject"], "msg-0", "Partial drain must be FIFO");
+
+        // DashMap entry should still exist (not removed)
+        assert!(
+            state.inboxes.contains_key("recvr45h5"),
+            "DashMap entry must persist after partial drain"
+        );
+
+        // Drain again with limit=1 — should return msg-1, remaining=3
+        let result2 = get_inbox(&state, json!({ "agent_name": "recvr45h5", "limit": 1 })).unwrap();
+        let msgs2 = inbox_messages(&result2);
+        assert_eq!(
+            msgs2[0]["subject"], "msg-1",
+            "Second drain returns next FIFO message"
+        );
+        assert_eq!(result2["remaining"], 3);
+
+        state.shutdown();
+    }
 }
