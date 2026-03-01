@@ -11259,7 +11259,10 @@ mod tests {
         let msgs = parsed["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);
         let to_field = msgs[0]["to_recipients"].as_str().unwrap();
-        assert_eq!(to_field, "bob", "Single recipient must not contain \\x1F separator");
+        assert_eq!(
+            to_field, "bob",
+            "Single recipient must not contain \\x1F separator"
+        );
         assert!(
             !to_field.contains('\x1F'),
             "to_recipients for single recipient must not contain unit separator"
@@ -11438,7 +11441,12 @@ mod tests {
         let text = inbox_resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         let arr = parsed["messages"].as_array().unwrap();
-        assert_eq!(arr.len(), MAX_INBOX_LIMIT, "Must return all {} messages", MAX_INBOX_LIMIT);
+        assert_eq!(
+            arr.len(),
+            MAX_INBOX_LIMIT,
+            "Must return all {} messages",
+            MAX_INBOX_LIMIT
+        );
 
         // Verify remaining is 0 (full drain path)
         assert_eq!(parsed["remaining"], 0, "Full drain must report 0 remaining");
