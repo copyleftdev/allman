@@ -534,6 +534,11 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     };
 
     // Single source of truth: use validate_name() for from_agent (DR30-H1).
+    // NOTE: from_agent is format-validated only — no state.agents.contains_key()
+    // check. Unregistered senders can send messages. This is intentional:
+    // the system uses open addressing (recipients also don't require registration),
+    // and ephemeral DashMap state is lost on restart, so requiring registration
+    // would break messaging after a server restart (DR42-H2).
     validate_name(from_agent, "from_agent")?;
     if to_agents.is_empty() {
         return Err("No recipients specified".to_string());
@@ -611,9 +616,13 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
     // send is rejected by capacity checks above (DR33-H3).
     let message_id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
+    // Join recipients with unit separator (\x1F) — same format as the Tantivy
+    // index, so get_inbox and search_messages return consistent data (DR42-H3).
+    let to_recipients_joined = to_agents.join("\x1F");
     let entry = InboxEntry {
         message_id: message_id.clone(),
         from_agent: from_agent.to_string(),
+        to_recipients: to_recipients_joined.clone(),
         subject: subject.to_string(),
         body: body.to_string(),
         timestamp: now,
@@ -677,7 +686,7 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         id: message_id.clone(),
         project_id: project_id.to_string(),
         from_agent: from_agent.to_string(),
-        to_recipients: to_agents.join("\x1F"),
+        to_recipients: to_recipients_joined,
         subject: subject.to_string(),
         body: body.to_string(),
         created_ts: now,
@@ -784,6 +793,7 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
             json!({
                 "id": e.message_id,
                 "from_agent": e.from_agent,
+                "to_recipients": e.to_recipients,
                 "subject": e.subject,
                 "body": e.body,
                 "created_ts": e.timestamp,
@@ -6270,6 +6280,7 @@ mod tests {
                 .push(InboxEntry {
                     message_id: format!("msg_{}", i),
                     from_agent: "setup".to_string(),
+                    to_recipients: "phantom".to_string(),
                     subject: "pre-fill".to_string(),
                     body: "x".to_string(),
                     timestamp: 0,
@@ -6650,6 +6661,7 @@ mod tests {
             entries.push(InboxEntry {
                 message_id: format!("prefill-{}", i),
                 from_agent: "Sender".to_string(),
+                to_recipients: "CapTarget".to_string(),
                 subject: "fill".to_string(),
                 body: "x".to_string(),
                 timestamp: 0,
@@ -10638,9 +10650,8 @@ mod tests {
         assert_eq!(resp["result"]["content"][0]["type"], "text");
 
         // The text field should be a valid JSON string that can be parsed
-        let parsed: Value = serde_json::from_str(text).expect(
-            "MCP text content should be a valid JSON string (not double-encoded)",
-        );
+        let parsed: Value = serde_json::from_str(text)
+            .expect("MCP text content should be a valid JSON string (not double-encoded)");
         assert!(parsed.get("id").is_some(), "Parsed result should have id");
         assert!(
             parsed.get("name").is_some(),
@@ -10689,9 +10700,9 @@ mod tests {
         state.shutdown();
     }
 
-    // ── DR42-H3: Inbox response missing to_recipients ───────────────────────
-    // CONFIRMED: InboxEntry lacks to_recipients field, so get_inbox responses
-    // omit recipient information that search_messages includes.
+    // ── DR42-H3: Inbox response includes to_recipients (fixed) ─────────────
+    // Previously InboxEntry lacked to_recipients — get_inbox omitted it while
+    // search_messages included it. Now both paths return consistent fields.
     #[tokio::test]
     async fn dr42_h3_inbox_response_missing_to_recipients() {
         let (state, _idx, _repo) = test_post_office();
@@ -10701,11 +10712,7 @@ mod tests {
             json!({ "project_key": "dr42", "name_hint": "Alice" }),
         )
         .unwrap();
-        create_agent(
-            &state,
-            json!({ "project_key": "dr42", "name_hint": "Bob" }),
-        )
-        .unwrap();
+        create_agent(&state, json!({ "project_key": "dr42", "name_hint": "Bob" })).unwrap();
 
         // Send to multiple recipients
         send_message(
@@ -10720,15 +10727,18 @@ mod tests {
         )
         .unwrap();
 
-        // get_inbox does NOT include to_recipients
+        // get_inbox now includes to_recipients (DR42-H3 fix)
         let inbox = get_inbox(&state, json!({ "agent_name": "Bob" })).unwrap();
         let msgs = inbox_messages(&inbox);
         assert_eq!(msgs.len(), 1);
+        let to_recip = msgs[0]["to_recipients"].as_str().unwrap();
+        // Uses unit separator (\x1F) join — same format as Tantivy index
+        assert!(to_recip.contains("Bob"), "to_recipients should contain Bob");
         assert!(
-            msgs[0].get("to_recipients").is_none(),
-            "get_inbox response should NOT have to_recipients field (InboxEntry lacks it)"
+            to_recip.contains("Alice"),
+            "to_recipients should contain Alice"
         );
-        // But it does have other expected fields
+        // All other expected fields still present
         assert!(msgs[0].get("from_agent").is_some());
         assert!(msgs[0].get("subject").is_some());
         assert!(msgs[0].get("body").is_some());
@@ -10736,12 +10746,8 @@ mod tests {
         // Wait for persist worker batch commit + NRT reader refresh
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // search_messages DOES include to_recipients
-        let search = search_messages(
-            &state,
-            json!({ "query": "both", "limit": 10 }),
-        )
-        .unwrap();
+        // search_messages also includes to_recipients — consistent with get_inbox
+        let search = search_messages(&state, json!({ "query": "both", "limit": 10 })).unwrap();
         let results = search["results"].as_array().unwrap();
         assert!(
             !results.is_empty(),
@@ -10836,10 +10842,7 @@ mod tests {
         );
 
         // Find get_inbox tool
-        let inbox_tool = tools
-            .iter()
-            .find(|t| t["name"] == "get_inbox")
-            .unwrap();
+        let inbox_tool = tools.iter().find(|t| t["name"] == "get_inbox").unwrap();
         let inbox_limit = &inbox_tool["inputSchema"]["properties"]["limit"];
         assert_eq!(inbox_limit["default"], DEFAULT_INBOX_LIMIT);
         assert_eq!(inbox_limit["minimum"], 1);
@@ -10850,10 +10853,7 @@ mod tests {
         );
 
         // Find create_agent tool
-        let create_tool = tools
-            .iter()
-            .find(|t| t["name"] == "create_agent")
-            .unwrap();
+        let create_tool = tools.iter().find(|t| t["name"] == "create_agent").unwrap();
         assert_eq!(
             create_tool["inputSchema"]["properties"]["project_key"]["maxLength"],
             MAX_PROJECT_KEY_LEN
