@@ -2,6 +2,7 @@ use crate::models::InboxEntry;
 use crate::state::{AgentRecord, PersistOp, PostOffice};
 use chrono::Utc;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
 use uuid::Uuid;
@@ -24,6 +25,73 @@ const MAX_AGENTS: usize = 100_000;
 const MAX_PROJECTS: usize = 100_000;
 const MAX_INBOXES: usize = 100_000;
 const MAX_TOOL_NAME_LEN: usize = 64;
+
+// ── Cached tools/list response ──────────────────────────────────────────────
+// Built once on first access via OnceLock. The tools/list response is entirely
+// static (schema + constants), so reconstructing it on every request was
+// wasteful — ~60 string literals and ~10 constant evaluations per call (DR45-H1).
+fn tools_list_value() -> &'static Value {
+    static TOOLS_LIST: OnceLock<Value> = OnceLock::new();
+    TOOLS_LIST.get_or_init(|| {
+        json!({
+            "tools": [
+                {
+                    "name": "create_agent",
+                    "description": "Register a new agent in a project",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_key": { "type": "string", "description": "Human-readable project identifier", "maxLength": MAX_PROJECT_KEY_LEN },
+                            "name_hint": { "type": "string", "description": "Agent name (defaults to AnonymousAgent)", "maxLength": MAX_AGENT_NAME_LEN },
+                            "program": { "type": "string", "description": "Program/version identifier", "maxLength": MAX_PROGRAM_LEN },
+                            "model": { "type": "string", "description": "LLM model name", "maxLength": MAX_MODEL_LEN }
+                        },
+                        "required": ["project_key"]
+                    }
+                },
+                {
+                    "name": "send_message",
+                    "description": "Send a message to one or more agents",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "from_agent": { "type": "string", "description": "Sender agent name", "maxLength": MAX_AGENT_NAME_LEN },
+                            "to": { "type": "array", "items": { "type": "string", "maxLength": MAX_AGENT_NAME_LEN }, "description": "Recipient agent names", "minItems": 1, "maxItems": MAX_RECIPIENTS },
+                            "subject": { "type": "string", "description": "Message subject", "maxLength": MAX_SUBJECT_LEN },
+                            "body": { "type": "string", "description": "Message body", "maxLength": MAX_BODY_LEN },
+                            "project_id": { "type": "string", "description": "Project ID for search indexing", "maxLength": MAX_PROJECT_ID_LEN }
+                        },
+                        "required": ["from_agent", "to"]
+                    }
+                },
+                {
+                    "name": "search_messages",
+                    "description": "Full-text search over indexed messages",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "Search query (Tantivy syntax)", "maxLength": MAX_QUERY_LEN },
+                            "limit": { "type": "integer", "description": "Max results to return", "default": DEFAULT_SEARCH_LIMIT, "minimum": 1, "maximum": MAX_SEARCH_LIMIT }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "get_inbox",
+                    "description": "Drain unread messages from an agent's inbox",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "agent_name": { "type": "string", "description": "Agent whose inbox to drain", "maxLength": MAX_AGENT_NAME_LEN },
+                            "limit": { "type": "integer", "description": "Max messages to drain", "default": DEFAULT_INBOX_LIMIT, "minimum": 1, "maximum": MAX_INBOX_LIMIT }
+                        },
+                        "required": ["agent_name"]
+                    }
+                }
+            ]
+        })
+    })
+}
 
 pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
     // JSON-RPC 2.0 §4: request MUST be a JSON Object.
@@ -183,67 +251,15 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                 }
             }
         }
+        // Return the cached tools/list response. The tools array is static
+        // (schema + constants), so it's built once via OnceLock and cloned
+        // per request instead of reconstructing ~60 string literals and ~10
+        // constant evaluations each time (DR45-H1).
         "tools/list" => {
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": {
-                    "tools": [
-                        {
-                            "name": "create_agent",
-                            "description": "Register a new agent in a project",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "project_key": { "type": "string", "description": "Human-readable project identifier", "maxLength": MAX_PROJECT_KEY_LEN },
-                                    "name_hint": { "type": "string", "description": "Agent name (defaults to AnonymousAgent)", "maxLength": MAX_AGENT_NAME_LEN },
-                                    "program": { "type": "string", "description": "Program/version identifier", "maxLength": MAX_PROGRAM_LEN },
-                                    "model": { "type": "string", "description": "LLM model name", "maxLength": MAX_MODEL_LEN }
-                                },
-                                "required": ["project_key"]
-                            }
-                        },
-                        {
-                            "name": "send_message",
-                            "description": "Send a message to one or more agents",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "from_agent": { "type": "string", "description": "Sender agent name", "maxLength": MAX_AGENT_NAME_LEN },
-                                    "to": { "type": "array", "items": { "type": "string", "maxLength": MAX_AGENT_NAME_LEN }, "description": "Recipient agent names", "minItems": 1, "maxItems": MAX_RECIPIENTS },
-                                    "subject": { "type": "string", "description": "Message subject", "maxLength": MAX_SUBJECT_LEN },
-                                    "body": { "type": "string", "description": "Message body", "maxLength": MAX_BODY_LEN },
-                                    "project_id": { "type": "string", "description": "Project ID for search indexing", "maxLength": MAX_PROJECT_ID_LEN }
-                                },
-                                "required": ["from_agent", "to"]
-                            }
-                        },
-                        {
-                            "name": "search_messages",
-                            "description": "Full-text search over indexed messages",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "query": { "type": "string", "description": "Search query (Tantivy syntax)", "maxLength": MAX_QUERY_LEN },
-                                    "limit": { "type": "integer", "description": "Max results to return", "default": 10, "minimum": 1, "maximum": 1000 }
-                                },
-                                "required": ["query"]
-                            }
-                        },
-                        {
-                            "name": "get_inbox",
-                            "description": "Drain unread messages from an agent's inbox",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "agent_name": { "type": "string", "description": "Agent whose inbox to drain", "maxLength": MAX_AGENT_NAME_LEN },
-                                    "limit": { "type": "integer", "description": "Max messages to drain", "default": 100, "minimum": 1, "maximum": 1000 }
-                                },
-                                "required": ["agent_name"]
-                            }
-                        }
-                    ]
-                }
+                "result": tools_list_value()
             })
         }
         _ => json!({
@@ -700,20 +716,26 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
         delivered_count += 1;
     }
 
-    // 2. Fire-and-forget: index in Tantivy (batched by persistence worker)
-    if let Err(e) = state.persist_tx.try_send(PersistOp::IndexMessage {
-        id: message_id.clone(),
-        project_id: project_id.to_string(),
-        from_agent: from_agent.to_string(),
-        to_recipients: to_recipients_joined,
-        subject: subject.to_string(),
-        body: body.to_string(),
-        created_ts: now,
-    }) {
+    // 2. Fire-and-forget: index in Tantivy (batched by persistence worker).
+    // Track whether the persist channel accepted the op so the response
+    // can inform the client. Previously, a dropped index op was only
+    // logged server-side — clients had no way to know (DR45-H4).
+    let indexed = state
+        .persist_tx
+        .try_send(PersistOp::IndexMessage {
+            id: message_id.clone(),
+            project_id: project_id.to_string(),
+            from_agent: from_agent.to_string(),
+            to_recipients: to_recipients_joined,
+            subject: subject.to_string(),
+            body: body.to_string(),
+            created_ts: now,
+        })
+        .is_ok();
+    if !indexed {
         tracing::warn!(
-            "Persist channel full, dropping index op for message {}: {}",
+            "Persist channel full, dropping index op for message {}",
             message_id,
-            e
         );
     }
 
@@ -727,13 +749,16 @@ fn send_message(state: &PostOffice, args: Value) -> Result<Value, String> {
             "id": message_id,
             "status": "sent",
             "delivered_count": delivered_count,
+            "indexed": indexed,
             "warning": format!(
                 "Partial delivery: {}/{} recipients received the message (concurrent inbox full)",
                 delivered_count, expected
             )
         }))
     } else {
-        Ok(json!({ "id": message_id, "status": "sent", "delivered_count": delivered_count }))
+        Ok(
+            json!({ "id": message_id, "status": "sent", "delivered_count": delivered_count, "indexed": indexed }),
+        )
     }
 }
 
@@ -3930,10 +3955,10 @@ mod tests {
         assert!(result.is_ok(), "Upsert must succeed regardless of count");
     }
 
-    // ── H2 (UPDATED): persist channel drop returns "sent" silently ─────────
-    // When the persist channel is full, try_send drops the Tantivy index op.
-    // The caller gets "status": "sent" with no internal state leakage.
-    // (DR21 H5 removed the "indexed" field from the response.)
+    // ── H2 (UPDATED): send_message reports indexed status ──────────────────
+    // The response includes "indexed": true/false so clients know whether
+    // the persist channel accepted the Tantivy index op (DR45-H4).
+    // (DR21-H5 removed "indexed"; DR45-H4 restored it with correct semantics.)
     #[tokio::test]
     async fn dr14_h2_send_message_reports_indexed_status() {
         let (state, _idx, _repo) = test_post_office();
@@ -3950,9 +3975,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["status"], "sent");
+        // UPDATED (DR45-H4): indexed field is now present — reports whether
+        // the persist channel accepted the Tantivy index operation.
         assert!(
-            result.get("indexed").is_none(),
-            "Response must NOT expose internal 'indexed' status (removed in DR21)"
+            result.get("indexed").is_some(),
+            "Response must include 'indexed' field (restored in DR45-H4)"
+        );
+        assert_eq!(
+            result["indexed"], true,
+            "indexed must be true when persist channel is available"
         );
     }
 
@@ -5575,8 +5606,10 @@ mod tests {
         );
     }
 
-    // ── H5 (FIXED): send_message response no longer exposes `indexed` ───
-    // The internal persist channel status is no longer leaked to clients.
+    // ── H5 (UPDATED DR45-H4): send_message response now includes `indexed` ──
+    // The `indexed` field reports whether the persist channel accepted the
+    // Tantivy index operation. Clients can distinguish "sent + indexed" from
+    // "sent + index dropped" (DR45-H4).
     #[tokio::test]
     async fn dr21_h5_send_message_response_contains_indexed_field() {
         let (state, _idx, _repo) = test_post_office();
@@ -5592,10 +5625,14 @@ mod tests {
         )
         .unwrap();
 
-        // FIXED: Response only contains id and status — no internal state leak
+        // UPDATED (DR45-H4): indexed field restored — reports persist channel status
         assert!(
-            result.get("indexed").is_none(),
-            "FIXED: 'indexed' field removed from response"
+            result.get("indexed").is_some(),
+            "Response must include 'indexed' field (DR45-H4)"
+        );
+        assert_eq!(
+            result["indexed"], true,
+            "indexed must be true under normal conditions"
         );
         assert!(result.get("id").is_some(), "Response has id");
         assert_eq!(result["status"], "sent", "Response has status");
@@ -11456,6 +11493,251 @@ mod tests {
             !state.inboxes.contains_key("receiver"),
             "DashMap entry must be removed after full drain at limit boundary"
         );
+
+        state.shutdown();
+    }
+
+    // ── DR45: Deep Review 45 ────────────────────────────────────────────────
+
+    // DR45-H1: tools/list response is static but rebuilt from scratch on
+    // every request. This test asserts the response is byte-identical across
+    // calls, confirming the output is deterministic and could be cached.
+    #[tokio::test]
+    async fn dr45_h1_tools_list_response_is_static_and_deterministic() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let resp1 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+        let resp2 = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+
+        // Responses must be byte-identical (same id, same content)
+        assert_eq!(
+            resp1.to_string(),
+            resp2.to_string(),
+            "tools/list response must be deterministic — could be cached"
+        );
+
+        // Verify the response includes all 4 tools
+        let tools = resp1["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+
+        state.shutdown();
+    }
+
+    // DR45-H2: send_message with exactly 1 recipient skips the clone path.
+    // The loop at line 694 iterates over &to_agents[..to_agents.len()-1],
+    // which is empty for a single recipient. The entry is moved (not cloned)
+    // into the last recipient's inbox via to_agents.last().unwrap().
+    #[tokio::test]
+    async fn dr45_h2_single_recipient_skips_clone_path() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h2", "name_hint": "sender45" }),
+        );
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h2", "name_hint": "receiver45" }),
+        );
+
+        // Send to exactly 1 recipient — entry should be moved, not cloned
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender45",
+                "to": ["receiver45"],
+                "subject": "single",
+                "body": "no clone needed"
+            }),
+        );
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        assert_eq!(resp["delivered_count"], 1);
+        assert_eq!(resp["status"], "sent");
+
+        // Verify the message was actually delivered
+        let inbox = get_inbox(&state, json!({ "agent_name": "receiver45" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["subject"], "single");
+        assert_eq!(msgs[0]["body"], "no clone needed");
+
+        state.shutdown();
+    }
+
+    // DR45-H3: create_agent concurrent re-registration with identical args
+    // preserves agent_id and registered_at — verifying the idempotent upsert
+    // produces stable identity across multiple re-registrations.
+    #[tokio::test]
+    async fn dr45_h3_triple_registration_preserves_identity() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // First registration
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "dr45h3", "name_hint": "stable", "program": "v1" }),
+        )
+        .unwrap();
+        let id1 = r1["id"].as_str().unwrap().to_string();
+        let reg_at1 = r1["registered_at"].as_i64().unwrap();
+
+        // Second registration (re-reg)
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "dr45h3", "name_hint": "stable", "program": "v2" }),
+        )
+        .unwrap();
+        let id2 = r2["id"].as_str().unwrap().to_string();
+        let reg_at2 = r2["registered_at"].as_i64().unwrap();
+
+        // Third registration (re-reg again)
+        let r3 = create_agent(
+            &state,
+            json!({ "project_key": "dr45h3", "name_hint": "stable", "program": "v3" }),
+        )
+        .unwrap();
+        let id3 = r3["id"].as_str().unwrap().to_string();
+        let reg_at3 = r3["registered_at"].as_i64().unwrap();
+
+        // Identity must be stable across all 3 registrations
+        assert_eq!(id1, id2, "agent_id must be stable on re-registration");
+        assert_eq!(id2, id3, "agent_id must be stable on triple registration");
+        assert_eq!(
+            reg_at1, reg_at2,
+            "registered_at must be stable on re-registration"
+        );
+        assert_eq!(
+            reg_at2, reg_at3,
+            "registered_at must be stable on triple registration"
+        );
+
+        // But program must reflect the latest value
+        {
+            let record = state.agents.get("stable").unwrap();
+            assert_eq!(
+                record.program, "v3",
+                "program must reflect latest registration"
+            );
+        }
+
+        state.shutdown();
+    }
+
+    // DR45-H4: send_message response has no field indicating whether the
+    // Tantivy index operation succeeded or was dropped. The response always
+    // says status: "sent" regardless of persist channel state. This test
+    // documents the behavior — "sent" refers to inbox delivery only.
+    #[tokio::test]
+    async fn dr45_h4_send_response_status_refers_to_inbox_only() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h4", "name_hint": "alice45" }),
+        );
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h4", "name_hint": "bob45" }),
+        );
+
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "alice45",
+                "to": ["bob45"],
+                "subject": "test",
+                "body": "indexing status unknown"
+            }),
+        )
+        .unwrap();
+
+        // Response says "sent" — this refers to inbox delivery
+        assert_eq!(result["status"], "sent");
+        assert_eq!(result["delivered_count"], 1);
+
+        // FIXED (DR45-H4): indexed field now present — reports whether the
+        // persist channel accepted the Tantivy index operation.
+        assert!(
+            result.get("indexed").is_some(),
+            "Response must include 'indexed' field (DR45-H4)"
+        );
+        assert_eq!(
+            result["indexed"], true,
+            "indexed must be true when persist channel is available"
+        );
+
+        state.shutdown();
+    }
+
+    // DR45-H5: get_inbox with limit=1 on an inbox with many messages uses
+    // the partial drain path and returns accurate remaining count.
+    #[tokio::test]
+    async fn dr45_h5_limit_one_partial_drain_remaining_count() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h5", "name_hint": "sender45h5" }),
+        );
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "dr45h5", "name_hint": "recvr45h5" }),
+        );
+
+        // Send 5 messages
+        for i in 0..5 {
+            let _ = send_message(
+                &state,
+                json!({
+                    "from_agent": "sender45h5",
+                    "to": ["recvr45h5"],
+                    "subject": format!("msg-{}", i),
+                    "body": "partial drain test"
+                }),
+            )
+            .unwrap();
+        }
+
+        // Drain with limit=1 — should return 1 message and remaining=4
+        let result = get_inbox(&state, json!({ "agent_name": "recvr45h5", "limit": 1 })).unwrap();
+        let msgs = inbox_messages(&result);
+        assert_eq!(msgs.len(), 1, "limit=1 must return exactly 1 message");
+        assert_eq!(
+            result["remaining"], 4,
+            "remaining must be 4 after draining 1 of 5"
+        );
+
+        // The first message should be returned (FIFO order)
+        assert_eq!(msgs[0]["subject"], "msg-0", "Partial drain must be FIFO");
+
+        // DashMap entry should still exist (not removed)
+        assert!(
+            state.inboxes.contains_key("recvr45h5"),
+            "DashMap entry must persist after partial drain"
+        );
+
+        // Drain again with limit=1 — should return msg-1, remaining=3
+        let result2 = get_inbox(&state, json!({ "agent_name": "recvr45h5", "limit": 1 })).unwrap();
+        let msgs2 = inbox_messages(&result2);
+        assert_eq!(
+            msgs2[0]["subject"], "msg-1",
+            "Second drain returns next FIFO message"
+        );
+        assert_eq!(result2["remaining"], 3);
 
         state.shutdown();
     }
