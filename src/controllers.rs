@@ -11989,4 +11989,278 @@ mod tests {
 
         state.shutdown();
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // DR47 — Deep Review 47
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── DR47-H1: search query with trailing whitespace is rejected ───────
+    // Confirmed: validate_text_core enforces no leading/trailing whitespace,
+    // which is appropriate for identifiers (names, subjects) but too strict
+    // for user-provided search queries where trailing spaces from copy-paste
+    // are common. "hello " is rejected instead of searching for "hello".
+    #[tokio::test]
+    async fn dr47_h1_search_query_trailing_whitespace_rejected() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Query with trailing space — currently rejected
+        let result = search_messages(&state, json!({ "query": "hello " }));
+        assert!(
+            result.is_err(),
+            "BUG: query with trailing whitespace is currently rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("leading or trailing whitespace"),
+            "Error should mention whitespace, got: {}",
+            err
+        );
+
+        // Query with leading space — also rejected
+        let result2 = search_messages(&state, json!({ "query": " hello" }));
+        assert!(
+            result2.is_err(),
+            "BUG: query with leading whitespace is currently rejected"
+        );
+
+        // Query without whitespace padding — accepted
+        let result3 = search_messages(&state, json!({ "query": "hello" }));
+        assert!(
+            result3.is_ok(),
+            "Query without whitespace padding should be accepted"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR47-H2: send_message deduplicates recipients ───────────────────
+    // Disproved: The HashSet dedup at line 544-553 correctly filters
+    // duplicate recipient names before delivery.
+    // Regression guard.
+    #[tokio::test]
+    async fn dr47_h2_duplicate_recipients_deduplicated() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj47h2", "name_hint": "sender47h2" }),
+        )
+        .unwrap();
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj47h2", "name_hint": "Alice47h2" }),
+        )
+        .unwrap();
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj47h2", "name_hint": "Bob47h2" }),
+        )
+        .unwrap();
+
+        // Send with duplicate "Alice47h2" in recipients
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender47h2",
+                "to": ["Alice47h2", "Alice47h2", "Bob47h2"],
+                "subject": "dedup test",
+                "body": "should arrive once"
+            }),
+        )
+        .unwrap();
+
+        // delivered_count should be 2 (Alice once, Bob once)
+        assert_eq!(
+            result["delivered_count"], 2,
+            "Duplicate recipients must be deduplicated: Alice once + Bob once = 2"
+        );
+
+        // Alice's inbox should have exactly 1 message
+        let alice_inbox = get_inbox(&state, json!({ "agent_name": "Alice47h2" })).unwrap();
+        let alice_msgs = inbox_messages(&alice_inbox);
+        assert_eq!(
+            alice_msgs.len(),
+            1,
+            "Alice must receive exactly 1 message, not 2"
+        );
+
+        // Bob's inbox should have exactly 1 message
+        let bob_inbox = get_inbox(&state, json!({ "agent_name": "Bob47h2" })).unwrap();
+        let bob_msgs = inbox_messages(&bob_inbox);
+        assert_eq!(bob_msgs.len(), 1, "Bob must receive exactly 1 message");
+
+        state.shutdown();
+    }
+
+    // ── DR47-H3: create_agent response updated_at consistency ───────────
+    // Disproved: Response always includes updated_at — null for fresh
+    // registrations, timestamp for re-registrations (DR38-H4, DR39-H2).
+    // Regression guard.
+    #[tokio::test]
+    async fn dr47_h3_create_agent_updated_at_consistency() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Fresh registration — updated_at must be null
+        let r1 = create_agent(
+            &state,
+            json!({ "project_key": "proj47h3", "name_hint": "agent47h3", "program": "v1" }),
+        )
+        .unwrap();
+        assert!(
+            r1.get("updated_at").is_some(),
+            "Fresh registration response must include updated_at field"
+        );
+        assert!(
+            r1["updated_at"].is_null(),
+            "Fresh registration updated_at must be null"
+        );
+
+        // Small delay for different timestamp
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Re-registration — updated_at must be a timestamp
+        let r2 = create_agent(
+            &state,
+            json!({ "project_key": "proj47h3", "name_hint": "agent47h3", "program": "v2" }),
+        )
+        .unwrap();
+        assert!(
+            r2.get("updated_at").is_some(),
+            "Re-registration response must include updated_at field"
+        );
+        assert!(
+            r2["updated_at"].is_i64(),
+            "Re-registration updated_at must be a timestamp, got: {}",
+            r2["updated_at"]
+        );
+        assert!(
+            r2["updated_at"].as_i64().unwrap() > 0,
+            "Re-registration updated_at must be positive"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR47-H4: body validation allows newlines but rejects control chars
+    // Disproved: Body validation intentionally allows \n, \t, \r for
+    // multi-line content while rejecting other control characters (DR41-H1).
+    // Regression guard.
+    #[tokio::test]
+    async fn dr47_h4_body_allows_newlines_rejects_control_chars() {
+        let (state, _idx, _repo) = test_post_office();
+
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj47h4", "name_hint": "sender47h4" }),
+        )
+        .unwrap();
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj47h4", "name_hint": "recvr47h4" }),
+        )
+        .unwrap();
+
+        // Body with newlines, tabs, carriage returns — must be accepted
+        let result = send_message(
+            &state,
+            json!({
+                "from_agent": "sender47h4",
+                "to": ["recvr47h4"],
+                "subject": "multiline",
+                "body": "line1\nline2\ttabbed\rcarriage"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "Body with \\n, \\t, \\r must be accepted, got: {:?}",
+            result.err()
+        );
+
+        // Body with SOH control char (\x01) — must be rejected
+        let result2 = send_message(
+            &state,
+            json!({
+                "from_agent": "sender47h4",
+                "to": ["recvr47h4"],
+                "subject": "bad body",
+                "body": "has\x01control"
+            }),
+        );
+        assert!(
+            result2.is_err(),
+            "Body with \\x01 control char must be rejected"
+        );
+        assert!(
+            result2.unwrap_err().contains("control characters"),
+            "Error should mention control characters"
+        );
+
+        // Body with null byte — must be rejected with specific message
+        let result3 = send_message(
+            &state,
+            json!({
+                "from_agent": "sender47h4",
+                "to": ["recvr47h4"],
+                "subject": "null body",
+                "body": "has\0null"
+            }),
+        );
+        assert!(result3.is_err(), "Body with null byte must be rejected");
+        assert!(
+            result3.unwrap_err().contains("null bytes"),
+            "Error should specifically mention null bytes"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR47-H5: float limit rejected as non-integer ────────────────────
+    // Disproved: serde_json's as_i64() returns None for float-typed Numbers
+    // (even mathematically integer values like 1.0). The schema declares
+    // type: integer, so this rejection is correct per the contract.
+    // Regression guard.
+    #[tokio::test]
+    async fn dr47_h5_float_limit_rejected_as_non_integer() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // get_inbox with limit: 1.0 (float) — should return type error
+        // because serde_json stores 1.0 as f64, and as_i64() returns None.
+        // Note: serde_json::json!(1.0) creates a float Number.
+        let _ = create_agent(
+            &state,
+            json!({ "project_key": "proj47h5", "name_hint": "agent47h5" }),
+        )
+        .unwrap();
+
+        let result = get_inbox(&state, json!({ "agent_name": "agent47h5", "limit": 1.0 }));
+        assert!(
+            result.is_err(),
+            "Float limit (1.0) must be rejected as non-integer"
+        );
+        assert!(
+            result.unwrap_err().contains("integer"),
+            "Error should mention integer requirement"
+        );
+
+        // search_messages with limit: 1.0 — same behavior
+        let result2 = search_messages(&state, json!({ "query": "test", "limit": 1.0 }));
+        assert!(
+            result2.is_err(),
+            "Float limit in search must also be rejected"
+        );
+        assert!(
+            result2.unwrap_err().contains("integer"),
+            "Error should mention integer requirement"
+        );
+
+        // Integer limit (1) — must be accepted
+        let result3 = get_inbox(&state, json!({ "agent_name": "agent47h5", "limit": 1 }));
+        assert!(
+            result3.is_ok(),
+            "Integer limit (1) must be accepted, got: {:?}",
+            result3.err()
+        );
+
+        state.shutdown();
+    }
 }
