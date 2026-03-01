@@ -158,11 +158,18 @@ pub async fn handle_mcp_request(state: PostOffice, req: Value) -> Value {
                     "id": id,
                     "result": { "content": [{ "type": "text", "text": content.to_string() }] }
                 }),
-                Err(e) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": -32602, "message": e }
-                }),
+                Err(e) => {
+                    // Log tool errors server-side so operators have visibility
+                    // into error rates and types without client cooperation.
+                    // Previously errors were only returned in the JSON-RPC
+                    // response with no server-side audit trail (DR43-H2).
+                    tracing::warn!(tool = tool_name, error = %e, "Tool call failed");
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32602, "message": e }
+                    })
+                }
             }
         }
         "tools/list" => {
@@ -314,11 +321,12 @@ fn validate_name(name: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Backward-compatible wrapper for create_agent's name_hint validation.
-// Error messages use "Invalid agent name:" prefix for consistency with
-// existing tests and API responses.
+// Wrapper for create_agent's name_hint validation. Uses standard field
+// name format ("name_hint") consistent with all other validate_name calls
+// (from_agent, recipient, agent_name) — previously used "Invalid agent name:"
+// prefix which created inconsistent error messages (DR43-H3).
 fn validate_agent_name(name: &str) -> Result<(), String> {
-    validate_name(name, "Invalid agent name:")
+    validate_name(name, "name_hint")
 }
 
 // ── create_agent ─────────────────────────────────────────────────────────────
@@ -787,6 +795,12 @@ fn get_inbox(state: &PostOffice, args: Value) -> Result<Value, String> {
         }
     }
 
+    // NOTE: `to_recipients` is a \x1F-delimited string (e.g., "Alice\x1FBob"),
+    // not a JSON array. This matches the Tantivy index format for consistency
+    // between get_inbox and search_messages. Clients should split on \x1F to
+    // recover individual recipient names. The input format (`to` in send_message)
+    // is a JSON array — this asymmetry is by design: the internal format avoids
+    // nested JSON in stored fields (DR43-H1).
     let result: Vec<Value> = taken
         .into_iter()
         .map(|e| {
@@ -1233,7 +1247,7 @@ mod tests {
         );
         assert!(r.is_err(), "name_hint with .. must be rejected");
         assert!(
-            r.unwrap_err().contains("Invalid"),
+            r.unwrap_err().contains("must not contain"),
             "Error message should indicate invalid name"
         );
     }
@@ -10862,6 +10876,284 @@ mod tests {
             create_tool["inputSchema"]["properties"]["name_hint"]["maxLength"],
             MAX_AGENT_NAME_LEN
         );
+
+        state.shutdown();
+    }
+
+    // ── DR43-H1: to_recipients format asymmetry (input array vs output string) ──
+    // CONFIRMED: send_message accepts `to` as a JSON array, but get_inbox and
+    // search_messages return `to_recipients` as a \x1F-delimited string.
+    // Clients must know the internal separator format to parse recipients.
+    #[tokio::test]
+    async fn dr43_h1_to_recipients_format_asymmetry_input_vs_output() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "Sender" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "RecA" }),
+        )
+        .unwrap();
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "RecB" }),
+        )
+        .unwrap();
+
+        // Input format: JSON array
+        send_message(
+            &state,
+            json!({
+                "from_agent": "Sender",
+                "to": ["RecA", "RecB"],
+                "subject": "format-test",
+                "body": "testing format"
+            }),
+        )
+        .unwrap();
+
+        // Output format: \x1F-delimited string (not array)
+        let inbox = get_inbox(&state, json!({ "agent_name": "RecA" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+
+        let to_recip = msgs[0]["to_recipients"].as_str().unwrap();
+        // The output is a string, not a JSON array
+        assert!(
+            msgs[0]["to_recipients"].is_string(),
+            "to_recipients output is a string, not an array (format asymmetry)"
+        );
+        // Contains \x1F separator
+        assert!(
+            to_recip.contains('\x1F'),
+            "to_recipients uses \\x1F separator: {:?}",
+            to_recip
+        );
+        // Can be split to recover the original array
+        let recipients: Vec<&str> = to_recip.split('\x1F').collect();
+        assert_eq!(recipients, vec!["RecA", "RecB"]);
+
+        state.shutdown();
+    }
+
+    // ── DR43-H2: Tool errors now logged server-side (fixed) ────────────────
+    // Previously tool errors were only returned in JSON-RPC responses with no
+    // server-side audit trail. Now tracing::warn! is emitted for all tool
+    // errors, giving operators visibility into error rates and types (DR43-H2).
+    #[tokio::test]
+    async fn dr43_h2_tool_errors_not_logged_server_side() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // Trigger a tool error (missing required field)
+        let result = create_agent(&state, json!({}));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("Missing project_key"),
+            "Error is returned to caller: {}",
+            err_msg
+        );
+
+        // The error is wrapped in JSON-RPC response AND now traced server-side.
+        // tracing::warn!(tool, error, "Tool call failed") is emitted in the
+        // Err branch of handle_mcp_request's result match (DR43-H2 fix).
+        let resp = handle_mcp_request(
+            state.clone(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_agent",
+                    "arguments": {}
+                }
+            }),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_some(),
+            "Error returned in JSON-RPC response"
+        );
+        assert_eq!(resp["error"]["code"], -32602);
+
+        state.shutdown();
+    }
+
+    // ── DR43-H3: validate_agent_name error format consistency (fixed) ───────
+    // Previously create_agent used "Invalid agent name:" prefix while other
+    // tools used bare field names. Now all use standard "{field} {error}" format.
+    #[tokio::test]
+    async fn dr43_h3_validate_agent_name_error_format_inconsistency() {
+        let (state, _idx, _repo) = test_post_office();
+
+        // create_agent now uses "name_hint" field name (DR43-H3 fix)
+        let create_err =
+            create_agent(&state, json!({ "project_key": "dr43", "name_hint": "" })).unwrap_err();
+        assert!(
+            create_err.starts_with("name_hint"),
+            "create_agent error now uses 'name_hint' field name: {}",
+            create_err
+        );
+
+        // send_message uses validate_name(_, "from_agent") → bare field name
+        let send_err = send_message(
+            &state,
+            json!({
+                "from_agent": "",
+                "to": ["someone"],
+                "body": "test"
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            send_err.starts_with("from_agent"),
+            "send_message error uses bare field name 'from_agent': {}",
+            send_err
+        );
+
+        // get_inbox uses validate_name(_, "agent_name") → bare field name
+        let inbox_err = get_inbox(&state, json!({ "agent_name": "" })).unwrap_err();
+        assert!(
+            inbox_err.starts_with("agent_name"),
+            "get_inbox error uses bare field name 'agent_name': {}",
+            inbox_err
+        );
+
+        // All now use consistent "{field} {error}" format
+        // "name_hint must not be empty" / "from_agent must not be empty" / "agent_name must not be empty"
+        assert!(create_err.contains("must not be empty"));
+        assert!(send_err.contains("must not be empty"));
+        assert!(inbox_err.contains("must not be empty"));
+
+        state.shutdown();
+    }
+
+    // ── DR43-H4: InboxEntry String field count matches comment ──────────────
+    // DISPROVED: The comment at line 674 says "6 String fields" which is now
+    // correct after DR42-H3 added to_recipients. Regression guard to catch
+    // if a field is added/removed without updating the comment.
+    #[tokio::test]
+    async fn dr43_h4_inbox_entry_string_field_count_matches_comment() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "Counter" }),
+        )
+        .unwrap();
+
+        send_message(
+            &state,
+            json!({
+                "from_agent": "Counter",
+                "to": ["Counter"],
+                "subject": "count-test",
+                "body": "counting fields"
+            }),
+        )
+        .unwrap();
+
+        let inbox = get_inbox(&state, json!({ "agent_name": "Counter" })).unwrap();
+        let msgs = inbox_messages(&inbox);
+        assert_eq!(msgs.len(), 1);
+
+        // InboxEntry has 6 String fields + 1 i64 field = 7 total fields.
+        // The comment at line 674 says "6 String fields" — verify by checking
+        // that all 6 string fields and 1 numeric field are present.
+        let msg = &msgs[0];
+        // 6 String fields:
+        assert!(msg["id"].is_string(), "id is String");
+        assert!(msg["from_agent"].is_string(), "from_agent is String");
+        assert!(msg["to_recipients"].is_string(), "to_recipients is String");
+        assert!(msg["subject"].is_string(), "subject is String");
+        assert!(msg["body"].is_string(), "body is String");
+        assert!(msg["project_id"].is_string(), "project_id is String");
+        // 1 i64 field:
+        assert!(msg["created_ts"].is_i64(), "created_ts is i64");
+        // Total: 7 fields in JSON output
+        let field_count = msg.as_object().unwrap().len();
+        assert_eq!(
+            field_count, 7,
+            "InboxEntry serializes to 7 JSON fields (6 String + 1 i64)"
+        );
+
+        state.shutdown();
+    }
+
+    // ── DR43-H5: get_inbox and search_messages return same fields ───────────
+    // DISPROVED: Both paths now return the same 7 field names after DR42-H3
+    // added to_recipients to get_inbox. Regression guard for consistency.
+    #[tokio::test]
+    async fn dr43_h5_inbox_and_search_return_same_fields() {
+        let (state, _idx, _repo) = test_post_office();
+
+        create_agent(
+            &state,
+            json!({ "project_key": "dr43", "name_hint": "FieldCheck" }),
+        )
+        .unwrap();
+
+        send_message(
+            &state,
+            json!({
+                "from_agent": "FieldCheck",
+                "to": ["FieldCheck"],
+                "subject": "dr43fieldcheck",
+                "body": "field consistency test",
+                "project_id": "dr43-proj"
+            }),
+        )
+        .unwrap();
+
+        // Get inbox fields
+        let inbox = get_inbox(&state, json!({ "agent_name": "FieldCheck" })).unwrap();
+        let inbox_msgs = inbox_messages(&inbox);
+        assert_eq!(inbox_msgs.len(), 1);
+        let mut inbox_fields: Vec<&str> = inbox_msgs[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        inbox_fields.sort();
+
+        // Wait for search index
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Get search fields
+        let search =
+            search_messages(&state, json!({ "query": "dr43fieldcheck", "limit": 10 })).unwrap();
+        let results = search["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "Search should find the message");
+        let mut search_fields: Vec<&str> = results[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        search_fields.sort();
+
+        // Both should have the exact same field names
+        assert_eq!(
+            inbox_fields, search_fields,
+            "get_inbox and search_messages must return the same field names"
+        );
+
+        // Verify the expected 7 fields
+        let expected = vec![
+            "body",
+            "created_ts",
+            "from_agent",
+            "id",
+            "project_id",
+            "subject",
+            "to_recipients",
+        ];
+        assert_eq!(inbox_fields, expected);
 
         state.shutdown();
     }
